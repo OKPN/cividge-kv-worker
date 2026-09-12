@@ -356,7 +356,8 @@ export async function onRequestPost(context) {
     };
 
     // 🚀 URL再利用・即時反映: 直前までの404エッジキャッシュを即時パージ
-    context.waitUntil?.(purgeHybridCache(request, env, key)) || purgeHybridCache(request, env, key);
+    const extraDomainsToPurge = allowedHost ? allowedHost.split(",") : [];
+    context.waitUntil?.(purgeHybridCache(request, env, key, extraDomainsToPurge)) || purgeHybridCache(request, env, key, extraDomainsToPurge);
 
     return new Response(JSON.stringify({ success: true, key, cid: safeCid, metadata: returnedMeta }), {
       status: 200,
@@ -446,7 +447,8 @@ export async function onRequestDelete(context) {
     }
 
     // 🚀 リンク抹消: エッジに残っている画像キャッシュを即座に消滅させる
-    context.waitUntil?.(purgeHybridCache(request, env, key)) || purgeHybridCache(request, env, key);
+    const deleteExtraDomains = existing?.metadata?.d || existing?.metadata?.allowedHost ? (existing.metadata.d || existing.metadata.allowedHost).split(",") : [];
+    context.waitUntil?.(purgeHybridCache(request, env, key, deleteExtraDomains)) || purgeHybridCache(request, env, key, deleteExtraDomains);
 
     return new Response(JSON.stringify({ success: true, deletedKey: key }), {
       status: 200,
@@ -463,20 +465,47 @@ export async function onRequestDelete(context) {
 // 🌐 ハイブリッド Cache Purge ヘルパー
 // プランA (独自ドメイン設定時): REST Purge API で世界300箇所の全エッジから即時抹消
 // プランB (pages.dev無料運用時): Cache API (caches.default) でローカルPoPから即時抹消
-async function purgeHybridCache(request, env, key) {
+// ※ 開発者や特定ドメインを特別扱いせず、Request Origin / Referer / allowedHost から100%動的に解決
+async function purgeHybridCache(request, env, key, extraDomains = []) {
   if (!key) return;
   const reqUrl = new URL(request.url);
   const targetPath = `/${encodeURIComponent(key)}`;
-  const targetUrl = `${reqUrl.origin}${targetPath}`;
+  
+  const targetDomains = new Set();
+  
+  // 1. リクエスト自体のオリジン
+  if (reqUrl.origin) {
+    targetDomains.add(reqUrl.origin);
+  }
+  
+  // 2. クライアント側の Origin / Referer ヘッダー（フロントエンドのドメイン）
+  const originHeader = request.headers.get("origin");
+  if (originHeader) {
+    try { targetDomains.add(new URL(originHeader).origin); } catch (e) {}
+  }
+  const refererHeader = request.headers.get("referer");
+  if (refererHeader) {
+    try { targetDomains.add(new URL(refererHeader).origin); } catch (e) {}
+  }
+  
+  // 3. 引数で渡されたドメイン（allowedHost や body からの指定）
+  for (const d of extraDomains) {
+    if (!d) continue;
+    const clean = String(d).trim().toLowerCase();
+    const withProto = clean.startsWith("http") ? clean : `https://${clean}`;
+    try { targetDomains.add(new URL(withProto).origin); } catch (e) {}
+  }
 
-  // content-relay および content-cache ドメインのURLも対象に含める
-  const urlsToPurge = [targetUrl];
-  if (!reqUrl.hostname.includes("content-relay")) {
-    urlsToPurge.push(`https://content-relay.pages.dev${targetPath}`);
+  // 4. 環境変数でパージ対象ドメインが指定されている場合（PURGE_DOMAINS=domain1.com,domain2.pages.dev）
+  if (env.PURGE_DOMAINS) {
+    const customList = String(env.PURGE_DOMAINS).split(",").map(s => s.trim()).filter(Boolean);
+    for (const d of customList) {
+      const withProto = d.startsWith("http") ? d : `https://${d}`;
+      try { targetDomains.add(new URL(withProto).origin); } catch (e) {}
+    }
   }
-  if (!reqUrl.hostname.includes("content-cache")) {
-    urlsToPurge.push(`https://content-cache.pages.dev${targetPath}`);
-  }
+
+  const urlsToPurge = Array.from(targetDomains).map(origin => `${origin}${targetPath}`);
 
   // 1. プランA: REST Purge API (独自ドメインの Zone ID & API Token がある場合)
   const zoneId = env.CLOUDFLARE_ZONE_ID;
