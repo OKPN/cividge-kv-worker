@@ -19,13 +19,25 @@ function unpackMetadata(name, cid, meta = {}) {
   const size = meta.s !== undefined ? meta.s : (meta.size || 0);
   const lastModified = meta.t !== undefined ? meta.t * 1000 : (meta.lastModified || Date.now());
   const expiresAt = meta.e !== undefined ? meta.e * 1000 : (meta.expiresAt || null);
-  const s3Key = meta.k_s3 || meta.s3Key || name;
+
+  // hostname:filename の形式（別ドメイン用個別キー）かチェック
+  const colonIdx = name.indexOf(":");
+  let keyHost = null;
+  let displayName = name;
+  if (colonIdx > 0 && !name.startsWith("tombstone_") && !name.startsWith("blob_")) {
+    keyHost = name.substring(0, colonIdx);
+    displayName = name.substring(colonIdx + 1);
+  }
+
+  const s3Key = meta.k_s3 || meta.s3Key || displayName;
   const lastKuboPinAttempt = meta.k !== undefined ? meta.k * 1000 : (meta.lastKuboPinAttempt || null);
 
-  const allowedHost = meta.d || meta.allowedHost || null;
+  const allowedHost = keyHost || meta.d || meta.allowedHost || null;
 
   return {
     ...meta,
+    rawKey: name,
+    displayName,
     cid: cid || meta.cid || meta.c || "",
     size,
     s: size,
@@ -473,10 +485,17 @@ export async function onRequestDelete(context) {
 // ※ 開発者や特定ドメインを特別扱いせず、Request Origin / Referer / allowedHost から100%動的に解決
 async function purgeHybridCache(request, env, key, extraDomains = []) {
   if (!key) return;
+  const colonIdx = key.indexOf(":");
+  const pureFilename = (colonIdx > 0 && !key.startsWith("tombstone_") && !key.startsWith("blob_")) ? key.substring(colonIdx + 1) : key;
+  const keyHost = (colonIdx > 0 && !key.startsWith("tombstone_") && !key.startsWith("blob_")) ? key.substring(0, colonIdx) : null;
+
   const reqUrl = new URL(request.url);
-  const targetPath = `/${encodeURIComponent(key)}`;
+  const targetPath = `/${encodeURIComponent(pureFilename)}`;
   
   const targetDomains = new Set();
+  if (keyHost) {
+    targetDomains.add(`https://${keyHost}`);
+  }
   
   // 1. リクエスト自体のオリジン
   if (reqUrl.origin) {
