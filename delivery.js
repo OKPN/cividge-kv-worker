@@ -412,12 +412,19 @@ export async function onRequest(context) {
   }
 
   // 🌐 配信ドメイン制限チェック（設定されたドメイン以外からのアクセスは即座に404で遮断）
+  // 🌟 公式配信エッジ群（content-cache, content-relay, misskey-media, blobs-cache, cividge）は相互にスムーズな切り替え・配信を許可
   const allowedDomain = meta.d || meta.allowedHost;
   if (allowedDomain && typeof allowedDomain === "string" && allowedDomain.trim()) {
     const allowedHostnames = allowedDomain.split(",").map(h => h.trim().toLowerCase().replace(/^https?:\/\//, "").split('/')[0].split(':')[0]).filter(Boolean);
     const currentHostname = url.hostname.toLowerCase();
+    const isOfficialEdge = (h) => h.includes("content-relay") || h.includes("content-cache") || h.includes("blobs-cache") || h.includes("misskey-media") || h.includes("cividge.pages.dev");
+    const isCurrentOfficial = isOfficialEdge(currentHostname);
+    const isAnyAllowedOfficial = allowedHostnames.some(h => isOfficialEdge(h));
+
     if (allowedHostnames.length > 0 && !allowedHostnames.includes(currentHostname)) {
-      return renderNotFoundResponse(request, 86400); // 許可外ドメインアクセスは1日エッジキャッシュで即遮断
+      if (!(isCurrentOfficial && isAnyAllowedOfficial)) {
+        return renderNotFoundResponse(request, 60); // 許可外ドメインアクセスは1分キャッシュ
+      }
     }
   }
 
