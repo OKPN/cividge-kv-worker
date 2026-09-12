@@ -311,9 +311,14 @@ export async function onRequestPost(context) {
     const existingDomains = normalizeDomainList(existingMetadata && (existingMetadata.d || existingMetadata.allowedHost));
 
     if (incomingDomains.length > 0) {
-      // 既存のドメインと新規ドメインを統合（同一CIDなら同一ファイル名のまま複数ドメインからの配信を許容）
-      const mergedDomains = [...new Set([...existingDomains, ...incomingDomains])];
-      allowedHost = mergedDomains.join(",");
+      if (body.overwriteAllowedHost) {
+        // プルダウンでの切り替えなど、明示的なドメイン上書き指定の場合
+        allowedHost = incomingDomains.join(",");
+      } else {
+        // 既存のドメインと新規ドメインを統合（同一CIDなら同一ファイル名のまま複数ドメインからの配信を許容）
+        const mergedDomains = [...new Set([...existingDomains, ...incomingDomains])];
+        allowedHost = mergedDomains.join(",");
+      }
     } else if (existingDomains.length > 0) {
       allowedHost = existingDomains.join(",");
     }
