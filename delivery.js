@@ -351,6 +351,7 @@ export async function onRequest(context) {
   }
 
   const url = new URL(request.url);
+  const pathname = url.pathname;
   // 🛡️ メディア配信エッジ判定:
   // KV Worker / 配信エッジへの非メディアリクエストやトップページアクセスは即時404返却
   const isMainApp = url.hostname === "cividge.pages.dev" || url.hostname === "localhost" || url.hostname === "127.0.0.1";
