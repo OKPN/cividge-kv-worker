@@ -23,7 +23,7 @@ cividge-kv-worker serves as the decentralized backend routing and caching layer 
 - 🪐 **IPFS Multi-Gateway Failover**:
   - Seamlessly falls back across multiple public IPFS gateways (ipfs.filebase.io, cloudflare-ipfs.com, ipfs.io, dweb.link) when primary nodes are congested.
 - 🛡️ **Edge Protection**:
-  - Immediate 404 caching on delivery-only domains (content-cache, misskey-media, etc.) for non-media requests, fully conserving Worker execution quotas.
+  - Immediate 404 caching on delivery-only domains for non-media requests, fully conserving Worker execution quotas.
 
 ## Architecture
 
