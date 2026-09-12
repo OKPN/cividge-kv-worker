@@ -351,11 +351,10 @@ export async function onRequest(context) {
   }
 
   const url = new URL(request.url);
-  const pathname = url.pathname;
-
-  // 🛡️ content-relay, content-cache, blobs-cache, misskey-media, punipuni-media ドメインはファイル配信専用エッジ
-  // トップページ（/）や管理画面・非メディアURLへのアクセスは、フロントエンドアプリ画面を出さず即座に404返却（1日CDNキャッシュでFunctions完全防衛）
-  const isDeliveryEdge = url.hostname.includes("content-relay") || url.hostname.includes("content-cache") || url.hostname.includes("blobs-cache") || url.hostname.includes("misskey-media") || url.hostname.includes("punipuni-media");
+  // 🛡️ メディア配信エッジ判定:
+  // KV Worker / 配信エッジへの非メディアリクエストやトップページアクセスは即時404返却
+  const isMainApp = url.hostname === "cividge.pages.dev" || url.hostname === "localhost" || url.hostname === "127.0.0.1";
+  const isDeliveryEdge = !isMainApp;
 
   const rawFilename = pathname.replace(/^\/+/, "");
   if (rawFilename.startsWith("api/") || rawFilename.startsWith("404-character.")) {
