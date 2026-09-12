@@ -417,14 +417,8 @@ export async function onRequest(context) {
   if (allowedDomain && typeof allowedDomain === "string" && allowedDomain.trim()) {
     const allowedHostnames = allowedDomain.split(",").map(h => h.trim().toLowerCase().replace(/^https?:\/\//, "").split('/')[0].split(':')[0]).filter(Boolean);
     const currentHostname = url.hostname.toLowerCase();
-    const isOfficialEdge = (h) => h.includes("content-relay") || h.includes("content-cache") || h.includes("blobs-cache") || h.includes("misskey-media") || h.includes("cividge.pages.dev");
-    const isCurrentOfficial = isOfficialEdge(currentHostname);
-    const isAnyAllowedOfficial = allowedHostnames.some(h => isOfficialEdge(h));
-
     if (allowedHostnames.length > 0 && !allowedHostnames.includes(currentHostname)) {
-      if (!(isCurrentOfficial && isAnyAllowedOfficial)) {
-        return renderNotFoundResponse(request, 60); // 許可外ドメインアクセスは1分キャッシュ
-      }
+      return renderNotFoundResponse(request, 60); // 許可外ドメインアクセスは1分キャッシュ
     }
   }
 

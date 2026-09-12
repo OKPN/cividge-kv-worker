@@ -207,6 +207,15 @@ export async function onRequestPost(context) {
         existingValue = existing.value || "";
         if (existing.metadata) existingMetadata = existing.metadata;
       }
+      // もし key が domain:filename 形式で未登録なら、同一ファイル名単体キーからメタデータをフォールバック取得
+      if (!existingValue && key.includes(":")) {
+        const pureName = key.split(":").slice(1).join(":");
+        const fallback = await env.IPFS_KV.getWithMetadata(pureName);
+        if (fallback) {
+          existingValue = fallback.value || "";
+          if (fallback.metadata) existingMetadata = fallback.metadata;
+        }
+      }
     } catch (e) {}
 
     const existingCid = existingValue || (existingMetadata && (existingMetadata.c || existingMetadata.cid)) || "";
