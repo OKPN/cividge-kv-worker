@@ -307,7 +307,7 @@ function renderOgpHtml(filename, rawUrl, ext, isVideo, origin) {
 </html>`;
 }
 
-function renderNotFoundResponse(request, cdnCacheSeconds = 300) {
+function renderNotFoundResponse(request, cdnCacheSeconds = 60) {
   const accept = request.headers.get("accept") || "";
   const headers = {
     "Cache-Control": "no-cache",
