@@ -1,0 +1,11 @@
+name = "cividge-kv-worker"
+main = "server.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+[[kv_namespaces]]
+binding = "IPFS_KV"
+id = "ff45707014424ab3afac57fda8c305de"
+
+[secrets]
+required = ["ADMIN_API_TOKEN"]

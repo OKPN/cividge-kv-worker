@@ -1,0 +1,13 @@
+{
+  "name": "cividge-kv-worker",
+  "version": "1.0.0",
+  "description": "Dedicated Cloudflare Worker for Cividge KV registry, short-links, and IPFS edge delivery",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "hono": "^4.7.2"
+  }
+}
