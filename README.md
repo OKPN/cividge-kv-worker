@@ -1,6 +1,6 @@
 # Cividge KV Worker
 
-High-performance, edge-caching media delivery and metadata registry worker designed for [Cividge](https://github.com/OKPN/byorr-converter). Built on Cloudflare Workers and Workers KV.
+High-performance, edge-caching media delivery and metadata registry worker designed for [Cividge](https://github.com/OKPN/cividge). Built on Cloudflare Workers and Workers KV.
 
 ## Overview
 

@@ -22,6 +22,8 @@ function unpackMetadata(name, cid, meta = {}) {
   const s3Key = meta.k_s3 || meta.s3Key || name;
   const lastKuboPinAttempt = meta.k !== undefined ? meta.k * 1000 : (meta.lastKuboPinAttempt || null);
 
+  const allowedHost = meta.d || meta.allowedHost || null;
+
   return {
     ...meta,
     cid: cid || meta.cid || meta.c || "",
@@ -32,6 +34,7 @@ function unpackMetadata(name, cid, meta = {}) {
     unpinned: isUnpinned,
     kuboStatus,
     s3Key,
+    ...(allowedHost ? { allowedHost, d: allowedHost } : {}),
     ...(expiresAt ? { expiresAt, e: Math.floor(expiresAt / 1000) } : {}),
     ...(lastKuboPinAttempt ? { lastKuboPinAttempt } : {}),
   };
@@ -183,7 +186,34 @@ export async function onRequestPost(context) {
       });
     }
 
-    const safeCid = cid || "";
+    // 既存のレコード・メタデータを事前に取得（パスワード・kuboStatus・allowedHost等の継承用）
+    let existingMetadata = null;
+    let existingValue = "";
+    try {
+      const existing = await env.IPFS_KV.getWithMetadata(key);
+      if (existing) {
+        existingValue = existing.value || "";
+        if (existing.metadata) existingMetadata = existing.metadata;
+      }
+    } catch (e) {}
+
+    const existingCid = existingValue || (existingMetadata && (existingMetadata.c || existingMetadata.cid)) || "";
+
+    // 🛡️ CID衝突ガード:
+    // 同一ファイル名が既に存在し、かつ中身（CID）が異なる場合は上書き破壊を防ぐため409 Conflictで弾く
+    if (existingCid && cid && existingCid !== cid) {
+      return new Response(JSON.stringify({
+        error: "Conflict: A different file with the same name already exists.",
+        code: "CID_CONFLICT",
+        existingCid,
+        newCid: cid,
+      }), {
+        status: 409,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+
+    const safeCid = cid || existingCid || "";
 
     // パスワードが指定されている場合は PBKDF2 でハッシュ化
     let passwordMeta = {};
@@ -223,36 +253,39 @@ export async function onRequestPost(context) {
         passwordSalt: saltHex,
         sessionSecret,
       };
-    } else {
-      // パスワードが未指定の場合、既存レコードのパスワード設定を維持する
-      try {
-        const existing = await env.IPFS_KV.getWithMetadata(key);
-        if (existing && existing.metadata && existing.metadata.passwordHash) {
-          passwordMeta = {
-            passwordHash: existing.metadata.passwordHash,
-            passwordSalt: existing.metadata.passwordSalt,
-            sessionSecret: existing.metadata.sessionSecret,
-          };
-        }
-      } catch (e) {}
+    } else if (existingMetadata && existingMetadata.passwordHash) {
+      passwordMeta = {
+        passwordHash: existingMetadata.passwordHash,
+        passwordSalt: existingMetadata.passwordSalt,
+        sessionSecret: existingMetadata.sessionSecret,
+      };
     }
 
-    const calculatedExpiresAt = expiresAt || (ttl && Number(ttl) > 0 ? Date.now() + Number(ttl) * 1000 : null);
+    // 有効期限の計算と明示的な解除（ttl: 0 または expiresAt: 0 で無期限化）
+    let calculatedExpiresAt = null;
+    let putExpirationTtl = undefined;
+    if (expiresAt === 0 || ttl === 0 || expiresAt === null && body.clearTtl) {
+      calculatedExpiresAt = null;
+    } else if (expiresAt && Number(expiresAt) > 0) {
+      calculatedExpiresAt = Number(expiresAt);
+      const remainingSec = Math.floor((calculatedExpiresAt - Date.now()) / 1000);
+      if (remainingSec > 60) putExpirationTtl = remainingSec;
+    } else if (ttl && Number(ttl) > 0) {
+      calculatedExpiresAt = Date.now() + Number(ttl) * 1000;
+      putExpirationTtl = Math.max(60, Number(ttl));
+    } else if (existingMetadata && (existingMetadata.e || existingMetadata.expiresAt)) {
+      calculatedExpiresAt = existingMetadata.e ? existingMetadata.e * 1000 : existingMetadata.expiresAt;
+      const remainingSec = Math.floor((calculatedExpiresAt - Date.now()) / 1000);
+      if (remainingSec > 60) putExpirationTtl = remainingSec;
+    }
 
     // 既存の kuboStatus を引き継ぐ、または body から取得
     let existingKuboStatus = body.kuboStatus;
     let existingLastKuboPinAttempt = body.lastKuboPinAttempt;
-    let existingFlags = 0;
-    if (existingKuboStatus === undefined) {
-      try {
-        const existing = await env.IPFS_KV.getWithMetadata(key);
-        if (existing && existing.metadata) {
-          const m = existing.metadata;
-          existingKuboStatus = m.kuboStatus || (m.f & 2 ? "pinned" : (m.f & 4 ? "not_pinned" : undefined));
-          existingLastKuboPinAttempt = m.lastKuboPinAttempt || (m.k ? m.k * 1000 : undefined);
-          existingFlags = m.f || 0;
-        }
-      } catch (e) {}
+    let existingFlags = existingMetadata ? (existingMetadata.f || 0) : 0;
+    if (existingKuboStatus === undefined && existingMetadata) {
+      existingKuboStatus = existingMetadata.kuboStatus || (existingFlags & 2 ? "pinned" : (existingFlags & 4 ? "not_pinned" : undefined));
+      existingLastKuboPinAttempt = existingMetadata.lastKuboPinAttempt || (existingMetadata.k ? existingMetadata.k * 1000 : undefined);
     }
 
     // 🗜️ 台帳データ圧縮（スカスカ化）:
@@ -265,14 +298,37 @@ export async function onRequestPost(context) {
     if (finalKuboStatus === "pinned") flags |= 2;
     else if (finalKuboStatus === "not_pinned") flags |= 4;
 
+    // 🌐 配信ドメイン制限 (allowedHost / domain):
+    // カンマ区切りの複数ドメイン対応（同一CIDであれば複数ドメインでの配信を統合許可）
+    const normalizeDomainList = (val) => {
+      if (!val) return [];
+      const arr = Array.isArray(val) ? val : String(val).split(",");
+      return arr.map(h => String(h).trim().toLowerCase().replace(/^https?:\/\//, "").split('/')[0].split(':')[0]).filter(Boolean);
+    };
+
+    let allowedHost = null;
+    const incomingDomains = normalizeDomainList(body.allowedHost || body.domain || body.d);
+    const existingDomains = normalizeDomainList(existingMetadata && (existingMetadata.d || existingMetadata.allowedHost));
+
+    if (incomingDomains.length > 0) {
+      // 既存のドメインと新規ドメインを統合（同一CIDなら同一ファイル名のまま複数ドメインからの配信を許容）
+      const mergedDomains = [...new Set([...existingDomains, ...incomingDomains])];
+      allowedHost = mergedDomains.join(",");
+    } else if (existingDomains.length > 0) {
+      allowedHost = existingDomains.join(",");
+    }
+
     // 圧縮メタデータオブジェクト（1レコード数十バイトに極小化）
-    // c: cid, s: size, t: lastModified(秒), f: flags(ビット), e: expiresAt(秒), k: lastKuboPinAttempt(秒)
+    // c: cid, s: size, t: lastModified(秒), f: flags(ビット), e: expiresAt(秒), k: lastKuboPinAttempt(秒), d: allowedHost
+    const inheritedSize = Number(size) || (existingMetadata && (existingMetadata.s || existingMetadata.size)) || 0;
+    const inheritedS3Key = body.s3Key || (existingMetadata && (existingMetadata.k_s3 || existingMetadata.s3Key)) || key;
     const compressedMeta = {
       ...(safeCid ? { c: safeCid } : {}),
-      s: Number(size) || 0,
+      s: inheritedSize,
       t: Math.floor((lastModified || Date.now()) / 1000),
       ...(flags > 0 ? { f: flags } : {}),
-      ...(body.s3Key && body.s3Key !== key ? { k_s3: body.s3Key } : {}),
+      ...(allowedHost ? { d: allowedHost } : {}),
+      ...(inheritedS3Key && inheritedS3Key !== key ? { k_s3: inheritedS3Key } : {}),
       ...(calculatedExpiresAt ? { e: Math.floor(Number(calculatedExpiresAt) / 1000) } : {}),
       ...(existingLastKuboPinAttempt ? { k: Math.floor(Number(existingLastKuboPinAttempt) / 1000) } : {}),
       ...passwordMeta,
@@ -280,8 +336,8 @@ export async function onRequestPost(context) {
 
     // KV に登録 (value: safeCid, metadata, expirationTtl)
     const putOptions = { metadata: compressedMeta };
-    if (ttl && Number(ttl) > 0) {
-      putOptions.expirationTtl = Math.max(60, Number(ttl));
+    if (putExpirationTtl && putExpirationTtl > 0) {
+      putOptions.expirationTtl = putExpirationTtl;
     }
     await env.IPFS_KV.put(key, safeCid, putOptions);
 
@@ -294,6 +350,7 @@ export async function onRequestPost(context) {
       s3Key: body.s3Key || key,
       unpinned: Boolean(flags & 1),
       kuboStatus: finalKuboStatus,
+      allowedHost: allowedHost || null,
       ...(calculatedExpiresAt ? { expiresAt: calculatedExpiresAt } : {}),
       ...compressedMeta,
     };
@@ -301,7 +358,7 @@ export async function onRequestPost(context) {
     // 🚀 URL再利用・即時反映: 直前までの404エッジキャッシュを即時パージ
     context.waitUntil?.(purgeHybridCache(request, env, key)) || purgeHybridCache(request, env, key);
 
-    return new Response(JSON.stringify({ success: true, key, cid: safeCid, metadata }), {
+    return new Response(JSON.stringify({ success: true, key, cid: safeCid, metadata: returnedMeta }), {
       status: 200,
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });

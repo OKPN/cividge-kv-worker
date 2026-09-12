@@ -404,6 +404,16 @@ export async function onRequest(context) {
     return renderNotFoundResponse(request);
   }
 
+  // 🌐 配信ドメイン制限チェック（設定されたドメイン以外からのアクセスは即座に404で遮断）
+  const allowedDomain = meta.d || meta.allowedHost;
+  if (allowedDomain && typeof allowedDomain === "string" && allowedDomain.trim()) {
+    const allowedHostnames = allowedDomain.split(",").map(h => h.trim().toLowerCase().replace(/^https?:\/\//, "").split('/')[0].split(':')[0]).filter(Boolean);
+    const currentHostname = url.hostname.toLowerCase();
+    if (allowedHostnames.length > 0 && !allowedHostnames.includes(currentHostname)) {
+      return renderNotFoundResponse(request, 86400); // 許可外ドメインアクセスは1日エッジキャッシュで即遮断
+    }
+  }
+
   // 🔒 パスワード保護の検証ゲート
   const hasPassword = Boolean(meta.password || meta.passwordHash);
   if (hasPassword) {
