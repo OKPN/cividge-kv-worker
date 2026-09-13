@@ -384,19 +384,22 @@ export async function onRequest(context) {
   if (env && env.IPFS_KV) {
     try {
       const currentHost = url.hostname.toLowerCase();
-      // 1. ドメイン個別キー (例: "misskey-media.pages.dev:7ud1yi6z.mp4") で優先照会
+      // 1. ドメイン個別キー (例: "misskey-media.okpn.f5.si:7ud1yi6z.mp4") で優先照会
       let kvRes = await env.IPFS_KV.getWithMetadata(`${currentHost}:${filename}`);
-      if (!kvRes && filename !== rawFilename) {
+      if ((!kvRes || !kvRes.value) && filename !== rawFilename) {
         kvRes = await env.IPFS_KV.getWithMetadata(`${currentHost}:${rawFilename}`);
       }
+      let isDomainSpecific = Boolean(kvRes && kvRes.value);
+
       // 2. 見つからなければ従来のファイル名単体キーでフォールバック照会
-      if (!kvRes) {
+      if (!isDomainSpecific) {
         kvRes = await env.IPFS_KV.getWithMetadata(filename);
       }
-      if (!kvRes && filename !== rawFilename) {
+      if ((!kvRes || !kvRes.value) && filename !== rawFilename) {
         kvRes = await env.IPFS_KV.getWithMetadata(rawFilename);
       }
-      if (kvRes) {
+
+      if (kvRes && kvRes.value) {
         targetCid = kvRes.value;
         meta = kvRes.metadata || {};
       }
@@ -411,14 +414,13 @@ export async function onRequest(context) {
     return renderNotFoundResponse(request);
   }
 
-  // 🌐 配信ドメイン制限チェック（設定されたドメイン以外からのアクセスは即座に404で遮断）
-  // 🌟 公式配信エッジ群（content-cache, content-relay, misskey-media, blobs-cache, cividge）は相互にスムーズな切り替え・配信を許可
+  // 🌐 配信ドメイン制限チェック（各ドメインは完全独立：設定されたドメイン以外からのアクセスは即座に404で遮断）
   const allowedDomain = meta.d || meta.allowedHost;
   if (allowedDomain && typeof allowedDomain === "string" && allowedDomain.trim()) {
     const allowedHostnames = allowedDomain.split(",").map(h => h.trim().toLowerCase().replace(/^https?:\/\//, "").split('/')[0].split(':')[0]).filter(Boolean);
     const currentHostname = url.hostname.toLowerCase();
     if (allowedHostnames.length > 0 && !allowedHostnames.includes(currentHostname)) {
-      return renderNotFoundResponse(request, 60); // 許可外ドメインアクセスは1分キャッシュ
+      return renderNotFoundResponse(request, 60);
     }
   }
 
