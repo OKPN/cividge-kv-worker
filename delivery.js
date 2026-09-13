@@ -1,6 +1,21 @@
 // functions/_middleware.js
 // Cloudflare Pages Function Middleware: 静的ファイル 404 / SPA フォールバック時のスマート中継 (Catbox風ハイブリッド404 & パスワード保護ゲート)
 
+import { CHARACTER_WEBP_BASE64 } from "./character_image.js";
+
+let characterWebpBytes = null;
+function getCharacterWebpBytes() {
+  if (!characterWebpBytes) {
+    const binStr = atob(CHARACTER_WEBP_BASE64);
+    const len = binStr.length;
+    characterWebpBytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      characterWebpBytes[i] = binStr.charCodeAt(i);
+    }
+  }
+  return characterWebpBytes;
+}
+
 const CATBOX_404_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -85,7 +100,7 @@ const CATBOX_404_HTML = `<!DOCTYPE html>
   <div class="container">
     <div class="error-code">404</div>
     <div class="question-mark">?</div>
-    <img class="character-img" src="/404-character.webp" alt="404 Not Found" onerror="this.style.display='none'">
+    <img class="character-img" src="data:image/webp;base64,${CHARACTER_WEBP_BASE64}" alt="404 Not Found" onerror="this.style.display='none'">
     <div class="message">The file you're looking for doesn't exist<br>or has been removed.</div>
     <a href="/" class="home-link">Click me to go home</a>
   </div>
@@ -358,7 +373,17 @@ export async function onRequest(context) {
   const isDeliveryEdge = !isMainApp;
 
   const rawFilename = pathname.replace(/^\/+/, "");
-  if (rawFilename.startsWith("api/") || rawFilename.startsWith("404-character.")) {
+  if (rawFilename.startsWith("404-character.")) {
+    return new Response(getCharacterWebpBytes(), {
+      status: 200,
+      headers: {
+        "Content-Type": "image/webp",
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "Access-Control-Allow-Origin": "*",
+      },
+    });
+  }
+  if (rawFilename.startsWith("api/")) {
     return renderNotFoundResponse(request);
   }
 
