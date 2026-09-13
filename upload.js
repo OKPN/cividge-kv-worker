@@ -180,7 +180,7 @@ export async function onRequestPost(context) {
       }
     }
 
-    // 7. KV にルーティング登録（ドメイン個別キー & 一般キーの両方または allowedHost を付与）
+    // 7. KV にルーティング登録（キーは shortKey 単体とし、ドメイン制限は allowedHost メタデータで管理）
     if (env.IPFS_KV) {
       const kvMetadata = {
         blobKey,
@@ -191,13 +191,7 @@ export async function onRequestPost(context) {
         ...passwordMeta,
       };
 
-      // 基本キー
       await env.IPFS_KV.put(shortKey, targetCid || shortKey, { metadata: kvMetadata });
-
-      // ドメイン個別キー (例: "misskey-media.okpn.f5.si:abc123.webp") でも引けるように登録
-      if (cleanHostname) {
-        await env.IPFS_KV.put(`${cleanHostname}:${shortKey}`, targetCid || shortKey, { metadata: kvMetadata });
-      }
     }
 
     // 8. レスポンス返却
