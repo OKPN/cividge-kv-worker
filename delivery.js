@@ -330,11 +330,11 @@ function isSocialCrawler(userAgent = "") {
 }
 
 // 🖼️ SNSクローラー向け軽量 OGP HTML レスポンス生成（大容量バイナリ取得によるプレビュー失敗を完全防止）
-function renderOgpHtml(filename, rawUrl, ext, isVideo, origin) {
+function renderOgpHtml(filename, rawUrl, ext, isVideo, origin, thumbnailKey = null) {
   const title = `${filename}`;
   const siteName = "Cividge Media";
   // 動画の場合は同名先頭フレームサムネイル（.thumb.webp）を最優先指定
-  const videoThumbUrl = `${origin}/${filename}.thumb.webp`;
+  const videoThumbUrl = `${origin}/${encodeURIComponent(thumbnailKey || `${filename}.thumb.webp`)}`;
   const mediaUrl = rawUrl;
   const thumbUrl = isVideo ? videoThumbUrl : mediaUrl;
 
@@ -404,6 +404,16 @@ function capCacheToExpiry(defaultSeconds, expiresAt) {
   if (!expiresAt) return defaultSeconds;
   const remainingSeconds = Math.ceil((Number(expiresAt) - Date.now()) / 1000);
   return Math.max(0, Math.min(defaultSeconds, remainingSeconds));
+}
+
+// アップロード時に台帳へ保存した実寸を、直リンクを事前解析するクライアントへ渡す。
+function setImageDimensionHeaders(headers, meta = {}) {
+  const width = Math.floor(Number(meta.w ?? meta.width));
+  const height = Math.floor(Number(meta.h ?? meta.height));
+  if (width > 0 && height > 0) {
+    headers.set("X-Image-Width", String(width));
+    headers.set("X-Image-Height", String(height));
+  }
 }
 
 // 期限切れリンクは、最初にアクセスされた時だけ回収する。定期実行は行わない。
@@ -638,7 +648,8 @@ export async function onRequest(context) {
   const crawlerExt = extMatch[1].toLowerCase();
   const isCrawlerVideo = (crawlerExt === "mp4" || crawlerExt === "webm");
   if (!hasPassword && isSocialCrawler(userAgent)) {
-    const ogpHtml = renderOgpHtml(filename, request.url, crawlerExt, isCrawlerVideo, url.origin);
+    const ogpThumbnailKey = meta.th || meta.thumbnailKey || ((meta.k_s3 || meta.s3Key) ? `${meta.k_s3 || meta.s3Key}.thumb.webp` : null);
+    const ogpHtml = renderOgpHtml(filename, request.url, crawlerExt, isCrawlerVideo, url.origin, ogpThumbnailKey);
     const ogpCacheSeconds = capCacheToExpiry(86400, expiresTimestamp);
     return new Response(ogpHtml, {
       status: 200,
@@ -660,7 +671,7 @@ export async function onRequest(context) {
         const headers = new Headers();
         headers.set("Access-Control-Allow-Origin", "*");
         headers.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
-        headers.set("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges");
+        headers.set("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges, X-Image-Width, X-Image-Height");
         headers.set("Content-Disposition", `inline; filename="${encodeURIComponent(filename)}"`);
         headers.set("X-Content-Type-Options", "nosniff");
         headers.set("Accept-Ranges", "bytes");
@@ -688,6 +699,7 @@ export async function onRequest(context) {
         };
         const ext = extMatch[1].toLowerCase();
         headers.set("Content-Type", meta.mime || mimeMap[ext] || "application/octet-stream");
+        setImageDimensionHeaders(headers, meta);
         return new Response(directData, { status: 200, headers });
       }
     } catch (directErr) {
@@ -763,10 +775,11 @@ export async function onRequest(context) {
   const headers = new Headers();
   headers.set("Access-Control-Allow-Origin", "*");
   headers.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
-  headers.set("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges");
+  headers.set("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges, X-Image-Width, X-Image-Height");
   headers.set("Content-Disposition", `inline; filename="${encodeURIComponent(filename)}"`);
   headers.set("X-Content-Type-Options", "nosniff");
   headers.set("Accept-Ranges", "bytes");  // 常に宣言（iOS Safari等がシーク非対応と誤判定するのを防止）
+  setImageDimensionHeaders(headers, meta);
 
   // 3層キャッシュ戦略: ブラウザ=CDNレスポンス(画像1時間/動画・音声4時間、アンピン漂流中は7日間) / 上流フェッチ(通常1年/アンピン7日)
   const isVideo = ["mp4", "webm", "mov", "m4v", "avi", "ogv"].includes(extMatch[1].toLowerCase());

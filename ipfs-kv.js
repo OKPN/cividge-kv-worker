@@ -30,6 +30,9 @@ function unpackMetadata(name, cid, meta = {}) {
   }
 
   const s3Key = meta.k_s3 || meta.s3Key || displayName;
+  const thumbnailKey = meta.th || meta.thumbnailKey || null;
+  const width = Number(meta.w ?? meta.width) || null;
+  const height = Number(meta.h ?? meta.height) || null;
   const lastKuboPinAttempt = meta.k !== undefined ? meta.k * 1000 : (meta.lastKuboPinAttempt || null);
 
   const allowedHost = keyHost || meta.d || meta.allowedHost || null;
@@ -46,6 +49,8 @@ function unpackMetadata(name, cid, meta = {}) {
     unpinned: isUnpinned,
     kuboStatus,
     s3Key,
+    ...(thumbnailKey ? { thumbnailKey, th: thumbnailKey } : {}),
+    ...(width && height ? { width, height, w: width, h: height } : {}),
     ...(allowedHost ? { allowedHost, d: allowedHost } : {}),
     ...(expiresAt ? { expiresAt, e: Math.floor(expiresAt / 1000) } : {}),
     ...(lastKuboPinAttempt ? { lastKuboPinAttempt } : {}),
@@ -194,7 +199,7 @@ export async function onRequestPost(context) {
 
   try {
     const body = await request.json();
-    const { key, cid, size, mime, lastModified, password, dataBase64, ttl, expiresAt } = body;
+    const { key, cid, size, mime, lastModified, password, dataBase64, ttl, expiresAt, thumbnailKey, width, height } = body;
 
     if (!key) {
       return new Response(JSON.stringify({ error: "Missing 'key' in request body" }), {
@@ -345,9 +350,12 @@ export async function onRequestPost(context) {
     }
 
     // 圧縮メタデータオブジェクト（1レコード数十バイトに極小化）
-    // c: cid, s: size, t: lastModified(秒), f: flags(ビット), e: expiresAt(秒), k: lastKuboPinAttempt(秒), d: allowedHost
+    // c: cid, s: size, t: lastModified(秒), f: flags(ビット), e: expiresAt(秒), k: lastKuboPinAttempt(秒), d: allowedHost, w/h: image dimensions
     const inheritedSize = Number(size) || (existingMetadata && (existingMetadata.s || existingMetadata.size)) || 0;
     const inheritedS3Key = body.s3Key || (existingMetadata && (existingMetadata.k_s3 || existingMetadata.s3Key)) || key;
+    const inheritedThumbnailKey = thumbnailKey || (existingMetadata && (existingMetadata.th || existingMetadata.thumbnailKey)) || "";
+    const inheritedWidth = Math.floor(Number(width)) || (existingMetadata && Math.floor(Number(existingMetadata.w ?? existingMetadata.width))) || 0;
+    const inheritedHeight = Math.floor(Number(height)) || (existingMetadata && Math.floor(Number(existingMetadata.h ?? existingMetadata.height))) || 0;
     const compressedMeta = {
       ...(safeCid ? { c: safeCid } : {}),
       s: inheritedSize,
@@ -355,6 +363,8 @@ export async function onRequestPost(context) {
       ...(flags > 0 ? { f: flags } : {}),
       ...(allowedHost ? { d: allowedHost } : {}),
       ...(inheritedS3Key && inheritedS3Key !== key ? { k_s3: inheritedS3Key } : {}),
+      ...(inheritedThumbnailKey ? { th: inheritedThumbnailKey } : {}),
+      ...(inheritedWidth > 0 && inheritedHeight > 0 ? { w: inheritedWidth, h: inheritedHeight } : {}),
       ...(calculatedExpiresAt ? { e: Math.floor(Number(calculatedExpiresAt) / 1000) } : {}),
       ...(existingLastKuboPinAttempt ? { k: Math.floor(Number(existingLastKuboPinAttempt) / 1000) } : {}),
       ...passwordMeta,
@@ -374,6 +384,7 @@ export async function onRequestPost(context) {
       unpinned: Boolean(flags & 1),
       kuboStatus: finalKuboStatus,
       allowedHost: allowedHost || null,
+      ...(compressedMeta.w && compressedMeta.h ? { width: compressedMeta.w, height: compressedMeta.h } : {}),
       ...(calculatedExpiresAt ? { expiresAt: calculatedExpiresAt } : {}),
       ...compressedMeta,
     };
