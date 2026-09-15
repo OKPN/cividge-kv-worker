@@ -55,16 +55,12 @@ function unpackMetadata(name, cid, meta = {}) {
 // 投稿・一覧・削除の管理者認証検証（KV相乗り防止・責任分離）
 function verifyAdminAuth(request, env) {
   const adminToken = (env.ADMIN_API_TOKEN || env.API_TOKEN || "").trim();
-  if (!adminToken) return true; // 環境変数未設定の場合はローカル/オープン動作
+  if (!adminToken) return false;
 
   let clientToken = "";
   const authHeader = (request.headers.get("Authorization") || "").trim();
   if (authHeader) {
     clientToken = authHeader.startsWith("Bearer ") ? authHeader.substring(7).trim() : authHeader;
-  }
-  if (!clientToken) {
-    const url = new URL(request.url);
-    clientToken = (url.searchParams.get("admin_token") || url.searchParams.get("token") || "").trim();
   }
   return clientToken === adminToken;
 }
@@ -78,6 +74,15 @@ export async function onRequestGet(context) {
   if (!env || !env.IPFS_KV) {
     return new Response(JSON.stringify({ error: "IPFS_KV binding not configured" }), {
       status: 500,
+      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+    });
+  }
+
+  // 配信処理はこの API を経由せず Worker 内で KV を参照する。
+  // パスワード hash / salt / セッション情報を含む管理メタデータを公開しない。
+  if (!verifyAdminAuth(request, env)) {
+    return new Response(JSON.stringify({ error: "Unauthorized: Admin token required" }), {
+      status: 401,
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
   }
@@ -265,20 +270,14 @@ export async function onRequestPost(context) {
       const saltHex = Array.from(saltBytes)
         .map(b => b.toString(16).padStart(2, "0"))
         .join("");
-      const sessionSecret = "sec_" + Array.from(crypto.getRandomValues(new Uint8Array(16)))
-        .map(b => b.toString(16).padStart(2, "0"))
-        .join("");
-
       passwordMeta = {
         passwordHash: hashHex,
         passwordSalt: saltHex,
-        sessionSecret,
       };
     } else if (existingMetadata && existingMetadata.passwordHash) {
       passwordMeta = {
         passwordHash: existingMetadata.passwordHash,
         passwordSalt: existingMetadata.passwordSalt,
-        sessionSecret: existingMetadata.sessionSecret,
       };
     }
 
