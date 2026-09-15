@@ -349,6 +349,65 @@ function renderNotFoundResponse(request, cdnCacheSeconds = 60) {
   });
 }
 
+function capCacheToExpiry(defaultSeconds, expiresAt) {
+  if (!expiresAt) return defaultSeconds;
+  const remainingSeconds = Math.ceil((Number(expiresAt) - Date.now()) / 1000);
+  return Math.max(0, Math.min(defaultSeconds, remainingSeconds));
+}
+
+// 期限切れリンクは、最初にアクセスされた時だけ回収する。定期実行は行わない。
+// 同じ CID を参照する別名が残る限り pin は維持し、最後のリンクなら Kubo 用の
+// 墓標を作成する。FILEBASE_IPFS_API_KEY が設定済みの場合は Filebase pin も解放する。
+async function cleanupExpiredAlias(env, request, key, expectedCid) {
+  if (!env?.IPFS_KV || !key || !expectedCid) return;
+
+  try {
+    // 古いエッジ読み取り結果で、延長・再登録されたリンクを消さないよう再確認する。
+    const latest = await env.IPFS_KV.getWithMetadata(key);
+    const latestMeta = latest?.metadata || {};
+    const latestExpiresAt = latestMeta.e ? latestMeta.e * 1000 : latestMeta.expiresAt;
+    if (!latest?.value || latest.value !== expectedCid || !latestExpiresAt || Date.now() <= Number(latestExpiresAt)) return;
+
+    if (latestMeta.blobKey) {
+      await env.IPFS_KV.delete(latestMeta.blobKey).catch(() => {});
+    }
+    await env.IPFS_KV.delete(key);
+
+    // KV list は1,000件ずつなので、全ページを確認できた場合だけ「最後」と断定する。
+    let cursor = undefined;
+    let isCidShared = false;
+    do {
+      const page = await env.IPFS_KV.list({ limit: 1000, ...(cursor ? { cursor } : {}) });
+      isCidShared = (page.keys || []).some((item) => {
+        if (item.name.startsWith("tombstone_") || item.name.startsWith("blob_")) return false;
+        return (item.metadata?.c || item.metadata?.cid) === expectedCid;
+      });
+      cursor = page.list_complete === false ? page.cursor : undefined;
+    } while (!isCidShared && cursor);
+
+    if (!isCidShared) {
+      // 自宅 Kubo が次回起動した際に回収できるよう、既存仕様の墓標を維持する。
+      await env.IPFS_KV.put(`tombstone_${expectedCid}`, "1", { expirationTtl: 86400 * 30 }).catch(() => {});
+
+      // Filebase 用の限定 RPC key がある運用では、最後の別名で pin も解放する。
+      const filebaseKey = (env.FILEBASE_IPFS_API_KEY || "").trim();
+      if (filebaseKey) {
+        const release = await fetch(`https://rpc.filebase.io/api/v0/pin/rm?arg=${encodeURIComponent(expectedCid)}`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${filebaseKey}` },
+        });
+        if (!release.ok) console.warn(`Filebase unpin failed for expired CID (${release.status})`);
+      }
+    }
+
+    // 同じ URL が残っているエッジキャッシュをこの PoP から外す。
+    await caches.default.delete(request).catch(() => {});
+  } catch (err) {
+    // 配信の 404 自体は優先する。回収失敗時は次のアクセスで再試行される。
+    console.warn("Expired alias cleanup failed:", err);
+  }
+}
+
 export async function onRequest(context) {
   const { request, env } = context;
 
@@ -406,6 +465,7 @@ export async function onRequest(context) {
 
   let targetCid = null;
   let meta = {};
+  let resolvedKvKey = "";
   if (env && env.IPFS_KV) {
     try {
       const currentHost = url.hostname.toLowerCase();
@@ -427,6 +487,7 @@ export async function onRequest(context) {
       if (kvRes && kvRes.value) {
         targetCid = kvRes.value;
         meta = kvRes.metadata || {};
+        resolvedKvKey = isDomainSpecific ? `${currentHost}:${filename}` : filename;
       }
     } catch (kvErr) {
       console.warn("IPFS_KV get error:", kvErr);
@@ -436,6 +497,9 @@ export async function onRequest(context) {
   // ⏳ 時限アップロードの有効期限チェック（期限切れは即座に404、短縮キー e にも対応）
   const expiresTimestamp = meta.e ? (meta.e * 1000) : meta.expiresAt;
   if (expiresTimestamp && Date.now() > Number(expiresTimestamp)) {
+    // waitUntil により 404 を待たせず、期限切れアクセス時だけ後始末する。
+    const cleanup = cleanupExpiredAlias(env, request, resolvedKvKey, targetCid);
+    context.waitUntil?.(cleanup) || cleanup;
     return renderNotFoundResponse(request);
   }
 
@@ -514,12 +578,13 @@ export async function onRequest(context) {
   const isCrawlerVideo = (crawlerExt === "mp4" || crawlerExt === "webm");
   if (!hasPassword && isSocialCrawler(userAgent)) {
     const ogpHtml = renderOgpHtml(filename, request.url, crawlerExt, isCrawlerVideo, url.origin);
+    const ogpCacheSeconds = capCacheToExpiry(86400, expiresTimestamp);
     return new Response(ogpHtml, {
       status: 200,
       headers: {
         "Content-Type": "text/html; charset=utf-8",
-        "Cache-Control": "public, max-age=86400",
-        "Cloudflare-CDN-Cache-Control": "public, max-age=86400",
+        "Cache-Control": `public, max-age=${ogpCacheSeconds}`,
+        "Cloudflare-CDN-Cache-Control": `public, max-age=${ogpCacheSeconds}`,
         "Access-Control-Allow-Origin": "*",
       },
     });
@@ -541,7 +606,7 @@ export async function onRequest(context) {
         const extLower = extMatch[1].toLowerCase();
         const isVideo = ["mp4", "webm", "mov", "m4v", "avi", "ogv"].includes(extLower);
         const isAudio = ["mp3", "wav", "ogg", "m4a", "flac", "aac"].includes(extLower);
-        const CACHE_SECONDS = (isVideo || isAudio) ? 14400 : 3600; // 動画・音声4時間 / その他1時間
+        const CACHE_SECONDS = capCacheToExpiry((isVideo || isAudio) ? 14400 : 3600, expiresTimestamp); // 動画・音声4時間 / その他1時間（期限を超えない）
         if (hasPassword) {
           headers.set("Cache-Control", `private, max-age=${CACHE_SECONDS}`);
           headers.set("Cloudflare-CDN-Cache-Control", "private, no-store");
@@ -588,7 +653,7 @@ export async function onRequest(context) {
   // （週1回の上流アクセスでIPFSノードのGC消去を回避・延命し、Filebase転送枠も死守）
   // 通常ピン留め中は 1年間（31,536,000秒）キャッシュ
   const isUnpinned = Boolean(meta.unpinned) || Boolean((meta.f || 0) & 1);
-  const UPSTREAM_CACHE_SECONDS = isUnpinned ? (7 * 86400) : 31536000;
+  const UPSTREAM_CACHE_SECONDS = capCacheToExpiry(isUnpinned ? (7 * 86400) : 31536000, expiresTimestamp);
 
   // ゲートウェイの優先順位を分散（アンピン時は公共ノードにも均等にアクセスを散らす）
   const orderedGateways = isUnpinned
@@ -646,7 +711,7 @@ export async function onRequest(context) {
   const isVideo = ["mp4", "webm", "mov", "m4v", "avi", "ogv"].includes(extMatch[1].toLowerCase());
   const isAudio = ["mp3", "wav", "ogg", "m4a", "flac", "aac"].includes(extMatch[1].toLowerCase());
   // 🌊 アンピン（IPFS漂流中）ファイルは、7日間に1回アクセスがあれば上流をつついて延命し、アクセスが無ければ自然消滅するよう7日間に設定
-  const CACHE_SECONDS = isUnpinned ? (7 * 86400) : ((isVideo || isAudio) ? 14400 : 3600);
+  const CACHE_SECONDS = capCacheToExpiry(isUnpinned ? (7 * 86400) : ((isVideo || isAudio) ? 14400 : 3600), expiresTimestamp);
   if (hasPassword) {
     headers.set("Cache-Control", `private, max-age=${CACHE_SECONDS}`);
     headers.set("Cloudflare-CDN-Cache-Control", "private, no-store");

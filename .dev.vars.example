@@ -1,1 +1,3 @@
 ADMIN_API_TOKEN="your_secret_token_here"
+UPLOAD_TOKEN="separate_upload_only_token_here"
+FILEBASE_IPFS_API_KEY="filebase_bucket_scoped_ipfs_rpc_api_key"

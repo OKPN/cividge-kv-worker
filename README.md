@@ -65,6 +65,8 @@ Set your secret admin API token in .dev.vars:
 
 `nv
 ADMIN_API_TOKEN="your_strong_secret_token_here"
+UPLOAD_TOKEN="a_separate_upload_only_token"
+FILEBASE_IPFS_API_KEY="your_filebase_bucket_scoped_ipfs_rpc_api_key"
 `
 
 Configure your KV namespace in wrangler.toml:
@@ -89,6 +91,8 @@ Set the secret on Cloudflare:
 
 `ash
 npx wrangler secret put ADMIN_API_TOKEN
+npx wrangler secret put UPLOAD_TOKEN
+npx wrangler secret put FILEBASE_IPFS_API_KEY
 `
 
 Deploy the Worker:
@@ -96,6 +100,19 @@ Deploy the Worker:
 `ash
 npx wrangler deploy
 `
+
+### External upload API / Filebase
+
+`POST /api/upload?storage=filebase` uploads to Filebase through its IPFS RPC API and registers the returned CID in `IPFS_KV`. It requires both secrets below:
+
+- `UPLOAD_TOKEN`: the token used only by external upload clients such as the Windows **Send To** batch. Do not reuse `ADMIN_API_TOKEN`.
+- `FILEBASE_IPFS_API_KEY`: a bucket-scoped Filebase IPFS RPC API key. This stays in the Worker and must never be placed in a browser, BAT file, or repository.
+
+### Expiring links (no Cron)
+
+Expiry is stored as metadata rather than Cloudflare KV native TTL. On the first request after an expiry, the delivery Worker returns 404, removes only that alias, and checks whether another alias still references the CID. Only the final alias creates the Kubo unpin tombstone; when `FILEBASE_IPFS_API_KEY` is configured, it also requests Filebase to remove the pin. There is no scheduled scan or work while an expired URL remains unvisited.
+
+The client sends `UPLOAD_TOKEN` only as an `Authorization: Bearer` header. Do not place tokens in URL query strings.
 
 ## Supported File Extensions
 

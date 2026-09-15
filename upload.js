@@ -29,6 +29,49 @@ const MIME_MAP = {
   zip: "application/zip", "7z": "application/x-7z-compressed", pdf: "application/pdf"
 };
 
+function isIpfsCid(value) {
+  return typeof value === "string" && /^(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,})$/.test(value);
+}
+
+// Filebase の IPFS RPC API へ投稿する。S3 Access/Secret Key をクライアントへ
+// 出さず、Worker の FILEBASE_IPFS_API_KEY（バケット限定キー）だけで実行する。
+async function uploadToFilebase(fileBuffer, filename, contentType, env) {
+  const apiKey = (env.FILEBASE_IPFS_API_KEY || "").trim();
+  if (!apiKey) {
+    throw new Error("Filebase 投稿は未設定です。Worker に FILEBASE_IPFS_API_KEY を secret として設定してください。");
+  }
+
+  const formData = new FormData();
+  formData.append("file", new Blob([fileBuffer], { type: contentType || "application/octet-stream" }), filename);
+
+  const response = await fetch("https://rpc.filebase.io/api/v0/add?cid-version=0", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}` },
+    body: formData,
+  });
+  const responseText = await response.text();
+  if (!response.ok) {
+    throw new Error(`Filebase 投稿エラー (${response.status}): ${responseText.slice(0, 300)}`);
+  }
+
+  // IPFS API は複数行 JSON を返す実装があるため、末尾から CID を探す。
+  let cid = "";
+  for (const line of responseText.trim().split(/\r?\n/).reverse()) {
+    try {
+      const payload = JSON.parse(line);
+      const candidate = payload.Hash || payload.Cid?.["/"] || payload.cid;
+      if (isIpfsCid(candidate)) {
+        cid = candidate;
+        break;
+      }
+    } catch (_) {}
+  }
+  if (!cid) {
+    throw new Error("Filebase から有効な CID が返されませんでした。");
+  }
+  return cid;
+}
+
 // 投稿トークンの検証 (外部投稿はトークン設定必須)
 function verifyAuth(request, env) {
   const adminToken = (env.ADMIN_API_TOKEN || env.API_TOKEN || "").trim();
@@ -61,6 +104,13 @@ export async function onRequestPost(context) {
   if (!verifyAuth(request, env)) {
     return new Response(JSON.stringify({ success: false, error: "Unauthorized: Invalid or missing token" }), {
       status: 401,
+      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+    });
+  }
+
+  if (!env.IPFS_KV) {
+    return new Response(JSON.stringify({ success: false, error: "IPFS_KV binding is not configured" }), {
+      status: 503,
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
   }
@@ -167,14 +217,19 @@ export async function onRequestPost(context) {
     // 6. ストレージへの保存
     const blobKey = `blob_${shortKey}`;
     let targetCid = null;
+    const storageBackend = (url.searchParams.get("storage") || request.headers.get("X-Storage-Backend") || "").trim().toLowerCase();
 
-    if (env.R2_BUCKET && (url.searchParams.get("storage") === "r2" || request.headers.get("X-Storage-Backend") === "r2")) {
+    if (storageBackend === "filebase") {
+      targetCid = await uploadToFilebase(fileBuffer, originalFilename || shortKey, contentType, env);
+    } else if (storageBackend === "r2" && env.R2_BUCKET) {
       await env.R2_BUCKET.put(shortKey, fileBuffer, {
         httpMetadata: { contentType },
         customMetadata: { size: String(fileBuffer.byteLength) },
       });
+    } else if (storageBackend === "r2") {
+      throw new Error("R2 投稿は未設定です。Worker に R2_BUCKET binding を設定してください。");
     } else {
-      // デフォルト: IPFS_KV に直接実データを保持 (超高速・即時配信)
+      // storage 未指定時のみ、後方互換として KV に直接実データを保持する。
       if (env.IPFS_KV) {
         await env.IPFS_KV.put(blobKey, fileBuffer);
       }
@@ -187,6 +242,8 @@ export async function onRequestPost(context) {
         size: fileBuffer.byteLength,
         mime: contentType,
         registeredAt: Date.now(),
+        ...(storageBackend ? { backend: storageBackend } : { backend: "kv" }),
+        ...(targetCid ? { cid: targetCid } : {}),
         ...(cleanHostname ? { allowedHost: cleanHostname, d: cleanHostname } : {}),
         ...passwordMeta,
       };
@@ -204,6 +261,8 @@ export async function onRequestPost(context) {
       filename: shortKey,
       size: fileBuffer.byteLength,
       domain: cleanHostname,
+      storage: storageBackend || "kv",
+      cid: targetCid || null,
       hasPassword: Boolean(password),
     }), {
       status: 200,

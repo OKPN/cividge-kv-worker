@@ -284,20 +284,21 @@ export async function onRequestPost(context) {
 
     // 有効期限の計算と明示的な解除（ttl: 0 または expiresAt: 0 で無期限化）
     let calculatedExpiresAt = null;
-    let putExpirationTtl = undefined;
-    if (expiresAt === 0 || ttl === 0 || expiresAt === null && body.clearTtl) {
+    // 期限は KV のネイティブ TTL には渡さない。
+    // TTL に任せるとレコードだけが無通知で消え、配信時に「この CID の
+    // 最後の別名だったか」を判定して Filebase/Kubo の pin を解放できなくなる。
+    // delivery.js が期限後の最初のアクセスで expiresAt を確認して削除する。
+    // ttl: 0 は「明示的に無期限へ変更」のときだけ期限を外す。
+    // Filebase → Kubo のような保存先状態の更新では、継続時間を持たず ttl: 0 が
+    // 渡されることがあるため、正の expiresAt があればそちらを最優先で維持する。
+    if (expiresAt === 0 || body.clearTtl || (ttl === 0 && (expiresAt === undefined || expiresAt === null))) {
       calculatedExpiresAt = null;
     } else if (expiresAt && Number(expiresAt) > 0) {
       calculatedExpiresAt = Number(expiresAt);
-      const remainingSec = Math.floor((calculatedExpiresAt - Date.now()) / 1000);
-      if (remainingSec > 60) putExpirationTtl = remainingSec;
     } else if (ttl && Number(ttl) > 0) {
       calculatedExpiresAt = Date.now() + Number(ttl) * 1000;
-      putExpirationTtl = Math.max(60, Number(ttl));
     } else if (existingMetadata && (existingMetadata.e || existingMetadata.expiresAt)) {
       calculatedExpiresAt = existingMetadata.e ? existingMetadata.e * 1000 : existingMetadata.expiresAt;
-      const remainingSec = Math.floor((calculatedExpiresAt - Date.now()) / 1000);
-      if (remainingSec > 60) putExpirationTtl = remainingSec;
     }
 
     // 既存の kuboStatus を引き継ぐ、または body から取得
@@ -360,11 +361,8 @@ export async function onRequestPost(context) {
       ...passwordMeta,
     };
 
-    // KV に登録 (value: safeCid, metadata, expirationTtl)
+    // KV に登録。期限はメタデータ e だけで管理し、アクセス時の掃除対象として残す。
     const putOptions = { metadata: compressedMeta };
-    if (putExpirationTtl && putExpirationTtl > 0) {
-      putOptions.expirationTtl = putExpirationTtl;
-    }
     await env.IPFS_KV.put(key, safeCid, putOptions);
 
     // クライアント側へは旧形式互換のオブジェクトも含めて返却
