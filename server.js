@@ -14,7 +14,7 @@ export default {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS, HEAD",
           "Access-Control-Allow-Headers": "Content-Type, Authorization, Range, If-Range, X-Upload-Password, X-Custom-Domain, X-Delivery-Domain, X-Storage-Backend",
-          "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
+          "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges, X-Image-Width, X-Image-Height",
         },
       });
     }
