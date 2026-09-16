@@ -16,7 +16,7 @@ cividge-kv-worker serves as the decentralized backend routing and caching layer 
   - Automatically intercepts crawlers from Misskey (SummalyBot), Twitter/X, Discord, Slack, Mastodon, and Bluesky.
   - Generates lightweight, instant OGP HTML cards with first-frame thumbnails (.thumb.webp) to completely bypass crawler timeouts and 10MB payload limitations.
 - 🎵 **Multi-Media & Range Streaming Support**:
-  - Native support for HTTP 206 Partial Content and byte-range requests for audio/video seeking (mp4, webm, mov, mp3, wav, m4a, lac, etc.).
+  - Native support for HTTP 206 Partial Content and byte-range requests for audio/video seeking (mp4, webm, mov, mp3, wav, m4a, flac, etc.).
   - Non-media files (PDF, plain text, Markdown, JSON, CSV) served cleanly without corruptive transforms.
 - 🔒 **Edge Password Gate**:
   - Secure session-based verification gate using SHA-256 password hashes with zero origin overhead.
@@ -27,7 +27,7 @@ cividge-kv-worker serves as the decentralized backend routing and caching layer 
 
 ## Architecture
 
-`
+```text
 User / Social Bot (Misskey, Twitter, Discord)
                │
                ▼
@@ -44,7 +44,7 @@ User / Social Bot (Misskey, Twitter, Discord)
                │
                ▼
    [ Filebase IPFS / R2 Origin ] (Populates edge cache & returns byte stream)
-`
+```
 
 ## Setup & Deployment
 
@@ -57,21 +57,21 @@ User / Social Bot (Misskey, Twitter, Discord)
 
 Copy the example environment file:
 
-`ash
+```bash
 cp .dev.vars.example .dev.vars
-`
+```
 
 Set your secret admin API token in .dev.vars:
 
-`nv
+```env
 ADMIN_API_TOKEN="your_strong_secret_token_here"
 UPLOAD_TOKEN="a_separate_upload_only_token"
 FILEBASE_IPFS_API_KEY="your_filebase_bucket_scoped_ipfs_rpc_api_key"
-`
+```
 
 Configure your KV namespace in wrangler.toml:
 
-`	oml
+```toml
 name = "cividge-kv-worker"
 main = "server.js"
 compatibility_date = "2026-09-01"
@@ -83,23 +83,23 @@ id = "<your-kv-namespace-id>"
 
 [secrets]
 required = ["ADMIN_API_TOKEN"]
-`
+```
 
 ### 3. Deploy to Production
 
 Set the secret on Cloudflare:
 
-`ash
+```bash
 npx wrangler secret put ADMIN_API_TOKEN
 npx wrangler secret put UPLOAD_TOKEN
 npx wrangler secret put FILEBASE_IPFS_API_KEY
-`
+```
 
 Deploy the Worker:
 
-`ash
+```bash
 npx wrangler deploy
-`
+```
 
 ## Public delivery hardening
 
@@ -212,12 +212,12 @@ The generated Windows **Send To** batch uses a raw-body streaming upload (`X-Upl
 
 ## Supported File Extensions
 
-- **Images**: webp, png, jpg, jpeg, gif, jxl, vif, mp, ico
-- **Video**: mp4, webm, mov, m4v, vi, ogv
-- **Audio**: mp3, wav, ogg, m4a, lac, ac
-- **Documents**: pdf, 	xt, md, json, csv
+- **Images**: webp, png, jpg, jpeg, gif, jxl, avif, bmp, ico
+- **Video**: mp4, webm, mov, m4v, avi, ogv
+- **Audio**: mp3, wav, ogg, m4a, flac, aac
+- **Documents**: pdf, txt, md, json, csv
 
-*Note: Executable files and archive formats (zip, 7z, ar, xe, html) are blocked by design for origin defense and security compliance.*
+*Note: Executable files and archive formats (zip, 7z, rar, exe, html) are blocked by design for origin defense and security compliance.*
 
 ## License
 
