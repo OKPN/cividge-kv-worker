@@ -498,7 +498,11 @@ export async function onRequest(context) {
   // workers.dev は管理 API の接続先としては残すが、公開メディアの配信入口には
   // しない。f5.si Zone の URL Rewrite / Rate Limit を迂回して Worker を直接
   // 叩かれる経路を閉じる。`/api/*` は server.js が先に処理するため影響しない。
-  if (url.hostname.endsWith(".workers.dev")) {
+  // URL 内部名ではなく受信 Host を使う。Custom Domain で実行される Worker は
+  // 内部 URL が workers.dev を指す場合があるため、前者で判定すると正規配信まで
+  // 誤って遮断してしまう。
+  const requestHost = (request.headers.get("Host") || url.hostname).toLowerCase().split(":")[0];
+  if (requestHost.endsWith(".workers.dev")) {
     return renderNotFoundResponse(request, 86400);
   }
 
