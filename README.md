@@ -101,6 +101,100 @@ Deploy the Worker:
 npx wrangler deploy
 `
 
+## Public delivery hardening
+
+This section is optional for a private setup, but recommended when public media
+URLs may be posted to boards, chat services, or social platforms. It keeps a
+stable `pages.dev` URL as the public entry while making the Worker domain a
+small, controlled backend surface.
+
+### 1. Use a static Pages relay as the public URL
+
+Deploy the function-free Filebase relay template from the main
+[Cividge repository](https://github.com/OKPN/cividge/tree/main/compatibility-layer/filebase).
+It should redirect the public path to a compatibility Worker domain using the
+internal `/r/` prefix:
+
+```text
+/* https://media.example.com/r/:splat 307
+```
+
+The public URL users share stays clean:
+
+```text
+https://your-public-relay.pages.dev/example.mp4
+```
+
+The redirect destination is only an implementation detail:
+
+```text
+https://media.example.com/r/example.mp4
+```
+
+In `wrangler.toml`, allow the public Pages hostname so the Worker can resolve
+the correct delivery-domain registry entry:
+
+```toml
+[vars]
+STATIC_RELAY_PUBLIC_HOSTS = "your-public-relay.pages.dev"
+```
+
+`workers.dev` remains useful as an API endpoint for the Cividge client, but
+this Worker intentionally rejects media delivery through `workers.dev`.
+
+### 2. Normalize query strings at the compatibility domain
+
+In the Cloudflare zone that owns `media.example.com`, create a **URL Rewrite
+Rule**:
+
+- Match: `http.host eq "media.example.com"`
+- Path: **Preserve**
+- Query: rewrite to an empty static value
+
+This makes `example.webp?x=1` and `example.webp?x=random` reach the same
+backend cache key. The `/r/` marker stays in the path, so the Worker still
+recognizes a request that came through the approved public relay.
+
+### 3. Bound unique-path traffic
+
+In **Security → Security rules → Rate limiting rules**, add a rule for paths
+starting with `/r/`:
+
+- Counting characteristic: IP address
+- Threshold: **30 requests per 10 seconds**
+- Action: **Block**
+- Mitigation timeout: **10 seconds**
+
+On Cloudflare Free, rate-limit expressions are path-focused and only one rule
+is available. Reserving `/r/` for this relay prevents the rule from affecting
+unrelated services in the same zone.
+
+### 4. Optional strict backend-only mode
+
+After confirming that no legacy direct links to `media.example.com/<file>` need
+to remain public, add a **Custom WAF Rule** with the **Block** action:
+
+```cf
+http.host eq "media.example.com"
+and not starts_with(http.request.uri.path, "/r/")
+and not starts_with(http.request.uri.path, "/api/")
+```
+
+This rejects arbitrary direct paths before the Worker runs while preserving the
+relay path and authenticated API routes.
+
+### What this protects
+
+- Query-string variants of the same public file converge on one cached object.
+- Repeated requests for the same missing path receive a short-lived cached 404.
+- Unregistered media names return 404 without probing Filebase, IPFS gateways,
+  or Kubo.
+- Rate limiting bounds repeated unique `/r/` paths from one source IP.
+
+This does not make an already-public CID secret, prevent a recipient from
+redistributing a downloaded file, or fully stop a distributed botnet. Those are
+properties of public content distribution rather than the Worker routing layer.
+
 ### External upload API / Filebase
 
 `POST /api/upload?storage=filebase` uploads to Filebase through its IPFS RPC API and registers the returned CID in `IPFS_KV`. It accepts only `UPLOAD_TOKEN` (not `ADMIN_API_TOKEN`) and requires both secrets below:
