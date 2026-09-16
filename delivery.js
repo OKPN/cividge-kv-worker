@@ -409,6 +409,27 @@ function capCacheToExpiry(defaultSeconds, expiresAt) {
   return Math.max(0, Math.min(defaultSeconds, remainingSeconds));
 }
 
+// Cloudflare のゾーン単位パージを設定した運用だけ、公開メディアの CDN TTL を延ばす。
+// 片方でも未設定なら従来の短い TTL に戻るため、pages.dev 単独運用の挙動は変わらない。
+function hasGlobalPurgeConfiguration(env) {
+  return Boolean(
+    env?.CLOUDFLARE_ZONE_ID &&
+    (env?.CLOUDFLARE_PURGE_TOKEN || env?.CLOUDFLARE_API_TOKEN)
+  );
+}
+
+function publicMediaCacheSeconds(env, { isVideoOrAudio = false, isUnpinned = false, expiresAt = null } = {}) {
+  // FIFO 等で pin が外れた CID は、IPFS 上での実体を延命する既存の 7 日戦略を維持する。
+  if (isUnpinned) return capCacheToExpiry(7 * 86400, expiresAt);
+
+  // Zone purge を利用できる場合だけ 24 時間へ延長。未設定時は従来どおり、
+  // 画像・通常ファイルは 1 時間、動画・音声は 4 時間。
+  const defaultSeconds = hasGlobalPurgeConfiguration(env)
+    ? 86400
+    : (isVideoOrAudio ? 14400 : 3600);
+  return capCacheToExpiry(defaultSeconds, expiresAt);
+}
+
 // アップロード時に台帳へ保存した実寸を、直リンクを事前解析するクライアントへ渡す。
 function setImageDimensionHeaders(headers, meta = {}) {
   const width = Math.floor(Number(meta.w ?? meta.width));
@@ -744,7 +765,10 @@ export async function onRequest(context) {
         const extLower = extMatch[1].toLowerCase();
         const isVideo = ["mp4", "webm", "mov", "m4v", "avi", "ogv"].includes(extLower);
         const isAudio = ["mp3", "wav", "ogg", "m4a", "flac", "aac"].includes(extLower);
-        const CACHE_SECONDS = capCacheToExpiry((isVideo || isAudio) ? 14400 : 3600, expiresTimestamp); // 動画・音声4時間 / その他1時間（期限を超えない）
+        const CACHE_SECONDS = publicMediaCacheSeconds(env, {
+          isVideoOrAudio: isVideo || isAudio,
+          expiresAt: expiresTimestamp,
+        });
         if (hasPassword) {
           headers.set("Cache-Control", `private, max-age=${CACHE_SECONDS}`);
           headers.set("Cloudflare-CDN-Cache-Control", "private, no-store");
@@ -853,7 +877,11 @@ export async function onRequest(context) {
   const isVideo = ["mp4", "webm", "mov", "m4v", "avi", "ogv"].includes(extMatch[1].toLowerCase());
   const isAudio = ["mp3", "wav", "ogg", "m4a", "flac", "aac"].includes(extMatch[1].toLowerCase());
   // 🌊 アンピン（IPFS漂流中）ファイルは、7日間に1回アクセスがあれば上流をつついて延命し、アクセスが無ければ自然消滅するよう7日間に設定
-  const CACHE_SECONDS = capCacheToExpiry(isUnpinned ? (7 * 86400) : ((isVideo || isAudio) ? 14400 : 3600), expiresTimestamp);
+  const CACHE_SECONDS = publicMediaCacheSeconds(env, {
+    isVideoOrAudio: isVideo || isAudio,
+    isUnpinned,
+    expiresAt: expiresTimestamp,
+  });
   if (hasPassword) {
     headers.set("Cache-Control", `private, max-age=${CACHE_SECONDS}`);
     headers.set("Cloudflare-CDN-Cache-Control", "private, no-store");

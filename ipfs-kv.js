@@ -499,7 +499,9 @@ export async function onRequestDelete(context) {
 // 🌐 ハイブリッド Cache Purge ヘルパー
 // プランA (独自ドメイン設定時): REST Purge API で世界300箇所の全エッジから即時抹消
 // プランB (pages.dev無料運用時): Cache API (caches.default) でローカルPoPから即時抹消
-// ※ 開発者や特定ドメインを特別扱いせず、Request Origin / Referer / allowedHost から100%動的に解決
+// ※ ローカル Cache API の削除先は Request Origin / Referer / allowedHost から動的に解決する。
+//    Zone API は他ゾーンや pages.dev を渡すと失敗し得るため、明示設定した同一ゾーンの
+//    互換レイヤーだけを対象にする。
 async function purgeHybridCache(request, env, key, extraDomains = []) {
   if (!key) return;
   const colonIdx = key.indexOf(":");
@@ -548,19 +550,44 @@ async function purgeHybridCache(request, env, key, extraDomains = []) {
 
   const urlsToPurge = Array.from(targetDomains).map(origin => `${origin}${targetPath}`);
 
+  // 静的 Pages 公開入口は /<file> -> 独自ゾーンの /r/<file> へ送る。
+  // Zone Purge API へは、そのゾーンに属する実配信 URL だけを渡す。
+  const backendRelayOrigins = String(env.STATIC_RELAY_BACKEND_HOSTS || "")
+    .split(",")
+    .map(host => host.trim())
+    .filter(Boolean)
+    .map(host => host.startsWith("http") ? host : `https://${host}`)
+    .map(host => {
+      try { return new URL(host).origin; } catch (e) { return null; }
+    })
+    .filter(Boolean);
+  const relayTargetPath = `/r/${encodeURIComponent(pureFilename)}`;
+  const globalUrlsToPurge = backendRelayOrigins.flatMap(origin => [
+    `${origin}${relayTargetPath}`,
+    // 互換レイヤー導入前の plain path も、移行中のキャッシュを残さないよう併せて消す。
+    `${origin}${targetPath}`,
+  ]);
+
+  // Cache API でも実配信 URL を削除する。これは現在の PoP 限定の補助策。
+  urlsToPurge.push(...globalUrlsToPurge);
+
   // 1. プランA: REST Purge API (独自ドメインの Zone ID & API Token がある場合)
   const zoneId = env.CLOUDFLARE_ZONE_ID;
   const purgeToken = env.CLOUDFLARE_PURGE_TOKEN || env.CLOUDFLARE_API_TOKEN;
   if (zoneId && purgeToken) {
     try {
-      await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/purge_cache`, {
+      const response = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/purge_cache`, {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${purgeToken}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ files: urlsToPurge }),
+        body: JSON.stringify({ files: globalUrlsToPurge }),
       });
+      const result = await response.json().catch(() => null);
+      if (!response.ok || result?.success !== true) {
+        console.warn(`REST Purge API failed (${response.status}):`, result || "invalid JSON response");
+      }
     } catch (apiErr) {
       console.warn("REST Purge API error:", apiErr);
     }

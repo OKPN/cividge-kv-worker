@@ -12,6 +12,9 @@ enabled = true
 # Static Pages public entry points allowed to identify their original host.
 # Add comma-separated hosts here when another relay is intentionally deployed.
 STATIC_RELAY_PUBLIC_HOSTS = "content-relay.pages.dev"
+# The custom-zone endpoint behind the static Pages relay.  Its /r/<file> URL is
+# globally purged when CLOUDFLARE_ZONE_ID and CLOUDFLARE_PURGE_TOKEN are set.
+STATIC_RELAY_BACKEND_HOSTS = "ipfs-relay.k7m.f5.si"
 
 [[kv_namespaces]]
 binding = "IPFS_KV"
