@@ -7,7 +7,7 @@ export async function onRequestOptions() {
     headers: {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Upload-Password, X-Custom-Domain, X-Delivery-Domain, X-Storage-Backend",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Upload-Password, X-Upload-Filename, X-Custom-Domain, X-Delivery-Domain, X-Storage-Backend",
     },
   });
 }
@@ -29,7 +29,85 @@ const MIME_MAP = {
   zip: "application/zip", "7z": "application/x-7z-compressed", pdf: "application/pdf"
 };
 
-const MAX_UPLOAD_BYTES = 80 * 1024 * 1024;
+// Cloudflare Free/Pro の 100 MB request-body 上限を超えないよう、十進 99 MB とする。
+const MAX_UPLOAD_BYTES = 99 * 1000 * 1000;
+const MAX_UPLOAD_LABEL = "99 MB";
+const MAX_BUFFERED_UPLOAD_BYTES = 80 * 1024 * 1024;
+const MAX_BUFFERED_UPLOAD_LABEL = "80 MiB";
+
+class UploadTooLargeError extends Error {
+  constructor() {
+    super(`File too large (Max: ${MAX_UPLOAD_LABEL})`);
+    this.name = "UploadTooLargeError";
+  }
+}
+
+function createSizeLimitedStream(source, maxBytes) {
+  const reader = source.getReader();
+  let byteLength = 0;
+  const body = new ReadableStream({
+    async pull(controller) {
+      const { done, value } = await reader.read();
+      if (done) {
+        controller.close();
+        return;
+      }
+      byteLength += value.byteLength;
+      if (byteLength > maxBytes) {
+        await reader.cancel("Upload size limit exceeded");
+        controller.error(new UploadTooLargeError());
+        return;
+      }
+      controller.enqueue(value);
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+  return { body, getByteLength: () => byteLength };
+}
+
+function createFilebaseMultipartStream(fileStream, filename, contentType) {
+  const boundary = `----cividge-${crypto.randomUUID()}`;
+  const safeFilename = String(filename || "upload_file").replace(/[\r\n"]/g, "_");
+  const encoder = new TextEncoder();
+  const prefix = encoder.encode(
+    `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${safeFilename}"\r\nContent-Type: ${contentType || "application/octet-stream"}\r\n\r\n`,
+  );
+  const suffix = encoder.encode(`\r\n--${boundary}--\r\n`);
+  const reader = fileStream.getReader();
+  let stage = 0;
+
+  return {
+    contentType: `multipart/form-data; boundary=${boundary}`,
+    body: new ReadableStream({
+      async pull(controller) {
+        if (stage === 0) {
+          stage = 1;
+          controller.enqueue(prefix);
+          return;
+        }
+        if (stage === 1) {
+          const { done, value } = await reader.read();
+          if (!done) {
+            controller.enqueue(value);
+            return;
+          }
+          stage = 2;
+        }
+        if (stage === 2) {
+          stage = 3;
+          controller.enqueue(suffix);
+          return;
+        }
+        controller.close();
+      },
+      cancel(reason) {
+        return reader.cancel(reason);
+      },
+    }),
+  };
+}
 
 function isIpfsCid(value) {
   return typeof value === "string" && /^(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,})$/.test(value);
@@ -74,23 +152,47 @@ async function uploadToFilebase(fileBuffer, filename, contentType, env) {
   return cid;
 }
 
-// 投稿トークンの検証 (外部投稿はトークン設定必須)
-function verifyAuth(request, env) {
-  const adminToken = (env.ADMIN_API_TOKEN || env.API_TOKEN || "").trim();
-  const uploadToken = (env.UPLOAD_TOKEN || "").trim();
-  const requiredToken = adminToken || uploadToken;
+async function uploadStreamToFilebase(fileStream, filename, contentType, env) {
+  const apiKey = (env.FILEBASE_IPFS_API_KEY || "").trim();
+  if (!apiKey) {
+    throw new Error("Filebase 投稿は未設定です。Worker に FILEBASE_IPFS_API_KEY を secret として設定してください。");
+  }
+  const multipart = createFilebaseMultipartStream(fileStream, filename, contentType);
+  const response = await fetch("https://rpc.filebase.io/api/v0/add?cid-version=0", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": multipart.contentType,
+    },
+    body: multipart.body,
+  });
+  const responseText = await response.text();
+  if (!response.ok) {
+    throw new Error(`Filebase 投稿エラー (${response.status}): ${responseText.slice(0, 300)}`);
+  }
+  for (const line of responseText.trim().split(/\r?\n/).reverse()) {
+    try {
+      const payload = JSON.parse(line);
+      const candidate = payload.Hash || payload.Cid?.["/"] || payload.cid;
+      if (isIpfsCid(candidate)) return candidate;
+    } catch (_) {}
+  }
+  throw new Error("Filebase から有効な CID が返されませんでした。");
+}
 
-  // 🛡️ トークンが環境変数に設定されていない場合は、不正投稿を防ぐため拒否
-  if (!requiredToken) return false;
+// 投稿トークンの検証。管理トークンは投稿 API に流用しない。
+function verifyAuth(request, env) {
+  const uploadToken = (env.UPLOAD_TOKEN || "").trim();
+
+  // UPLOAD_TOKEN が未設定なら API 自体を無効化する。
+  if (!uploadToken) return false;
 
   let clientToken = "";
   const authHeader = (request.headers.get("Authorization") || "").trim();
   if (authHeader) {
     clientToken = authHeader.startsWith("Bearer ") ? authHeader.substring(7).trim() : authHeader;
   }
-  if (adminToken && clientToken === adminToken) return true;
-  if (uploadToken && clientToken === uploadToken) return true;
-  return false;
+  return clientToken === uploadToken;
 }
 
 export async function onRequestPost(context) {
@@ -113,22 +215,27 @@ export async function onRequestPost(context) {
   }
 
   try {
+    const contentTypeHeader = request.headers.get("Content-Type") || "";
+    const isMultipart = contentTypeHeader.includes("multipart/form-data");
     const declaredLength = Number(request.headers.get("content-length") || 0);
-    if (declaredLength > MAX_UPLOAD_BYTES) {
-      return new Response(JSON.stringify({ success: false, error: "File too large (Max: 80MB)" }), {
+    const declaredLimit = isMultipart ? MAX_BUFFERED_UPLOAD_BYTES : MAX_UPLOAD_BYTES;
+    const declaredLimitLabel = isMultipart ? MAX_BUFFERED_UPLOAD_LABEL : MAX_UPLOAD_LABEL;
+    if (declaredLength > declaredLimit) {
+      return new Response(JSON.stringify({ success: false, error: `File too large (Max: ${declaredLimitLabel})` }), {
         status: 413,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
     }
 
     let fileBuffer = null;
-    let originalFilename = url.searchParams.get("filename") || "";
-    let password = (request.headers.get("X-Upload-Password") || url.searchParams.get("password") || "").trim();
+    let fileStream = null;
+    let streamByteLength = null;
+    let originalFilename = url.searchParams.get("filename") || request.headers.get("X-Upload-Filename") || "";
+    // パスワードを URL に入れると履歴・ログへ残り得るため、ヘッダーか multipart のみ許可。
+    let password = (request.headers.get("X-Upload-Password") || "").trim();
     let contentType = "";
 
-    const contentTypeHeader = request.headers.get("Content-Type") || "";
-
-    if (contentTypeHeader.includes("multipart/form-data")) {
+    if (isMultipart) {
       const formData = await request.formData();
       const uploadedFile = formData.get("file") || formData.get("image");
       if (uploadedFile && typeof uploadedFile.arrayBuffer === "function") {
@@ -140,18 +247,32 @@ export async function onRequestPost(context) {
         password = String(formData.get("password")).trim();
       }
     } else {
-      fileBuffer = await request.arrayBuffer();
+      if (!request.body) {
+        return new Response(JSON.stringify({ success: false, error: "No file content uploaded" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+        });
+      }
+      const limited = createSizeLimitedStream(request.body, MAX_UPLOAD_BYTES);
+      fileStream = limited.body;
+      streamByteLength = limited.getByteLength;
       contentType = contentTypeHeader.split(";")[0].trim();
     }
 
-    if (!fileBuffer || fileBuffer.byteLength === 0) {
+    if (!fileBuffer && !fileStream) {
       return new Response(JSON.stringify({ success: false, error: "No file content uploaded" }), {
         status: 400,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
     }
-    if (fileBuffer.byteLength > MAX_UPLOAD_BYTES) {
-      return new Response(JSON.stringify({ success: false, error: "File too large (Max: 80MB)" }), {
+    if (fileBuffer && fileBuffer.byteLength === 0) {
+      return new Response(JSON.stringify({ success: false, error: "No file content uploaded" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+    if (fileBuffer && fileBuffer.byteLength > MAX_BUFFERED_UPLOAD_BYTES) {
+      return new Response(JSON.stringify({ success: false, error: `File too large (Max: ${MAX_BUFFERED_UPLOAD_LABEL})` }), {
         status: 413,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
@@ -227,26 +348,33 @@ export async function onRequestPost(context) {
     const storageBackend = (url.searchParams.get("storage") || request.headers.get("X-Storage-Backend") || "").trim().toLowerCase();
 
     if (storageBackend === "filebase") {
-      targetCid = await uploadToFilebase(fileBuffer, originalFilename || shortKey, contentType, env);
+      targetCid = fileStream
+        ? await uploadStreamToFilebase(fileStream, originalFilename || shortKey, contentType, env)
+        : await uploadToFilebase(fileBuffer, originalFilename || shortKey, contentType, env);
     } else if (storageBackend === "r2" && env.R2_BUCKET) {
-      await env.R2_BUCKET.put(shortKey, fileBuffer, {
+      await env.R2_BUCKET.put(shortKey, fileStream || fileBuffer, {
         httpMetadata: { contentType },
-        customMetadata: { size: String(fileBuffer.byteLength) },
+        customMetadata: { size: String(declaredLength || 0) },
       });
     } else if (storageBackend === "r2") {
       throw new Error("R2 投稿は未設定です。Worker に R2_BUCKET binding を設定してください。");
-    } else {
+    } else if (fileBuffer) {
       // storage 未指定時のみ、後方互換として KV に直接実データを保持する。
       if (env.IPFS_KV) {
         await env.IPFS_KV.put(blobKey, fileBuffer);
       }
+    } else {
+      throw new Error("ストリーミング投稿では storage=filebase または storage=r2 を指定してください。");
     }
+
+    const uploadedSize = fileBuffer ? fileBuffer.byteLength : streamByteLength();
+    if (uploadedSize === 0) throw new Error("No file content uploaded");
 
     // 7. KV にルーティング登録（キーは shortKey 単体とし、ドメイン制限は allowedHost メタデータで管理）
     if (env.IPFS_KV) {
       const kvMetadata = {
         blobKey,
-        size: fileBuffer.byteLength,
+        size: uploadedSize,
         mime: contentType,
         registeredAt: Date.now(),
         ...(storageBackend ? { backend: storageBackend } : { backend: "kv" }),
@@ -266,7 +394,7 @@ export async function onRequestPost(context) {
       url: targetUrl,
       key: shortKey,
       filename: shortKey,
-      size: fileBuffer.byteLength,
+      size: uploadedSize,
       domain: cleanHostname,
       storage: storageBackend || "kv",
       cid: targetCid || null,
@@ -282,7 +410,7 @@ export async function onRequestPost(context) {
   } catch (err) {
     console.error("Upload error:", err);
     return new Response(JSON.stringify({ success: false, error: err.message }), {
-      status: 500,
+      status: err instanceof UploadTooLargeError ? 413 : 500,
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
   }

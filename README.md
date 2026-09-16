@@ -103,9 +103,9 @@ npx wrangler deploy
 
 ### External upload API / Filebase
 
-`POST /api/upload?storage=filebase` uploads to Filebase through its IPFS RPC API and registers the returned CID in `IPFS_KV`. It requires both secrets below:
+`POST /api/upload?storage=filebase` uploads to Filebase through its IPFS RPC API and registers the returned CID in `IPFS_KV`. It accepts only `UPLOAD_TOKEN` (not `ADMIN_API_TOKEN`) and requires both secrets below:
 
-- `UPLOAD_TOKEN`: the token used only by external upload clients such as the Windows **Send To** batch. Do not reuse `ADMIN_API_TOKEN`.
+- `UPLOAD_TOKEN`: the token used only by external upload clients such as the Windows **Send To** batch. Do not reuse `ADMIN_API_TOKEN`. The generated batch contains this token in plain text: never share, commit, or place it in a shared folder; rotate the secret immediately if it leaks.
 - `FILEBASE_IPFS_API_KEY`: a bucket-scoped Filebase IPFS RPC API key. This stays in the Worker and must never be placed in a browser, BAT file, or repository.
 
 ### Expiring links (no Cron)
@@ -113,6 +113,8 @@ npx wrangler deploy
 Expiry is stored as metadata rather than Cloudflare KV native TTL. On the first request after an expiry, the delivery Worker returns 404, removes only that alias, and checks whether another alias still references the CID. Only the final alias creates the Kubo unpin tombstone; when `FILEBASE_IPFS_API_KEY` is configured, it also requests Filebase to remove the pin. There is no scheduled scan or work while an expired URL remains unvisited.
 
 The client sends `UPLOAD_TOKEN` only as an `Authorization: Bearer` header. Do not place tokens in URL query strings.
+
+The generated Windows **Send To** batch uses a raw-body streaming upload (`X-Upload-Filename` plus `--data-binary`) and accepts files up to **99 MB**, below Cloudflare Free/Pro's 100 MB request limit. Legacy `multipart/form-data` clients remain supported with an 80 MiB ceiling because their bodies must be buffered for parsing.
 
 ## Supported File Extensions
 
