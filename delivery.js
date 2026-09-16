@@ -495,7 +495,14 @@ export async function onRequest(context) {
   const isMainApp = url.hostname === "cividge.pages.dev" || url.hostname === "localhost" || url.hostname === "127.0.0.1";
   const isDeliveryEdge = !isMainApp;
 
-  const rawFilename = pathname.replace(/^\/+/, "");
+  // 静的 Pages 互換レイヤーは query ではなく内部パスで印を渡す。
+  // 背後ドメイン側で query を捨てても、どの公開入口の台帳を参照すべきか失わない。
+  const STATIC_RELAY_PATH_PREFIX = "__cividge/";
+  let rawFilename = pathname.replace(/^\/+/, "");
+  const hasStaticRelayPathMarker = rawFilename.startsWith(STATIC_RELAY_PATH_PREFIX);
+  if (hasStaticRelayPathMarker) {
+    rawFilename = rawFilename.slice(STATIC_RELAY_PATH_PREFIX.length);
+  }
   if (rawFilename.startsWith("404-character.")) {
     return new Response(getCharacterWebpBytes(), {
       status: 200,
@@ -540,11 +547,11 @@ export async function onRequest(context) {
         .trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0].split(":")[0];
       const allowedRelayHosts = String(env.STATIC_RELAY_PUBLIC_HOSTS || "")
         .split(",").map((host) => host.trim().toLowerCase()).filter(Boolean);
-      // `?r` は単一の静的公開入口用の短い互換マーカー。
-      // 旧 `__cividge_relay=<host>` も移行期間は受け付ける。
+      // `__cividge/` は query 除去ルールと共存できる静的公開入口の印。
+      // 旧 `?r` / `__cividge_relay=<host>` も移行期間は受け付ける。
       const staticRelayHost = allowedRelayHosts.includes(relayHost)
         ? relayHost
-        : (url.searchParams.has("r") && allowedRelayHosts.length === 1
+        : ((hasStaticRelayPathMarker || url.searchParams.has("r")) && allowedRelayHosts.length === 1
           ? allowedRelayHosts[0]
           : "");
       // `?r` 付きは静的 Pages 公開入口からの正規リレーであることを示す。
