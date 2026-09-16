@@ -28,6 +28,9 @@ export default {
 
       const headers = new Headers(res.headers);
       headers.set("Access-Control-Allow-Origin", "*");
+      // Workers Cache を有効にしても、管理・投稿 API の応答は絶対に共有
+      // キャッシュへ保存しない。
+      headers.set("Cache-Control", "no-store");
       return new Response(res.body, { status: res.status, headers });
     }
 
@@ -41,6 +44,7 @@ export default {
 
       const headers = new Headers(res.headers);
       headers.set("Access-Control-Allow-Origin", "*");
+      headers.set("Cache-Control", "no-store");
       return new Response(res.body, { status: res.status, headers });
     }
 

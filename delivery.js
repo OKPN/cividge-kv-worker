@@ -376,7 +376,10 @@ function renderOgpHtml(filename, rawUrl, ext, isVideo, origin, thumbnailKey = nu
 function renderNotFoundResponse(request, cdnCacheSeconds = 60) {
   const accept = request.headers.get("accept") || "";
   const headers = {
-    "Cache-Control": "no-cache",
+    // 公開メディアの miss は短時間だけ負のキャッシュに載せる。`no-cache` では
+    // Workers Cache が毎回 Worker を再実行するため、ランダム query による
+    // 同一パスの再試行を抑止できない。
+    "Cache-Control": cdnCacheSeconds > 0 ? `public, max-age=${cdnCacheSeconds}` : "no-store",
     ...(cdnCacheSeconds > 0 ? { "Cloudflare-CDN-Cache-Control": `public, max-age=${cdnCacheSeconds}` } : {}),
   };
 
@@ -544,23 +547,26 @@ export async function onRequest(context) {
         : (url.searchParams.has("r") && allowedRelayHosts.length === 1
           ? allowedRelayHosts[0]
           : "");
-      // 1. ドメイン個別キー (例: "misskey-media.okpn.f5.si:7ud1yi6z.mp4") で優先照会
-      let kvRes = await env.IPFS_KV.getWithMetadata(`${currentHost}:${filename}`);
-      if ((!kvRes || !kvRes.value) && filename !== rawFilename) {
-        kvRes = await env.IPFS_KV.getWithMetadata(`${currentHost}:${rawFilename}`);
-      }
-      let isDomainSpecific = Boolean(kvRes && kvRes.value);
-
-      // 静的公開入口の 307 を経由したリクエストは、元の入口ホストで登録された
-      // 台帳キーをここで解決する。直接の f5.si URL では marker がないため発動しない。
-      let resolvedHost = currentHost;
-      if (!isDomainSpecific && staticRelayHost) {
-        kvRes = await env.IPFS_KV.getWithMetadata(`${staticRelayHost}:${filename}`);
-        if ((!kvRes || !kvRes.value) && filename !== rawFilename) {
-          kvRes = await env.IPFS_KV.getWithMetadata(`${staticRelayHost}:${rawFilename}`);
+      // `?r` 付きは静的 Pages 公開入口からの正規リレーであることを示す。
+      // この場合は入口側の台帳を先に読む。背後 Worker 側の同名キーを優先すると、
+      // 公開入口へ紐づけた配信が別ドメインの旧キーに奪われてしまう。
+      const lookupDomainKey = async (host) => {
+        let result = await env.IPFS_KV.getWithMetadata(`${host}:${filename}`);
+        let keyName = filename;
+        if ((!result || !result.value) && filename !== rawFilename) {
+          result = await env.IPFS_KV.getWithMetadata(`${host}:${rawFilename}`);
+          keyName = rawFilename;
         }
+        return { result, keyName };
+      };
+
+      let resolvedHost = staticRelayHost || currentHost;
+      let { result: kvRes, keyName: resolvedFilename } = await lookupDomainKey(resolvedHost);
+      let isDomainSpecific = Boolean(kvRes && kvRes.value);
+      if (!isDomainSpecific && staticRelayHost) {
+        resolvedHost = currentHost;
+        ({ result: kvRes, keyName: resolvedFilename } = await lookupDomainKey(currentHost));
         isDomainSpecific = Boolean(kvRes && kvRes.value);
-        if (isDomainSpecific) resolvedHost = staticRelayHost;
       }
 
       // 2. 見つからなければ従来のファイル名単体キーでフォールバック照会
@@ -574,7 +580,7 @@ export async function onRequest(context) {
       if (kvRes && kvRes.value) {
         targetCid = kvRes.value;
         meta = kvRes.metadata || {};
-        resolvedKvKey = isDomainSpecific ? `${resolvedHost}:${filename}` : filename;
+        resolvedKvKey = isDomainSpecific ? `${resolvedHost}:${resolvedFilename}` : filename;
         // 旧形式の filename 単体キーにも allowedHost が残っている。
         // 静的 Pages 入口からの正規 marker がある場合は、その入口を
         // ドメイン制限の検証対象にする（直接の背後 Worker URLでは発動しない）。
@@ -683,13 +689,14 @@ export async function onRequest(context) {
   if (!hasPassword && isSocialCrawler(userAgent)) {
     const ogpThumbnailKey = meta.th || meta.thumbnailKey || ((meta.k_s3 || meta.s3Key) ? `${meta.k_s3 || meta.s3Key}.thumb.webp` : null);
     const ogpHtml = renderOgpHtml(filename, request.url, crawlerExt, isCrawlerVideo, url.origin, ogpThumbnailKey);
-    const ogpCacheSeconds = capCacheToExpiry(86400, expiresTimestamp);
     return new Response(ogpHtml, {
       status: 200,
       headers: {
         "Content-Type": "text/html; charset=utf-8",
-        "Cache-Control": `public, max-age=${ogpCacheSeconds}`,
-        "Cloudflare-CDN-Cache-Control": `public, max-age=${ogpCacheSeconds}`,
+        // Worker Cache のキーは User-Agent を分離しない。OGP HTML を共有
+        // キャッシュに置くと通常の直リンクへ誤配信し得るのでキャッシュしない。
+        "Cache-Control": "no-store",
+        "Cloudflare-CDN-Cache-Control": "no-store",
         "Access-Control-Allow-Origin": "*",
       },
     });

@@ -3,6 +3,11 @@ main = "server.js"
 compatibility_date = "2026-09-01"
 workers_dev = true
 
+# Worker の前で Cache-Control に従うエッジキャッシュを照会する。
+# 公開メディアと短時間の 404 はキャッシュヒット時に JS/KV を実行しない。
+[cache]
+enabled = true
+
 [vars]
 # Static Pages public entry points allowed to identify their original host.
 # Add comma-separated hosts here when another relay is intentionally deployed.
