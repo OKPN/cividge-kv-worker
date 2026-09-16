@@ -3,6 +3,11 @@ main = "server.js"
 compatibility_date = "2026-09-01"
 workers_dev = true
 
+[vars]
+# Static Pages public entry points allowed to identify their original host.
+# Add comma-separated hosts here when another relay is intentionally deployed.
+STATIC_RELAY_PUBLIC_HOSTS = "content-relay.pages.dev"
+
 [[kv_namespaces]]
 binding = "IPFS_KV"
 id = "ff45707014424ab3afac57fda8c305de"

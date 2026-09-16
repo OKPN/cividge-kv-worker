@@ -530,12 +530,38 @@ export async function onRequest(context) {
   if (env && env.IPFS_KV) {
     try {
       const currentHost = url.hostname.toLowerCase();
+      // 静的 Pages 入口から背後の Worker へ転送された場合だけ、入口ホストの
+      // ドメイン別台帳を引く。値は環境変数で許可したホストに限定するため、
+      // 任意の query で別ホストの名前空間を読ませることはできない。
+      const relayHost = (url.searchParams.get("__cividge_relay") || "")
+        .trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0].split(":")[0];
+      const allowedRelayHosts = String(env.STATIC_RELAY_PUBLIC_HOSTS || "")
+        .split(",").map((host) => host.trim().toLowerCase()).filter(Boolean);
+      // `?r` は単一の静的公開入口用の短い互換マーカー。
+      // 旧 `__cividge_relay=<host>` も移行期間は受け付ける。
+      const staticRelayHost = allowedRelayHosts.includes(relayHost)
+        ? relayHost
+        : (url.searchParams.has("r") && allowedRelayHosts.length === 1
+          ? allowedRelayHosts[0]
+          : "");
       // 1. ドメイン個別キー (例: "misskey-media.okpn.f5.si:7ud1yi6z.mp4") で優先照会
       let kvRes = await env.IPFS_KV.getWithMetadata(`${currentHost}:${filename}`);
       if ((!kvRes || !kvRes.value) && filename !== rawFilename) {
         kvRes = await env.IPFS_KV.getWithMetadata(`${currentHost}:${rawFilename}`);
       }
       let isDomainSpecific = Boolean(kvRes && kvRes.value);
+
+      // 静的公開入口の 307 を経由したリクエストは、元の入口ホストで登録された
+      // 台帳キーをここで解決する。直接の f5.si URL では marker がないため発動しない。
+      let resolvedHost = currentHost;
+      if (!isDomainSpecific && staticRelayHost) {
+        kvRes = await env.IPFS_KV.getWithMetadata(`${staticRelayHost}:${filename}`);
+        if ((!kvRes || !kvRes.value) && filename !== rawFilename) {
+          kvRes = await env.IPFS_KV.getWithMetadata(`${staticRelayHost}:${rawFilename}`);
+        }
+        isDomainSpecific = Boolean(kvRes && kvRes.value);
+        if (isDomainSpecific) resolvedHost = staticRelayHost;
+      }
 
       // 2. 見つからなければ従来のファイル名単体キーでフォールバック照会
       if (!isDomainSpecific) {
@@ -548,7 +574,13 @@ export async function onRequest(context) {
       if (kvRes && kvRes.value) {
         targetCid = kvRes.value;
         meta = kvRes.metadata || {};
-        resolvedKvKey = isDomainSpecific ? `${currentHost}:${filename}` : filename;
+        resolvedKvKey = isDomainSpecific ? `${resolvedHost}:${filename}` : filename;
+        // 旧形式の filename 単体キーにも allowedHost が残っている。
+        // 静的 Pages 入口からの正規 marker がある場合は、その入口を
+        // ドメイン制限の検証対象にする（直接の背後 Worker URLでは発動しない）。
+        meta.__resolvedPublicHost = isDomainSpecific
+          ? resolvedHost
+          : (staticRelayHost || currentHost);
       }
     } catch (kvErr) {
       console.warn("IPFS_KV get error:", kvErr);
@@ -568,7 +600,8 @@ export async function onRequest(context) {
   const allowedDomain = meta.d || meta.allowedHost;
   if (allowedDomain && typeof allowedDomain === "string" && allowedDomain.trim()) {
     const allowedHostnames = allowedDomain.split(",").map(h => h.trim().toLowerCase().replace(/^https?:\/\//, "").split('/')[0].split(':')[0]).filter(Boolean);
-    const currentHostname = url.hostname.toLowerCase();
+    // 静的入口を正規に経由した場合は、入口側の台帳ホストを検証対象にする。
+    const currentHostname = meta.__resolvedPublicHost || url.hostname.toLowerCase();
     if (allowedHostnames.length > 0 && !allowedHostnames.includes(currentHostname)) {
       return renderNotFoundResponse(request, 60);
     }
@@ -717,7 +750,8 @@ export async function onRequest(context) {
   // 🪐 複数公共IPFSゲートウェイへのアクセス分散（マルチキャッシュ伝播 & Filebase転送量節約）
   const ipfsGateways = [
     "https://ipfs.filebase.io/ipfs",
-    "https://cloudflare-ipfs.com/ipfs",
+    "https://gateway.pinata.cloud/ipfs",
+    "https://4everland.io/ipfs",
     "https://ipfs.io/ipfs",
     "https://dweb.link/ipfs",
   ];
@@ -741,7 +775,8 @@ export async function onRequest(context) {
       try {
         upstreamResponse = await fetch(`${gw}/${candidate}`, {
           method: isHead ? "HEAD" : "GET",
-          signal: AbortSignal.timeout(4000),
+          redirect: "follow",
+          signal: AbortSignal.timeout(6000),
           headers: {
             "User-Agent": "Cividge-KV-Relay/1.0",
             ...(request.headers.get("Range") ? { "Range": request.headers.get("Range") } : {}),
@@ -759,7 +794,7 @@ export async function onRequest(context) {
           break;
         }
       } catch (err) {
-        console.warn(`Upstream fetch attempt failed for ${gw}/${candidate}:`, err.name === "TimeoutError" ? "Timeout (4s)" : err.message || err);
+        console.warn(`Upstream fetch attempt failed for ${gw}/${candidate}:`, err.name === "TimeoutError" ? "Timeout (6s)" : err.message || err);
       }
     }
     if (upstreamResponse && upstreamResponse.ok) {
