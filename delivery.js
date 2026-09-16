@@ -495,6 +495,13 @@ export async function onRequest(context) {
   const isMainApp = url.hostname === "cividge.pages.dev" || url.hostname === "localhost" || url.hostname === "127.0.0.1";
   const isDeliveryEdge = !isMainApp;
 
+  // workers.dev は管理 API の接続先としては残すが、公開メディアの配信入口には
+  // しない。f5.si Zone の URL Rewrite / Rate Limit を迂回して Worker を直接
+  // 叩かれる経路を閉じる。`/api/*` は server.js が先に処理するため影響しない。
+  if (url.hostname.endsWith(".workers.dev")) {
+    return renderNotFoundResponse(request, 86400);
+  }
+
   // 静的 Pages 互換レイヤーは query ではなく内部パスで印を渡す。
   // 背後ドメイン側で query を捨てても、どの公開入口の台帳を参照すべきか失わない。
   const STATIC_RELAY_PATH_PREFIX = "r/";
@@ -598,6 +605,14 @@ export async function onRequest(context) {
     } catch (kvErr) {
       console.warn("IPFS_KV get error:", kvErr);
     }
+  }
+
+  // 台帳に存在しないファイル名は、IPFS Gateway を検索しない。ランダムパス
+  // 攻撃で Filebase・公開 Gateway・Kubo の上流アクセスを発生させない。
+  // 正規の公開リンクは必ず KV 台帳の CID または保存キーを持つという不変条件に
+  // 依存する。
+  if (!targetCid) {
+    return renderNotFoundResponse(request, 60);
   }
 
   // ⏳ 時限アップロードの有効期限チェック（期限切れは即座に404、短縮キー e にも対応）
