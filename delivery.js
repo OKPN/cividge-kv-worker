@@ -497,7 +497,7 @@ export async function onRequest(context) {
 
   // 静的 Pages 互換レイヤーは query ではなく内部パスで印を渡す。
   // 背後ドメイン側で query を捨てても、どの公開入口の台帳を参照すべきか失わない。
-  const STATIC_RELAY_PATH_PREFIX = "__cividge/";
+  const STATIC_RELAY_PATH_PREFIX = "r/";
   let rawFilename = pathname.replace(/^\/+/, "");
   const hasStaticRelayPathMarker = rawFilename.startsWith(STATIC_RELAY_PATH_PREFIX);
   if (hasStaticRelayPathMarker) {
@@ -547,7 +547,7 @@ export async function onRequest(context) {
         .trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0].split(":")[0];
       const allowedRelayHosts = String(env.STATIC_RELAY_PUBLIC_HOSTS || "")
         .split(",").map((host) => host.trim().toLowerCase()).filter(Boolean);
-      // `__cividge/` は query 除去ルールと共存できる静的公開入口の印。
+      // `r/` は query 除去ルールと共存できる静的公開入口の印。
       // 旧 `?r` / `__cividge_relay=<host>` も移行期間は受け付ける。
       const staticRelayHost = allowedRelayHosts.includes(relayHost)
         ? relayHost
