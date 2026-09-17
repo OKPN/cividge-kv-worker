@@ -17,6 +17,10 @@ STATIC_RELAY_PUBLIC_HOSTS = "content-relay.pages.dev,testunko.pages.dev,punipuni
 STATIC_RELAY_BACKEND_HOSTS = "ipfs-relay.k7m.f5.si"
 
 [[kv_namespaces]]
+binding = "CIVIDGE_KV"
+id = "ff45707014424ab3afac57fda8c305de"
+
+[[kv_namespaces]]
 binding = "IPFS_KV"
 id = "ff45707014424ab3afac57fda8c305de"
 

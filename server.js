@@ -1,4 +1,4 @@
-import * as ipfsKv from "./ipfs-kv.js";
+import * as cividgeKv from "./cividge-kv.js";
 import * as uploadApi from "./upload.js";
 import { onRequest as onDelivery } from "./delivery.js";
 
@@ -34,12 +34,15 @@ export default {
       return new Response(res.body, { status: res.status, headers });
     }
 
-    if (pathname === "/api/ipfs-kv" || pathname.startsWith("/api/ipfs-kv?")) {
+    // 🪐 Cividge 統合台帳 API (/api/cividge-kv および 旧 /api/ipfs-kv の両対応)
+    const isKvApi = pathname === "/api/cividge-kv" || pathname.startsWith("/api/cividge-kv?") ||
+                    pathname === "/api/ipfs-kv" || pathname.startsWith("/api/ipfs-kv?");
+    if (isKvApi) {
       const context = { request, env, waitUntil: (p) => ctx.waitUntil(p), next: () => new Response("404", { status: 404 }) };
       let res;
-      if (request.method === "GET") res = await ipfsKv.onRequestGet(context);
-      else if (request.method === "POST") res = await ipfsKv.onRequestPost(context);
-      else if (request.method === "DELETE") res = await ipfsKv.onRequestDelete(context);
+      if (request.method === "GET") res = await cividgeKv.onRequestGet(context);
+      else if (request.method === "POST") res = await cividgeKv.onRequestPost(context);
+      else if (request.method === "DELETE") res = await cividgeKv.onRequestDelete(context);
       else res = new Response("Method Not Allowed", { status: 405 });
 
       const headers = new Headers(res.headers);

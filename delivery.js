@@ -448,21 +448,21 @@ async function cleanupExpiredAlias(env, request, key, expectedCid) {
 
   try {
     // 古いエッジ読み取り結果で、延長・再登録されたリンクを消さないよう再確認する。
-    const latest = await env.IPFS_KV.getWithMetadata(key);
+    const latest = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(key);
     const latestMeta = latest?.metadata || {};
     const latestExpiresAt = latestMeta.e ? latestMeta.e * 1000 : latestMeta.expiresAt;
     if (!latest?.value || latest.value !== expectedCid || !latestExpiresAt || Date.now() <= Number(latestExpiresAt)) return;
 
     if (latestMeta.blobKey) {
-      await env.IPFS_KV.delete(latestMeta.blobKey).catch(() => {});
+      await (env.CIVIDGE_KV || env.IPFS_KV).delete(latestMeta.blobKey).catch(() => {});
     }
-    await env.IPFS_KV.delete(key);
+    await (env.CIVIDGE_KV || env.IPFS_KV).delete(key);
 
     // KV list は1,000件ずつなので、全ページを確認できた場合だけ「最後」と断定する。
     let cursor = undefined;
     let isCidShared = false;
     do {
-      const page = await env.IPFS_KV.list({ limit: 1000, ...(cursor ? { cursor } : {}) });
+      const page = await (env.CIVIDGE_KV || env.IPFS_KV).list({ limit: 1000, ...(cursor ? { cursor } : {}) });
       isCidShared = (page.keys || []).some((item) => {
         if (item.name.startsWith("tombstone_") || item.name.startsWith("blob_")) return false;
         return (item.metadata?.c || item.metadata?.cid) === expectedCid;
@@ -472,12 +472,12 @@ async function cleanupExpiredAlias(env, request, key, expectedCid) {
 
     if (!isCidShared) {
       // 自宅 Kubo が次回起動した際に回収できるよう、既存仕様の墓標を維持する。
-      await env.IPFS_KV.put(`tombstone_${expectedCid}`, "1", { expirationTtl: 86400 * 30 }).catch(() => {});
+      await (env.CIVIDGE_KV || env.IPFS_KV).put(`tombstone_${expectedCid}`, "1", { expirationTtl: 86400 * 30 }).catch(() => {});
 
       // S3実体削除用の墓標を作成（管理画面が開いた際にブラウザのS3クライアントが実体削除して墓標を消去する）
       const s3TargetKey = latestMeta.s3Key || latestMeta.s || (key.includes(":") ? key.split(":")[1] : key);
       if (s3TargetKey) {
-        await env.IPFS_KV.put(`tombstone_s3_${encodeURIComponent(s3TargetKey)}`, "1", { expirationTtl: 86400 * 30 }).catch(() => {});
+        await (env.CIVIDGE_KV || env.IPFS_KV).put(`tombstone_s3_${encodeURIComponent(s3TargetKey)}`, "1", { expirationTtl: 86400 * 30 }).catch(() => {});
       }
 
       // Filebase 用の限定 RPC key がある運用では、最後の別名で pin も解放する。
@@ -575,7 +575,7 @@ export async function onRequest(context) {
   let targetCid = null;
   let meta = {};
   let resolvedKvKey = "";
-  if (env && env.IPFS_KV) {
+  if (env && (env.CIVIDGE_KV || env.IPFS_KV)) {
     try {
       const currentHost = url.hostname.toLowerCase();
       // 静的 Pages 入口から背後の Worker へ転送された場合だけ、入口ホストの
@@ -597,10 +597,10 @@ export async function onRequest(context) {
       }
 
       const lookupDomainKey = async (host) => {
-        let result = await env.IPFS_KV.getWithMetadata(`${host}:${filename}`);
+        let result = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(`${host}:${filename}`);
         let keyName = filename;
         if ((!result || !result.value) && filename !== rawFilename) {
-          result = await env.IPFS_KV.getWithMetadata(`${host}:${rawFilename}`);
+          result = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(`${host}:${rawFilename}`);
           keyName = rawFilename;
         }
         return { result, keyName };
@@ -636,10 +636,10 @@ export async function onRequest(context) {
 
       // 2. 見つからなければ従来のファイル名単体キーでフォールバック照会
       if (!isDomainSpecific) {
-        kvRes = await env.IPFS_KV.getWithMetadata(filename);
+        kvRes = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(filename);
       }
       if ((!kvRes || !kvRes.value) && filename !== rawFilename) {
-        kvRes = await env.IPFS_KV.getWithMetadata(rawFilename);
+        kvRes = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(rawFilename);
       }
 
       if (kvRes && kvRes.value) {
@@ -778,10 +778,10 @@ export async function onRequest(context) {
   }
 
   // 3. KV に実データ（blobKey または blob_<filename>）が直接格納されている場合は即時配信
-  if (env && env.IPFS_KV) {
+  if (env && (env.CIVIDGE_KV || env.IPFS_KV)) {
     try {
       const blobKey = meta.blobKey || ("blob_" + filename);
-      const directData = await env.IPFS_KV.get(blobKey, "arrayBuffer");
+      const directData = await (env.CIVIDGE_KV || env.IPFS_KV).get(blobKey, "arrayBuffer");
       if (directData) {
         const headers = new Headers();
         headers.set("Access-Control-Allow-Origin", "*");

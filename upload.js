@@ -207,7 +207,7 @@ export async function onRequestPost(context) {
     });
   }
 
-  if (!env.IPFS_KV) {
+  if (!(env.CIVIDGE_KV || env.IPFS_KV)) {
     return new Response(JSON.stringify({ success: false, error: "IPFS_KV binding is not configured" }), {
       status: 503,
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
@@ -360,8 +360,8 @@ export async function onRequestPost(context) {
       throw new Error("R2 投稿は未設定です。Worker に R2_BUCKET binding を設定してください。");
     } else if (fileBuffer) {
       // storage 未指定時のみ、後方互換として KV に直接実データを保持する。
-      if (env.IPFS_KV) {
-        await env.IPFS_KV.put(blobKey, fileBuffer);
+      if ((env.CIVIDGE_KV || env.IPFS_KV)) {
+        await (env.CIVIDGE_KV || env.IPFS_KV).put(blobKey, fileBuffer);
       }
     } else {
       throw new Error("ストリーミング投稿では storage=filebase または storage=r2 を指定してください。");
@@ -371,7 +371,7 @@ export async function onRequestPost(context) {
     if (uploadedSize === 0) throw new Error("No file content uploaded");
 
     // 7. KV にルーティング登録（キーは shortKey 単体とし、ドメイン制限は allowedHost メタデータで管理）
-    if (env.IPFS_KV) {
+    if ((env.CIVIDGE_KV || env.IPFS_KV)) {
       const kvMetadata = {
         blobKey,
         size: uploadedSize,
@@ -383,7 +383,7 @@ export async function onRequestPost(context) {
         ...passwordMeta,
       };
 
-      await env.IPFS_KV.put(shortKey, targetCid || shortKey, { metadata: kvMetadata });
+      await (env.CIVIDGE_KV || env.IPFS_KV).put(shortKey, targetCid || shortKey, { metadata: kvMetadata });
     }
 
     // 8. レスポンス返却
