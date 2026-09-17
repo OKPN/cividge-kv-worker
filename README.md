@@ -48,6 +48,13 @@ User / Social Bot (Misskey, Twitter, Discord)
 
 ## Setup & Deployment
 
+### 🤖 For AI Coding Agents (Codex, Claude, etc.)
+
+This repository includes official agent skills in [`.codex/skills/`](.codex/skills/) to automate safe deployments and public relay configuration without breaking routes:
+
+- **`cividge-deploy`**: Validates syntax, preserves multi-relay host lists in `wrangler.toml`, deploys the Worker, and runs automated curl health checks.
+- **`cloudflare-pages-relay`**: Generates function-free, disposable `pages.dev` 307 relays and registers them into `STATIC_RELAY_PUBLIC_HOSTS` cleanly.
+
 ### 1. Prerequisites
 
 - Node.js (v18+)
