@@ -474,6 +474,12 @@ async function cleanupExpiredAlias(env, request, key, expectedCid) {
       // 自宅 Kubo が次回起動した際に回収できるよう、既存仕様の墓標を維持する。
       await env.IPFS_KV.put(`tombstone_${expectedCid}`, "1", { expirationTtl: 86400 * 30 }).catch(() => {});
 
+      // S3実体削除用の墓標を作成（管理画面が開いた際にブラウザのS3クライアントが実体削除して墓標を消去する）
+      const s3TargetKey = latestMeta.s3Key || latestMeta.s || (key.includes(":") ? key.split(":")[1] : key);
+      if (s3TargetKey) {
+        await env.IPFS_KV.put(`tombstone_s3_${encodeURIComponent(s3TargetKey)}`, "1", { expirationTtl: 86400 * 30 }).catch(() => {});
+      }
+
       // Filebase 用の限定 RPC key がある運用では、最後の別名で pin も解放する。
       const filebaseKey = (env.FILEBASE_IPFS_API_KEY || "").trim();
       if (filebaseKey) {

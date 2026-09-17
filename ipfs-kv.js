@@ -94,7 +94,32 @@ export async function onRequestGet(context) {
     });
   }
 
-  // 0. tombstones パラメータがある場合は未回収の墓標（アンピン予約）一覧を返却（管理者のみ）
+  // 0. tombstones / tombstones_s3 パラメータがある場合は未回収の墓標一覧を返却（管理者のみ）
+  if (url.searchParams.get("tombstones_s3") === "1") {
+    if (!verifyAdminAuth(request, env)) {
+      return new Response(JSON.stringify({ error: "Unauthorized: Admin token required" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+    try {
+      const list = await env.IPFS_KV.list({ prefix: "tombstone_s3_", limit: 1000 });
+      const tombstonesS3 = (list.keys || []).map(k => {
+        const raw = k.name.replace(/^tombstone_s3_/, "");
+        try { return decodeURIComponent(raw); } catch { return raw; }
+      });
+      return new Response(JSON.stringify({ success: true, tombstonesS3 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    } catch (err) {
+      return new Response(JSON.stringify({ error: err.message }), {
+        status: 500,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+  }
+
   if (url.searchParams.get("tombstones") === "1") {
     if (!verifyAdminAuth(request, env)) {
       return new Response(JSON.stringify({ error: "Unauthorized: Admin token required" }), {
@@ -104,7 +129,10 @@ export async function onRequestGet(context) {
     }
     try {
       const list = await env.IPFS_KV.list({ prefix: "tombstone_", limit: 1000 });
-      const tombstones = (list.keys || []).map(k => k.name.replace(/^tombstone_/, ""));
+      // S3用の墓標は除外し、Kubo用のCID墓標のみ返却
+      const tombstones = (list.keys || [])
+        .filter(k => !k.name.startsWith("tombstone_s3_"))
+        .map(k => k.name.replace(/^tombstone_/, ""));
       return new Response(JSON.stringify({ success: true, tombstones }), {
         status: 200,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
@@ -434,7 +462,23 @@ export async function onRequestDelete(context) {
     });
   }
 
-  // 1. 墓標の回収完了（KuboでのUnpin完了通知）
+  // 1. 墓標の回収完了（KuboでのUnpin完了通知、またはS3実体削除完了通知）
+  const tombstoneS3 = url.searchParams.get("tombstone_s3");
+  if (tombstoneS3) {
+    try {
+      await env.IPFS_KV.delete("tombstone_s3_" + encodeURIComponent(tombstoneS3));
+      return new Response(JSON.stringify({ success: true, clearedTombstoneS3: tombstoneS3 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    } catch (err) {
+      return new Response(JSON.stringify({ error: err.message }), {
+        status: 500,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+  }
+
   if (tombstoneCid) {
     try {
       await env.IPFS_KV.delete("tombstone_" + tombstoneCid);
