@@ -444,7 +444,7 @@ function setImageDimensionHeaders(headers, meta = {}) {
 // 同じ CID を参照する別名が残る限り pin は維持し、最後のリンクなら Kubo 用の
 // 墓標を作成する。FILEBASE_IPFS_API_KEY が設定済みの場合は Filebase pin も解放する。
 async function cleanupExpiredAlias(env, request, key, expectedCid) {
-  if (!env?.IPFS_KV || !key || !expectedCid) return;
+  if (!(env?.CIVIDGE_KV || env?.IPFS_KV) || !key || !expectedCid) return;
 
   try {
     // 古いエッジ読み取り結果で、延長・再登録されたリンクを消さないよう再確認する。

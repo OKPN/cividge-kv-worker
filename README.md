@@ -85,6 +85,11 @@ compatibility_date = "2026-09-01"
 workers_dev = true
 
 [[kv_namespaces]]
+binding = "CIVIDGE_KV"
+id = "<your-kv-namespace-id>"
+
+# Backward compatibility alias
+[[kv_namespaces]]
 binding = "IPFS_KV"
 id = "<your-kv-namespace-id>"
 
@@ -204,7 +209,7 @@ properties of public content distribution rather than the Worker routing layer.
 
 ### External upload API / Filebase
 
-`POST /api/upload?storage=filebase` uploads to Filebase through its IPFS RPC API and registers the returned CID in `IPFS_KV`. It accepts only `UPLOAD_TOKEN` (not `ADMIN_API_TOKEN`) and requires both secrets below:
+`POST /api/upload?storage=filebase` uploads to Filebase through its IPFS RPC API and registers the returned CID in `CIVIDGE_KV`. It accepts only `UPLOAD_TOKEN` (not `ADMIN_API_TOKEN`) and requires both secrets below:
 
 - `UPLOAD_TOKEN`: the token used only by external upload clients such as the Windows **Send To** batch. Do not reuse `ADMIN_API_TOKEN`. The generated batch contains this token in plain text: never share, commit, or place it in a shared folder; rotate the secret immediately if it leaks.
 - `FILEBASE_IPFS_API_KEY`: a bucket-scoped Filebase IPFS RPC API key. This stays in the Worker and must never be placed in a browser, BAT file, or repository.
