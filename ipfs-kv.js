@@ -34,6 +34,7 @@ function unpackMetadata(name, cid, meta = {}) {
   const width = Number(meta.w ?? meta.width) || null;
   const height = Number(meta.h ?? meta.height) || null;
   const lastKuboPinAttempt = meta.k !== undefined ? meta.k * 1000 : (meta.lastKuboPinAttempt || null);
+  const civitaiTemporary = meta.ct !== undefined ? Boolean(meta.ct) : Boolean(meta.civitaiTemporary);
 
   const allowedHost = keyHost || meta.d || meta.allowedHost || null;
 
@@ -54,6 +55,7 @@ function unpackMetadata(name, cid, meta = {}) {
     ...(allowedHost ? { allowedHost, d: allowedHost } : {}),
     ...(expiresAt ? { expiresAt, e: Math.floor(expiresAt / 1000) } : {}),
     ...(lastKuboPinAttempt ? { lastKuboPinAttempt } : {}),
+    ...(civitaiTemporary ? { civitaiTemporary: true, ct: 1 } : {}),
   };
 }
 
@@ -356,6 +358,9 @@ export async function onRequestPost(context) {
     const inheritedThumbnailKey = thumbnailKey || (existingMetadata && (existingMetadata.th || existingMetadata.thumbnailKey)) || "";
     const inheritedWidth = Math.floor(Number(width)) || (existingMetadata && Math.floor(Number(existingMetadata.w ?? existingMetadata.width))) || 0;
     const inheritedHeight = Math.floor(Number(height)) || (existingMetadata && Math.floor(Number(existingMetadata.h ?? existingMetadata.height))) || 0;
+    const civitaiTemporary = body.civitaiTemporary === undefined
+      ? Boolean(existingMetadata?.ct || existingMetadata?.civitaiTemporary)
+      : Boolean(body.civitaiTemporary);
     const compressedMeta = {
       ...(safeCid ? { c: safeCid } : {}),
       s: inheritedSize,
@@ -367,6 +372,7 @@ export async function onRequestPost(context) {
       ...(inheritedWidth > 0 && inheritedHeight > 0 ? { w: inheritedWidth, h: inheritedHeight } : {}),
       ...(calculatedExpiresAt ? { e: Math.floor(Number(calculatedExpiresAt) / 1000) } : {}),
       ...(existingLastKuboPinAttempt ? { k: Math.floor(Number(existingLastKuboPinAttempt) / 1000) } : {}),
+      ...(civitaiTemporary ? { ct: 1 } : {}),
       ...passwordMeta,
     };
 
@@ -386,6 +392,7 @@ export async function onRequestPost(context) {
       allowedHost: allowedHost || null,
       ...(compressedMeta.w && compressedMeta.h ? { width: compressedMeta.w, height: compressedMeta.h } : {}),
       ...(calculatedExpiresAt ? { expiresAt: calculatedExpiresAt } : {}),
+      ...(civitaiTemporary ? { civitaiTemporary: true, ct: 1 } : {}),
       ...compressedMeta,
     };
 
