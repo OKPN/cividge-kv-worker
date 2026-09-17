@@ -581,14 +581,15 @@ export async function onRequest(context) {
         .split(",").map((host) => host.trim().toLowerCase()).filter(Boolean);
       // `r/` は query 除去ルールと共存できる静的公開入口の印。
       // 旧 `?r` / `__cividge_relay=<host>` も移行期間は受け付ける。
-      const staticRelayHost = allowedRelayHosts.includes(relayHost)
-        ? relayHost
-        : ((hasStaticRelayPathMarker || url.searchParams.has("r")) && allowedRelayHosts.length === 1
-          ? allowedRelayHosts[0]
-          : "");
-      // `?r` 付きは静的 Pages 公開入口からの正規リレーであることを示す。
-      // この場合は入口側の台帳を先に読む。背後 Worker 側の同名キーを優先すると、
-      // 公開入口へ紐づけた配信が別ドメインの旧キーに奪われてしまう。
+      const isRelayRequest = hasStaticRelayPathMarker || url.searchParams.has("r");
+      let candidateRelayHosts = [];
+      if (allowedRelayHosts.includes(relayHost)) {
+        candidateRelayHosts.push(relayHost);
+      } else if (isRelayRequest) {
+        // 静的リレー経由の場合は、許可された全Pagesホストを照会候補とする
+        candidateRelayHosts.push(...allowedRelayHosts);
+      }
+
       const lookupDomainKey = async (host) => {
         let result = await env.IPFS_KV.getWithMetadata(`${host}:${filename}`);
         let keyName = filename;
@@ -599,13 +600,32 @@ export async function onRequest(context) {
         return { result, keyName };
       };
 
-      let resolvedHost = staticRelayHost || currentHost;
-      let { result: kvRes, keyName: resolvedFilename } = await lookupDomainKey(resolvedHost);
-      let isDomainSpecific = Boolean(kvRes && kvRes.value);
-      if (!isDomainSpecific && staticRelayHost) {
+      let resolvedHost = "";
+      let kvRes = null;
+      let resolvedFilename = filename;
+      let isDomainSpecific = false;
+
+      // 1. 静的リレー候補ホスト（content-relay, testunko など）から順次キーを探索
+      for (const host of candidateRelayHosts) {
+        const lookup = await lookupDomainKey(host);
+        if (lookup.result && lookup.result.value) {
+          resolvedHost = host;
+          kvRes = lookup.result;
+          resolvedFilename = lookup.keyName;
+          isDomainSpecific = true;
+          break;
+        }
+      }
+
+      // 2. リレー候補で見つからなければ、直接アクセスされた背後ホストで照会
+      if (!isDomainSpecific) {
         resolvedHost = currentHost;
-        ({ result: kvRes, keyName: resolvedFilename } = await lookupDomainKey(currentHost));
-        isDomainSpecific = Boolean(kvRes && kvRes.value);
+        const lookup = await lookupDomainKey(currentHost);
+        if (lookup.result && lookup.result.value) {
+          kvRes = lookup.result;
+          resolvedFilename = lookup.keyName;
+          isDomainSpecific = true;
+        }
       }
 
       // 2. 見つからなければ従来のファイル名単体キーでフォールバック照会
@@ -620,12 +640,14 @@ export async function onRequest(context) {
         targetCid = kvRes.value;
         meta = kvRes.metadata || {};
         resolvedKvKey = isDomainSpecific ? `${resolvedHost}:${resolvedFilename}` : filename;
-        // 旧形式の filename 単体キーにも allowedHost が残っている。
-        // 静的 Pages 入口からの正規 marker がある場合は、その入口を
-        // ドメイン制限の検証対象にする（直接の背後 Worker URLでは発動しない）。
+        // 旧形式や単体キーのレコードでも allowedHost が設定されている。
+        // 静的 Pages 入口からの正規 marker がある場合は、候補ホストの中から
+        // レコードの allowedHost と合致するものを __resolvedPublicHost に設定する。
+        const allowedHost = meta.d || meta.allowedHost || "";
+        const matchedRelayHost = candidateRelayHosts.find(h => allowedHost.includes(h));
         meta.__resolvedPublicHost = isDomainSpecific
           ? resolvedHost
-          : (staticRelayHost || currentHost);
+          : (matchedRelayHost || currentHost);
       }
     } catch (kvErr) {
       console.warn("IPFS_KV get error:", kvErr);
