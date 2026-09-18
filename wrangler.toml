@@ -3,6 +3,11 @@ main = "server.js"
 compatibility_date = "2026-09-01"
 workers_dev = true
 
+routes = [
+  { pattern = "misskey-media.okpn.f5.si", custom_domain = true },
+  { pattern = "ipfs-relay.k7m.f5.si", custom_domain = true }
+]
+
 # Worker の前で Cache-Control に従うエッジキャッシュを照会する。
 # 公開メディアと短時間の 404 はキャッシュヒット時に JS/KV を実行しない。
 [cache]
@@ -15,6 +20,8 @@ STATIC_RELAY_PUBLIC_HOSTS = "content-relay.pages.dev,testunko.pages.dev,punipuni
 # The custom-zone endpoint behind the static Pages relay.  Its /r/<file> URL is
 # globally purged when CLOUDFLARE_ZONE_ID and CLOUDFLARE_PURGE_TOKEN are set.
 STATIC_RELAY_BACKEND_HOSTS = "ipfs-relay.k7m.f5.si"
+ADMIN_API_TOKEN = "cividge_secret_99f821a603c4"
+UPLOAD_TOKEN = "o33eVwZHlbJt8cKhCuNwLZYdtYqz1omSebbxJlZ0"
 
 [[kv_namespaces]]
 binding = "CIVIDGE_KV"
@@ -23,6 +30,3 @@ id = "ff45707014424ab3afac57fda8c305de"
 [[kv_namespaces]]
 binding = "IPFS_KV"
 id = "ff45707014424ab3afac57fda8c305de"
-
-[secrets]
-required = ["ADMIN_API_TOKEN"]
