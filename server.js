@@ -23,6 +23,7 @@ export default {
       const context = { request, env, waitUntil: (p) => ctx.waitUntil(p), next: () => new Response("404", { status: 404 }) };
       let res;
       if (request.method === "POST") res = await uploadApi.onRequestPost(context);
+      else if (request.method === "GET") res = await uploadApi.onRequestGet(context);
       else if (request.method === "OPTIONS") res = await uploadApi.onRequestOptions();
       else res = new Response("Method Not Allowed", { status: 405 });
 
