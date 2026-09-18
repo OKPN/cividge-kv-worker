@@ -869,14 +869,43 @@ export async function onRequest(context) {
   if (effectiveS3Key && !candidates.includes(effectiveS3Key)) candidates.push(effectiveS3Key);
   if (!candidates.includes(filename)) candidates.push(filename);
 
-  // 🪐 複数公共IPFSゲートウェイへのアクセス分散（マルチキャッシュ伝播 & Filebase転送量節約）
-  const ipfsGateways = [
-    "https://ipfs.filebase.io/ipfs",
+  // 🪐 複数公共IPFSゲートウェイとピン状態に応じた動的優先ルーティング
+  // See: [INV-DELIVERY-002] (ストレージ状態に応じたゲートウェイ動的ルーティング)
+  const isKuboPinned = meta.kuboStatus === "pinned" || Boolean((meta.f || 0) & 2);
+  const isUnpinned = Boolean(meta.unpinned) || Boolean((meta.f || 0) & 1);
+
+  // 公共ゲートウェイ群（Protocol Labs / Pinata / 4EVERLAND など DHT 経由で探索可能なノード）
+  const publicGateways = [
+    "https://dweb.link/ipfs",
+    "https://ipfs.io/ipfs",
     "https://gateway.pinata.cloud/ipfs",
     "https://4everland.io/ipfs",
-    "https://ipfs.io/ipfs",
-    "https://dweb.link/ipfs",
   ];
+  const filebaseGateway = "https://ipfs.filebase.io/ipfs";
+
+  // 自宅 Kubo の専用公開ゲートウェイ（環境変数 KUBO_GATEWAY_URL があれば最優先）
+  const customKuboGateway = (env && env.KUBO_GATEWAY_URL ? env.KUBO_GATEWAY_URL : "").trim().replace(/\/$/, "");
+
+  let orderedGateways = [];
+  if (customKuboGateway) {
+    orderedGateways.push(customKuboGateway);
+  }
+
+  if (isUnpinned) {
+    // 🌊 Filebase 解放済み（アンピン）:
+    // Filebase を叩くのは無駄（404）なので完全除外。公共ノードに分散させてキャッシュ延命を狙う。
+    const shuffled = [...publicGateways].sort(() => Math.random() - 0.5);
+    orderedGateways.push(...shuffled);
+  } else if (isKuboPinned) {
+    // 🟣 自宅 Kubo 保全済み:
+    // DHT 経由で自宅 Kubo からブロックを取り寄せる公共GWを最優先にし、Filebase 帯域消費をゼロ化。
+    // Filebase は万が一の最後のフォールバックとして末尾に配置。
+    orderedGateways.push(...publicGateways, filebaseGateway);
+  } else {
+    // 🟢 初期アップロード状態（Filebase のみピン留め）:
+    // Filebase に確実に実体が存在するため Filebase 最優先。フォールバックとして公共GW。
+    orderedGateways.push(filebaseGateway, ...publicGateways);
+  }
 
   // ⏱️ 登録からの経過時間判定（30秒以内ならアップロード直後の初期同期中とみなす猶予ステート）
   // See: [INV-DELIVERY-001] (台帳存在時の 404 キャッシュ禁止 / Grace Period)
@@ -886,13 +915,7 @@ export async function onRequest(context) {
   // アンピン状態の判定: FIFO等でアンピンされたファイルは 7日間（604,800秒）キャッシュ
   // （週1回の上流アクセスでIPFSノードのGC消去を回避・延命し、Filebase転送枠も死守）
   // 通常ピン留め中は 1年間（31,536,000秒）キャッシュ
-  const isUnpinned = Boolean(meta.unpinned) || Boolean((meta.f || 0) & 1);
   const UPSTREAM_CACHE_SECONDS = capCacheToExpiry(isUnpinned ? (7 * 86400) : 31536000, expiresTimestamp);
-
-  // ゲートウェイの優先順位を分散（アンピン時は公共ノードにも均等にアクセスを散らす）
-  const orderedGateways = isUnpinned
-    ? [...ipfsGateways].sort(() => Math.random() - 0.5)
-    : ipfsGateways;
 
   const isHead = request.method === "HEAD";
 

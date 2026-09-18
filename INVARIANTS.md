@@ -36,6 +36,18 @@
 
 ---
 
+### [INV-DELIVERY-003] ストレージ状態に応じたゲートウェイ動的優先ルーティング
+* **規則 (Rule)**:  
+  上流 IPFS ゲートウェイへの問い合わせ順序は、KV 台帳のピン状態（`kuboStatus`、`unpinned` フラグ）に応じて動的に制御し、Filebase のダウンロード帯域（Egress）を保護しなければならない (MUST)。
+
+* **満たすべき性質 (Required Behavior)**:  
+  1. **Kubo Pin 済み (`kuboStatus: "pinned"`)**: DHT 経由で自宅 Kubo からブロックを取り寄せる公共ゲートウェイ（`dweb.link`, `ipfs.io`, `Pinata` 等）を最優先にし、Filebase ゲートウェイは末尾の最終フォールバックに配置すること（Filebase 帯域消費をゼロ化）。
+  2. **Filebase 解放済み (`unpinned: true`)**: Filebase への無駄な 404 問い合わせを完全排除するため、Filebase ゲートウェイを候補から除外すること。
+  3. **初期状態（Filebase Pin のみ）**: 実体が確実に存在する Filebase ゲートウェイを最優先とすること。
+  4. 自宅 Kubo の専用ゲートウェイ（`KUBO_GATEWAY_URL`）が設定されている場合は、最優先で問い合わせること。
+
+---
+
 ## 2. 台帳の完全性と実体保護 (Ledger Integrity & Pin Safety)
 
 ### [INV-LEDGER-001] 参照残存時のアンピン（墓標発行）禁止
