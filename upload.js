@@ -113,6 +113,38 @@ function isIpfsCid(value) {
   return typeof value === "string" && /^(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,})$/.test(value);
 }
 
+// ファイル名を最大100文字に制限し、超過時は安全に切り詰めてハッシュを付与
+export function truncateFilename(filename, maxLength = 100) {
+  if (!filename || typeof filename !== "string") return filename || "";
+  const fullChars = Array.from(filename);
+  if (fullChars.length <= maxLength) return filename;
+
+  const dotIndex = filename.lastIndexOf(".");
+  let ext = "";
+  let baseStr = filename;
+  if (dotIndex > 0 && dotIndex < filename.length - 1) {
+    ext = filename.slice(dotIndex);
+    baseStr = filename.slice(0, dotIndex);
+  }
+
+  let hash = "";
+  if (typeof crypto !== "undefined" && crypto.getRandomValues) {
+    const rand = new Uint8Array(4);
+    crypto.getRandomValues(rand);
+    hash = Array.from(rand, b => b.toString(36).padStart(2, "0")).join("").slice(0, 6);
+  } else {
+    hash = Math.random().toString(36).slice(2, 8);
+  }
+
+  const suffix = `_${hash}${ext}`;
+  const suffixChars = Array.from(suffix);
+  const allowedBaseCharsCount = Math.max(1, maxLength - suffixChars.length);
+  const baseChars = Array.from(baseStr);
+  const truncatedBase = baseChars.slice(0, allowedBaseCharsCount).join("").replace(/[._\s-]+$/, "");
+
+  return `${truncatedBase}${suffix}`;
+}
+
 // Filebase の IPFS RPC API へ投稿する。S3 Access/Secret Key をクライアントへ
 // 出さず、Worker の FILEBASE_IPFS_API_KEY（バケット限定キー）だけで実行する。
 async function uploadToFilebase(fileBuffer, filename, contentType, env) {
@@ -278,7 +310,10 @@ export async function onRequestPost(context) {
       });
     }
 
-    // 2. 拡張子バリデーション
+    // 2. ファイル名正規化（最大100文字制限）
+    originalFilename = truncateFilename(originalFilename, 100);
+
+    // 3. 拡張子バリデーション
     let ext = originalFilename.includes(".") ? originalFilename.split(".").pop().toLowerCase() : "";
     if (!ext || !ALLOWED_EXTS.includes(ext)) {
       ext = "webp"; // デフォルト拡張子

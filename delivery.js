@@ -572,6 +572,11 @@ export async function onRequest(context) {
     return renderNotFoundResponse(request, 86400);
   }
 
+  // 🛡️ ファイル名長上限ガード: 100文字を超えるリクエストはKVを検索せず即座に404（24時間キャッシュ）
+  if (Array.from(filename).length > 100) {
+    return renderNotFoundResponse(request, 86400);
+  }
+
   let targetCid = null;
   let meta = {};
   let resolvedKvKey = "";
