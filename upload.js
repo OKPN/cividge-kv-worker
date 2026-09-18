@@ -335,11 +335,27 @@ export async function onRequestPost(context) {
     }
     contentType = contentType || MIME_MAP[ext] || "application/octet-stream";
 
-    // 3. ランダムファイル名生成（6文字英数）
+    // 3. 命名ルールに基づく shortKey の生成 (random / original / date_random)
+    const namingRule = (url.searchParams.get("naming") || request.headers.get("X-Upload-Naming") || "random").toLowerCase();
     const randomArray = new Uint8Array(4);
     crypto.getRandomValues(randomArray);
     const randomStr = Array.from(randomArray, b => b.toString(36).padStart(2, "0")).join("").substring(0, 6);
-    const shortKey = `${randomStr}.${ext}`;
+
+    let shortKey = `${randomStr}.${ext}`;
+    if (namingRule === "original" && originalFilename) {
+      const lastDot = originalFilename.lastIndexOf(".");
+      let baseName = lastDot > 0 ? originalFilename.slice(0, lastDot) : originalFilename;
+      baseName = baseName.replace(/[/\\?%*:|"<>]/g, "_").trim().replace(/\s+/g, "_");
+      if (baseName) {
+        shortKey = `${baseName}.${ext}`;
+      }
+    } else if (namingRule === "date_random") {
+      const now = new Date();
+      const y = now.getUTCFullYear();
+      const m = String(now.getUTCMonth() + 1).padStart(2, "0");
+      const d = String(now.getUTCDate()).padStart(2, "0");
+      shortKey = `${y}${m}${d}_${randomStr}.${ext}`;
+    }
 
     // 4. パスワードハッシュ生成 (PBKDF2)
     let passwordMeta = {};
