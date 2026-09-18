@@ -891,19 +891,16 @@ export async function onRequest(context) {
     orderedGateways.push(customKuboGateway);
   }
 
-  if (isUnpinned) {
-    // 🌊 Filebase 解放済み（アンピン）:
-    // Filebase を叩くのは無駄（404）なので完全除外。公共ノードに分散させてキャッシュ延命を狙う。
-    const shuffled = [...publicGateways].sort(() => Math.random() - 0.5);
-    orderedGateways.push(...shuffled);
-  } else if (isKuboPinned) {
+  if (isKuboPinned) {
     // 🟣 自宅 Kubo 保全済み:
     // DHT 経由で自宅 Kubo からブロックを取り寄せる公共GWを最優先にし、Filebase 帯域消費をゼロ化。
-    // Filebase は万が一の最後のフォールバックとして末尾に配置。
+    // 自宅 PC が電源オフの時だけ、Filebase を最後のフォールバックとして叩いて 404 を防ぐ。
     orderedGateways.push(...publicGateways, filebaseGateway);
   } else {
-    // 🟢 初期アップロード状態（Filebase のみピン留め）:
-    // Filebase に確実に実体が存在するため Filebase 最優先。フォールバックとして公共GW。
+    // 🟢 Filebase ピン留め中 または 🌊 アンピン漂流中:
+    // 最もデータ実体・エッジキャッシュが最後まで残存している Filebase を最優先で叩いて即座に救出。
+    // Filebase で見つからない（完全にGC消去された）場合は、フォールバックとして公共GWを探索する。
+    // ※アンピン漂流中ファイルは Cloudflare エッジに 7日間（604,800秒）キャッシュされるため、Filebase 帯域消費も週1回で極小。
     orderedGateways.push(filebaseGateway, ...publicGateways);
   }
 

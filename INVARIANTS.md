@@ -41,10 +41,9 @@
   上流 IPFS ゲートウェイへの問い合わせ順序は、KV 台帳のピン状態（`kuboStatus`、`unpinned` フラグ）に応じて動的に制御し、Filebase のダウンロード帯域（Egress）を保護しなければならない (MUST)。
 
 * **満たすべき性質 (Required Behavior)**:  
-  1. **Kubo Pin 済み (`kuboStatus: "pinned"`)**: DHT 経由で自宅 Kubo からブロックを取り寄せる公共ゲートウェイ（`dweb.link`, `ipfs.io`, `Pinata` 等）を最優先にし、Filebase ゲートウェイは末尾の最終フォールバックに配置すること（Filebase 帯域消費をゼロ化）。
-  2. **Filebase 解放済み (`unpinned: true`)**: Filebase への無駄な 404 問い合わせを完全排除するため、Filebase ゲートウェイを候補から除外すること。
-  3. **初期状態（Filebase Pin のみ）**: 実体が確実に存在する Filebase ゲートウェイを最優先とすること。
-  4. 自宅 Kubo の専用ゲートウェイ（`KUBO_GATEWAY_URL`）が設定されている場合は、最優先で問い合わせること。
+  1. **Kubo Pin 済み (`kuboStatus: "pinned"`)**: DHT 経由で自宅 Kubo からブロックを取り寄せる公共ゲートウェイ（`dweb.link`, `ipfs.io`, `Pinata` 等）を最優先にし、Filebase ゲートウェイは自宅オフライン時の最終フォールバックに配置すること（Filebase 帯域消費をゼロ化）。
+  2. **Filebase Pin 留め中 または アンピン漂流中 (`unpinned: true`)**: 最もデータ実体およびエッジキャッシュが最後まで残存している Filebase ゲートウェイを最優先で問い合わせ、ダメなら公共ゲートウェイへフォールバックすること。※漂流中ファイルはエッジに 7日間キャッシュされるため Filebase 帯域への影響も極小。
+  3. 自宅 Kubo の専用ゲートウェイ（`KUBO_GATEWAY_URL`）が設定されている場合は、最優先で問い合わせること。
 
 ---
 
