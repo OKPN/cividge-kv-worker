@@ -438,11 +438,15 @@ export async function onRequestPost(context) {
 
     // 7. KV にルーティング登録（キーは shortKey 単体とし、ドメイン制限は allowedHost メタデータで管理）
     if ((env.CIVIDGE_KV || env.IPFS_KV)) {
+      const now = Date.now();
       const kvMetadata = {
         blobKey,
         size: uploadedSize,
+        s: uploadedSize,
         mime: contentType,
-        registeredAt: Date.now(),
+        registeredAt: now,
+        lastModified: now,
+        t: Math.floor(now / 1000),
         ...(storageBackend ? { backend: storageBackend } : { backend: "kv" }),
         ...(targetCid ? { cid: targetCid } : {}),
         ...(cleanHostname ? { allowedHost: cleanHostname, d: cleanHostname } : {}),

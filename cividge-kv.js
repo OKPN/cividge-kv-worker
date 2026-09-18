@@ -154,8 +154,17 @@ export async function onRequestGet(context) {
       });
     }
     try {
-      const list = await (env.CIVIDGE_KV || env.IPFS_KV).list({ limit: 1000 });
-      const items = (list.keys || [])
+      let cursor = undefined;
+      const allRawKeys = [];
+      do {
+        const page = await (env.CIVIDGE_KV || env.IPFS_KV).list({ limit: 1000, ...(cursor ? { cursor } : {}) });
+        if (page.keys && page.keys.length > 0) {
+          allRawKeys.push(...page.keys);
+        }
+        cursor = page.list_complete === false ? page.cursor : undefined;
+      } while (cursor);
+
+      const items = allRawKeys
         .filter(k => !k.name.startsWith("tombstone_") && !k.name.startsWith("blob_"))
         .map(k => ({
           name: k.name,
@@ -515,13 +524,17 @@ export async function onRequestDelete(context) {
     // 🪦 墓標（Tombstone / Unpin予約）の発行判定:
     // CID が存在する場合、他のキーが同じ CID を参照していなければ、将来 Kubo 起動時にアンピンできるよう墓標を登録
     if (existingCid) {
-      const allKeys = await (env.CIVIDGE_KV || env.IPFS_KV).list({ limit: 1000 });
-      const isCidShared = (allKeys.keys || []).some(k => {
-        if (k.name === key || k.name.startsWith("tombstone_") || k.name.startsWith("blob_")) return false;
-        // metadata に CID (cid または c) が入っているか、あるいは同一実体キーか判定
-        const itemCid = k.metadata?.cid || k.metadata?.c;
-        return itemCid === existingCid;
-      });
+      let cursor = undefined;
+      let isCidShared = false;
+      do {
+        const page = await (env.CIVIDGE_KV || env.IPFS_KV).list({ limit: 1000, ...(cursor ? { cursor } : {}) });
+        isCidShared = (page.keys || []).some(k => {
+          if (k.name === key || k.name.startsWith("tombstone_") || k.name.startsWith("blob_")) return false;
+          const itemCid = k.metadata?.cid || k.metadata?.c;
+          return itemCid === existingCid;
+        });
+        cursor = page.list_complete === false ? page.cursor : undefined;
+      } while (!isCidShared && cursor);
 
       if (!isCidShared) {
         // 30日間のTTLを設定して墓標を保存
