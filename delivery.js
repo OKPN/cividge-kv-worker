@@ -100,7 +100,7 @@ const CATBOX_404_HTML = `<!DOCTYPE html>
   <div class="container">
     <div class="error-code">404</div>
     <div class="question-mark">?</div>
-    <img class="character-img" src="data:image/webp;base64,${CHARACTER_WEBP_BASE64}" alt="404 Not Found" onerror="this.style.display='none'">
+    <img class="character-img" src="/404-character.webp" alt="404 Not Found" onerror="this.onerror=null; this.src='data:image/webp;base64,${CHARACTER_WEBP_BASE64}';">
     <div class="message">The file you're looking for doesn't exist<br>or has been removed.</div>
     <a href="/" class="home-link">Click me to go home</a>
   </div>
@@ -830,6 +830,38 @@ export async function onRequest(context) {
     }
   }
 
+  // 3.5. R2 ストレージに保存されている場合は R2 バケットから直接配信
+  if (env && env.R2_BUCKET && (meta.backend === "r2" || (!targetCid && filename))) {
+    try {
+      const r2Key = meta.s3Key || meta.k_s3 || filename;
+      const r2Obj = await env.R2_BUCKET.get(r2Key);
+      if (r2Obj) {
+        const headers = new Headers();
+        headers.set("Access-Control-Allow-Origin", "*");
+        headers.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+        headers.set("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges, X-Image-Width, X-Image-Height");
+        headers.set("Content-Disposition", `inline; filename="${encodeURIComponent(filename)}"`);
+        headers.set("X-Content-Type-Options", "nosniff");
+        headers.set("Accept-Ranges", "bytes");
+        const extLower = extMatch[1].toLowerCase();
+        const isVideo = ["mp4", "webm", "mov", "m4v", "avi", "ogv"].includes(extLower);
+        const isAudio = ["mp3", "wav", "ogg", "m4a", "flac", "aac"].includes(extLower);
+        const CACHE_SECONDS = publicMediaCacheSeconds(env, {
+          isVideoOrAudio: isVideo || isAudio,
+          expiresAt: expiresTimestamp,
+        });
+        headers.set("Cache-Control", `public, max-age=${CACHE_SECONDS}`);
+        headers.set("Cloudflare-CDN-Cache-Control", `public, max-age=${CACHE_SECONDS}`);
+        headers.set("Vary", "Accept-Encoding");
+        r2Obj.writeHttpMetadata(headers);
+        headers.set("Content-Type", meta.mime || headers.get("Content-Type") || "application/octet-stream");
+        return new Response(r2Obj.body, { status: 200, headers });
+      }
+    } catch (r2Err) {
+      console.warn("R2 read error:", r2Err);
+    }
+  }
+
   // 候補ターゲット（CID、S3Key、ファイル名）を順次試行
   const candidates = [];
   if (targetCid) candidates.push(targetCid);
@@ -846,6 +878,10 @@ export async function onRequest(context) {
     "https://dweb.link/ipfs",
   ];
 
+  // ⏱️ 登録からの経過時間判定（30秒以内ならアップロード直後の初期同期中とみなす猶予ステート）
+  const registeredTime = meta.registeredAt || (meta.t ? meta.t * 1000 : 0) || meta.lastModified || 0;
+  const isWithinGracePeriod = registeredTime > 0 && (Date.now() - registeredTime < 30000);
+
   // アンピン状態の判定: FIFO等でアンピンされたファイルは 7日間（604,800秒）キャッシュ
   // （週1回の上流アクセスでIPFSノードのGC消去を回避・延命し、Filebase転送枠も死守）
   // 通常ピン留め中は 1年間（31,536,000秒）キャッシュ
@@ -860,31 +896,44 @@ export async function onRequest(context) {
   const isHead = request.method === "HEAD";
 
   let upstreamResponse = null;
-  for (const candidate of candidates) {
-    for (const gw of orderedGateways) {
-      try {
-        upstreamResponse = await fetch(`${gw}/${candidate}`, {
-          method: isHead ? "HEAD" : "GET",
-          redirect: "follow",
-          signal: AbortSignal.timeout(6000),
-          headers: {
-            "User-Agent": "Cividge-KV-Relay/1.0",
-            ...(request.headers.get("Range") ? { "Range": request.headers.get("Range") } : {}),
-            ...(request.headers.get("If-Range") ? { "If-Range": request.headers.get("If-Range") } : {}),
-          },
-          cf: {
-            cacheEverything: !hasPassword,
-            ...(hasPassword ? { cacheTtl: 0 } : {
-              cacheTtlByStatus: { "200-299": UPSTREAM_CACHE_SECONDS, "404": 60, "500-599": 0 }
-            }),
-          },
-        });
+  const maxFetchAttempts = isWithinGracePeriod ? 2 : 1; // 30秒以内の初期同期なら1回自動リトライ
 
-        if (upstreamResponse && upstreamResponse.ok) {
-          break;
+  for (let attempt = 0; attempt < maxFetchAttempts; attempt++) {
+    if (attempt > 0) {
+      // 1回目の失敗後、1.2秒待機して Filebase のインデックス完了を待つ
+      await new Promise(r => setTimeout(r, 1200));
+    }
+
+    for (const candidate of candidates) {
+      for (const gw of orderedGateways) {
+        try {
+          upstreamResponse = await fetch(`${gw}/${candidate}`, {
+            method: isHead ? "HEAD" : "GET",
+            redirect: "follow",
+            signal: AbortSignal.timeout(6000),
+            headers: {
+              "User-Agent": "Cividge-KV-Relay/1.0",
+              ...(request.headers.get("Range") ? { "Range": request.headers.get("Range") } : {}),
+              ...(request.headers.get("If-Range") ? { "If-Range": request.headers.get("If-Range") } : {}),
+            },
+            cf: {
+              cacheEverything: !hasPassword,
+              ...(hasPassword ? { cacheTtl: 0 } : {
+                // 30秒以内の初期同期中は 404 を絶対に Worker キャッシュしない (0秒)
+                cacheTtlByStatus: { "200-299": UPSTREAM_CACHE_SECONDS, "404": isWithinGracePeriod ? 0 : 60, "500-599": 0 }
+              }),
+            },
+          });
+
+          if (upstreamResponse && upstreamResponse.ok) {
+            break;
+          }
+        } catch (err) {
+          console.warn(`Upstream fetch attempt failed for ${gw}/${candidate}:`, err.name === "TimeoutError" ? "Timeout (6s)" : err.message || err);
         }
-      } catch (err) {
-        console.warn(`Upstream fetch attempt failed for ${gw}/${candidate}:`, err.name === "TimeoutError" ? "Timeout (6s)" : err.message || err);
+      }
+      if (upstreamResponse && upstreamResponse.ok) {
+        break;
       }
     }
     if (upstreamResponse && upstreamResponse.ok) {
@@ -892,9 +941,11 @@ export async function onRequest(context) {
     }
   }
 
-
   if (!upstreamResponse || !upstreamResponse.ok) {
-    return renderNotFoundResponse(request);
+    // ⚠️ 登録から30秒以内のファイルは初期同期ラグの可能性が高いため、エッジに404を焼き付けない (0秒 / no-store)
+    // 30秒を超えた長期不在（自宅ノードオフライン等）は、Worker防護のため通常通り60秒キャッシュする
+    const notFoundTtl = isWithinGracePeriod ? 0 : 60;
+    return renderNotFoundResponse(request, notFoundTtl);
   }
 
   const headers = new Headers();
