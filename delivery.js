@@ -879,6 +879,7 @@ export async function onRequest(context) {
   ];
 
   // ⏱️ 登録からの経過時間判定（30秒以内ならアップロード直後の初期同期中とみなす猶予ステート）
+  // See: [INV-DELIVERY-001] (台帳存在時の 404 キャッシュ禁止 / Grace Period)
   const registeredTime = meta.registeredAt || (meta.t ? meta.t * 1000 : 0) || meta.lastModified || 0;
   const isWithinGracePeriod = registeredTime > 0 && (Date.now() - registeredTime < 30000);
 

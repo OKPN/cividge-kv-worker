@@ -154,6 +154,7 @@ export async function onRequestGet(context) {
       });
     }
     try {
+      // See: [INV-LEDGER-002] (KV 走査における全件網羅 / 1,000 件制限の克服)
       let cursor = undefined;
       const allRawKeys = [];
       do {
@@ -523,6 +524,7 @@ export async function onRequestDelete(context) {
 
     // 🪦 墓標（Tombstone / Unpin予約）の発行判定:
     // CID が存在する場合、他のキーが同じ CID を参照していなければ、将来 Kubo 起動時にアンピンできるよう墓標を登録
+    // See: [INV-LEDGER-001] (参照残存時のアンピン禁止) & [INV-LEDGER-002] (全件走査)
     if (existingCid) {
       let cursor = undefined;
       let isCidShared = false;
