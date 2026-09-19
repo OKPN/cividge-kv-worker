@@ -482,13 +482,13 @@ async function cleanupExpiredAlias(env, request, key, expectedCid) {
     } while (!isCidShared && cursor);
 
     if (!isCidShared) {
-      // 自宅 Kubo が次回起動した際に回収できるよう、既存仕様の墓標を維持する。
-      await (env.CIVIDGE_KV || env.IPFS_KV).put(`tombstone_${expectedCid}`, "1", { expirationTtl: 86400 * 30 }).catch(() => {});
+      // 自宅 Kubo が次回起動した際に回収できるよう、無期限で墓標を保持する。
+      await (env.CIVIDGE_KV || env.IPFS_KV).put(`tombstone_${expectedCid}`, "1").catch(() => {});
 
       // S3実体削除用の墓標を作成（管理画面が開いた際にブラウザのS3クライアントが実体削除して墓標を消去する）
       const s3TargetKey = latestMeta.s3Key || latestMeta.s || (key.includes(":") ? key.split(":")[1] : key);
       if (s3TargetKey) {
-        await (env.CIVIDGE_KV || env.IPFS_KV).put(`tombstone_s3_${encodeURIComponent(s3TargetKey)}`, "1", { expirationTtl: 86400 * 30 }).catch(() => {});
+        await (env.CIVIDGE_KV || env.IPFS_KV).put(`tombstone_s3_${encodeURIComponent(s3TargetKey)}`, "1").catch(() => {});
         // ⚡ R2 の場合は Worker 自身が R2 バインディングを持っていれば実体とサムネイルも即時消去
         if ((latestMeta.backend === "r2" || latestMeta.b === "r2" || expectedCid === "r2") && env.R2_BUCKET) {
           await env.R2_BUCKET.delete(s3TargetKey).catch(() => {});

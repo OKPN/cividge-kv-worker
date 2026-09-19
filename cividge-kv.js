@@ -585,10 +585,8 @@ export async function onRequestDelete(context) {
       } while (!isCidShared && cursor);
 
       if (!isCidShared) {
-        // 30日間のTTLを設定して墓標を保存
-        await (env.CIVIDGE_KV || env.IPFS_KV).put("tombstone_" + existingCid, "1", {
-          expirationTtl: 86400 * 30,
-        }).catch(() => {});
+        // 回収されて実体が削除されるまで確実に残すため無期限で墓標を保存
+        await (env.CIVIDGE_KV || env.IPFS_KV).put("tombstone_" + existingCid, "1").catch(() => {});
       }
     }
 
