@@ -647,8 +647,8 @@ export async function onRequest(context) {
         kvRes = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(rawFilename);
       }
 
-      if (kvRes && kvRes.value) {
-        targetCid = kvRes.value;
+      if (kvRes && (kvRes.value !== undefined && kvRes.value !== null)) {
+        targetCid = kvRes.value || "";
         meta = kvRes.metadata || {};
         resolvedKvKey = isDomainSpecific ? `${resolvedHost}:${resolvedFilename}` : filename;
         // 旧形式や単体キーのレコードでも allowedHost が設定されている。
@@ -665,11 +665,12 @@ export async function onRequest(context) {
     }
   }
 
-  // 台帳に存在しないファイル名は、IPFS Gateway を検索しない。ランダムパス
-  // 攻撃で Filebase・公開 Gateway・Kubo の上流アクセスを発生させない。
-  // 正規の公開リンクは必ず KV 台帳の CID または保存キーを持つという不変条件に
-  // 依存する。
-  if (!targetCid) {
+  // 🛡️ 台帳存在チェック（ランダムパス攻撃防御）:
+  // 台帳に存在しないファイル名は、R2 / IPFS どちらのストレージも検索しない。
+  // 攻撃で上流アクセスを発生させず、エッジ最前線で即座に 404 返却する。
+  const isR2Record = targetCid === "r2" || meta.backend === "r2" || (Boolean(resolvedKvKey) && Boolean(meta.k_s3 || meta.s3Key) && Boolean(env.R2_BUCKET));
+  const hasValidLedgerRecord = Boolean(targetCid || isR2Record);
+  if (!hasValidLedgerRecord) {
     return renderNotFoundResponse(request, 60);
   }
 
@@ -830,36 +831,49 @@ export async function onRequest(context) {
     }
   }
 
-  // 3.5. R2 ストレージに保存されている場合は R2 バケットから直接配信
-  if (env && env.R2_BUCKET && (meta.backend === "r2" || (!targetCid && filename))) {
-    try {
-      const r2Key = meta.s3Key || meta.k_s3 || filename;
-      const r2Obj = await env.R2_BUCKET.get(r2Key);
-      if (r2Obj) {
-        const headers = new Headers();
-        headers.set("Access-Control-Allow-Origin", "*");
-        headers.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
-        headers.set("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges, X-Image-Width, X-Image-Height");
-        headers.set("Content-Disposition", `inline; filename="${encodeURIComponent(filename)}"`);
-        headers.set("X-Content-Type-Options", "nosniff");
-        headers.set("Accept-Ranges", "bytes");
-        const extLower = extMatch[1].toLowerCase();
-        const isVideo = ["mp4", "webm", "mov", "m4v", "avi", "ogv"].includes(extLower);
-        const isAudio = ["mp3", "wav", "ogg", "m4a", "flac", "aac"].includes(extLower);
-        const CACHE_SECONDS = publicMediaCacheSeconds(env, {
-          isVideoOrAudio: isVideo || isAudio,
-          expiresAt: expiresTimestamp,
-        });
-        headers.set("Cache-Control", `public, max-age=${CACHE_SECONDS}`);
-        headers.set("Cloudflare-CDN-Cache-Control", `public, max-age=${CACHE_SECONDS}`);
-        headers.set("Vary", "Accept-Encoding");
-        r2Obj.writeHttpMetadata(headers);
-        headers.set("Content-Type", meta.mime || headers.get("Content-Type") || "application/octet-stream");
-        return new Response(r2Obj.body, { status: 200, headers });
+  // ⚡ 3.5. R2 ストレージの配信処理（台帳が R2 の場合は R2 バケットのみを検索し、IPFS へは無駄打ちしない）
+  // See: [INV-DELIVERY-004] (R2 と IPFS の相互排他ルーティング)
+  const isR2 = Boolean(isR2Record || targetCid === "r2");
+  if (isR2) {
+    if (env && env.R2_BUCKET) {
+      try {
+        const r2Key = meta.s3Key || meta.k_s3 || filename;
+        const r2Obj = await env.R2_BUCKET.get(r2Key);
+        if (r2Obj) {
+          const headers = new Headers();
+          headers.set("Access-Control-Allow-Origin", "*");
+          headers.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+          headers.set("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges, X-Image-Width, X-Image-Height");
+          headers.set("Content-Disposition", `inline; filename="${encodeURIComponent(filename)}"`);
+          headers.set("X-Content-Type-Options", "nosniff");
+          headers.set("Accept-Ranges", "bytes");
+          setImageDimensionHeaders(headers, meta);
+          const extLower = extMatch[1].toLowerCase();
+          const isVideo = ["mp4", "webm", "mov", "m4v", "avi", "ogv"].includes(extLower);
+          const isAudio = ["mp3", "wav", "ogg", "m4a", "flac", "aac"].includes(extLower);
+          const CACHE_SECONDS = publicMediaCacheSeconds(env, {
+            isVideoOrAudio: isVideo || isAudio,
+            expiresAt: expiresTimestamp,
+          });
+          if (hasPassword) {
+            headers.set("Cache-Control", `private, max-age=${CACHE_SECONDS}`);
+            headers.set("Cloudflare-CDN-Cache-Control", "private, no-store");
+            headers.set("Vary", "Cookie, Accept-Encoding");
+          } else {
+            headers.set("Cache-Control", `public, max-age=${CACHE_SECONDS}`);
+            headers.set("Cloudflare-CDN-Cache-Control", `public, max-age=${CACHE_SECONDS}`);
+            headers.set("Vary", "Accept-Encoding");
+          }
+          r2Obj.writeHttpMetadata(headers);
+          headers.set("Content-Type", meta.mime || headers.get("Content-Type") || "application/octet-stream");
+          return new Response(isHead ? null : r2Obj.body, { status: 200, headers });
+        }
+      } catch (r2Err) {
+        console.warn("R2 read error:", r2Err);
       }
-    } catch (r2Err) {
-      console.warn("R2 read error:", r2Err);
     }
+    // R2 レコードなのに R2 バケットに存在しない場合は、IPFS を探さずに即座に 404 を返却（無駄打ちゼロ）
+    return renderNotFoundResponse(request, 60);
   }
 
   // 候補ターゲット（CID、S3Key、ファイル名）を順次試行
