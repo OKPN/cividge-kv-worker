@@ -489,6 +489,11 @@ async function cleanupExpiredAlias(env, request, key, expectedCid) {
       const s3TargetKey = latestMeta.s3Key || latestMeta.s || (key.includes(":") ? key.split(":")[1] : key);
       if (s3TargetKey) {
         await (env.CIVIDGE_KV || env.IPFS_KV).put(`tombstone_s3_${encodeURIComponent(s3TargetKey)}`, "1", { expirationTtl: 86400 * 30 }).catch(() => {});
+        // ⚡ R2 の場合は Worker 自身が R2 バインディングを持っていれば実体とサムネイルも即時消去
+        if ((latestMeta.backend === "r2" || latestMeta.b === "r2" || expectedCid === "r2") && env.R2_BUCKET) {
+          await env.R2_BUCKET.delete(s3TargetKey).catch(() => {});
+          await env.R2_BUCKET.delete(`${s3TargetKey}.thumb.webp`).catch(() => {});
+        }
       }
 
       // Filebase 用の限定 RPC key がある運用では、最後の別名で pin も解放する。
@@ -680,20 +685,62 @@ export async function onRequest(context) {
   // 🛡️ 台帳存在チェック（ランダムパス攻撃防御）:
   // 台帳に存在しないファイル名は、R2 / IPFS どちらのストレージも検索しない。
   // 攻撃で上流アクセスを発生させず、エッジ最前線で即座に 404 返却する。
-  const isIpfsRecord = Boolean(
+  let isIpfsRecord = Boolean(
     (targetCid && targetCid !== "r2") ||
     (meta.c && meta.c !== "r2") ||
     (meta.cid && meta.cid !== "r2")
   );
-  const isR2Record = !isIpfsRecord && Boolean(
+  let isR2Record = !isIpfsRecord && Boolean(
     targetCid === "r2" ||
     meta.backend === "r2" ||
     meta.b === "r2" ||
     (resolvedKvKey && Boolean(env.R2_BUCKET))
   );
-  const hasValidLedgerRecord = Boolean(isIpfsRecord || isR2Record);
+  let hasValidLedgerRecord = Boolean(isIpfsRecord || isR2Record);
   if (!hasValidLedgerRecord) {
-    return renderNotFoundResponse(request, 60);
+    if (env && env.R2_BUCKET) {
+      try {
+        const r2FallbackObj = await env.R2_BUCKET.get(filename);
+        if (r2FallbackObj) {
+          // ⚡ R2 オンデマンド自己修復（On-Demand Self-Healing）:
+          // R2 バケットに実体が存在したため、KV 台帳レコードを裏で自動生成・復旧
+          const autoKvSync = async () => {
+            try {
+              if (env.CIVIDGE_KV || env.IPFS_KV) {
+                const autoMeta = {
+                  b: "r2",
+                  backend: "r2",
+                  cid: "r2",
+                  s: r2FallbackObj.size,
+                  size: r2FallbackObj.size,
+                  s3Key: filename,
+                  mime: r2FallbackObj.httpMetadata?.contentType || "",
+                  t: Math.floor(Date.now() / 1000),
+                };
+                const hostKey = `${url.hostname.toLowerCase()}:${filename}`;
+                await (env.CIVIDGE_KV || env.IPFS_KV).put(hostKey, "r2", { metadata: autoMeta });
+                await (env.CIVIDGE_KV || env.IPFS_KV).put(filename, "r2", { metadata: autoMeta });
+                console.log(`⚡ On-Demand Self-Heal: Auto-registered KV for R2 file ${filename}`);
+              }
+            } catch (syncErr) {
+              console.warn("On-Demand KV auto-sync failed:", syncErr);
+            }
+          };
+          context.waitUntil?.(autoKvSync()) || autoKvSync();
+
+          targetCid = "r2";
+          meta = { backend: "r2", b: "r2", s3Key: filename, mime: r2FallbackObj.httpMetadata?.contentType };
+          isR2Record = true;
+          hasValidLedgerRecord = true;
+        } else {
+          return renderNotFoundResponse(request, 60);
+        }
+      } catch (r2Err) {
+        return renderNotFoundResponse(request, 60);
+      }
+    } else {
+      return renderNotFoundResponse(request, 60);
+    }
   }
 
   // ⏳ 時限アップロードの有効期限チェック（期限切れは即座に404、短縮キー e にも対応）
