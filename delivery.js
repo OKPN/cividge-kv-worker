@@ -352,6 +352,9 @@ function renderOgpHtml(filename, rawUrl, ext, isVideo, origin, thumbnailKey = nu
   <title>${title}</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta property="og:title" content="${title}">
+  <meta name="description" content="${title} - Cividge Media">
+  <meta property="og:description" content="${title} - Cividge Media">
+  <meta name="twitter:description" content="${title} - Cividge Media">
   <meta property="og:site_name" content="${siteName}">
   <meta property="og:url" content="${mediaUrl}">
   <meta property="og:image" content="${thumbUrl}">
