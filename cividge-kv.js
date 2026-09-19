@@ -12,6 +12,11 @@ export async function onRequestOptions() {
   });
 }
 
+// 🛡️ IPFS CID 判定ヘルパー（"r2" などの特殊マーカー値や無効値を除外）
+function isRealIpfsCid(c) {
+  return typeof c === "string" && c !== "r2" && (c.startsWith("Qm") || c.startsWith("baf") || c.length > 20);
+}
+
 function unpackMetadata(name, cid, meta = {}) {
   const flags = meta.f || 0;
   const isUnpinned = meta.unpinned !== undefined ? Boolean(meta.unpinned) : Boolean(flags & 1);
@@ -286,7 +291,6 @@ export async function onRequestPost(context) {
     // 🛡️ CID衝突ガード:
     // 同一ファイル名が既に存在し、かつ中身（実体CID）が異なる場合は上書き破壊を防ぐため409 Conflictで弾く。
     // ※ "r2" というマーカー値は IPFS CID ではないため、R2 のメタデータ更新や CID 同期時には衝突とみなさない。
-    const isRealIpfsCid = (c) => typeof c === "string" && c !== "r2" && (c.startsWith("Qm") || c.startsWith("baf") || c.length > 20);
     const existingRealCid = isRealIpfsCid(existingMetadata?.contentCid || existingMetadata?.c_cid)
       ? (existingMetadata?.contentCid || existingMetadata?.c_cid)
       : (isRealIpfsCid(existingCid) ? existingCid : "");
@@ -550,10 +554,10 @@ export async function onRequestDelete(context) {
     await (env.CIVIDGE_KV || env.IPFS_KV).delete(key);
 
     // 🪦 墓標（Tombstone / Unpin予約）の発行判定:
-    // クライアント側でローカル台帳により共有有無を判定して make_tombstone=0/1 が渡された場合、
-    // 重い全件走査（1日1,000回枠の list() 消費）を完全にスキップして即座に処理する。
+    // [INV-CORE-001] [INV-CORE-004] 純粋な IPFS CID（Qm..., baf...）のみ対象。
+    // R2 ファイル（cid === "r2" 等）や非CID値で無意味な tombstone_r2 を書き込んで枠（1,000回）を浪費するバグを根絶。
     const makeTombstoneParam = url.searchParams.get("make_tombstone");
-    if (existingCid) {
+    if (existingCid && isRealIpfsCid(existingCid)) {
       let shouldMakeTombstone = false;
       if (makeTombstoneParam === "1") {
         shouldMakeTombstone = true;
