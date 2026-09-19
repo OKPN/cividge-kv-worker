@@ -7,7 +7,7 @@ export async function onRequestOptions() {
     headers: {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, Range, If-Range, X-Upload-Password, X-Upload-Filename, X-Custom-Domain, X-Delivery-Domain, X-Storage-Backend",
     },
   });
 }
@@ -118,8 +118,9 @@ export async function onRequestGet(context) {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
     } catch (err) {
-      return new Response(JSON.stringify({ error: err.message }), {
-        status: 500,
+      console.warn("tombstones_s3 list error:", err.message);
+      return new Response(JSON.stringify({ success: true, tombstonesS3: [], warning: err.message }), {
+        status: 200,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
     }
@@ -143,8 +144,9 @@ export async function onRequestGet(context) {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
     } catch (err) {
-      return new Response(JSON.stringify({ error: err.message }), {
-        status: 500,
+      console.warn("tombstones list error:", err.message);
+      return new Response(JSON.stringify({ success: true, tombstones: [], warning: err.message }), {
+        status: 200,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
     }
@@ -158,12 +160,22 @@ export async function onRequestGet(context) {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
     }
+
+    const kv = env.CIVIDGE_KV || env.IPFS_KV;
+    const INDEX_KEY = "__cividge_ledger_index__";
+
+    // ⚡ まず高速・1日10万回無料の get() でインデックスキャッシュの存在を確認
+    let cachedIndex = null;
+    try {
+      cachedIndex = await kv.get(INDEX_KEY, "json");
+    } catch (e) {}
+
     try {
       // See: [INV-LEDGER-002] (KV 走査における全件網羅 / 1,000 件制限の克服)
       let cursor = undefined;
       const allRawKeys = [];
       do {
-        const page = await (env.CIVIDGE_KV || env.IPFS_KV).list({ limit: 1000, ...(cursor ? { cursor } : {}) });
+        const page = await kv.list({ limit: 1000, ...(cursor ? { cursor } : {}) });
         if (page.keys && page.keys.length > 0) {
           allRawKeys.push(...page.keys);
         }
@@ -171,18 +183,34 @@ export async function onRequestGet(context) {
       } while (cursor);
 
       const items = allRawKeys
-        .filter(k => !k.name.startsWith("tombstone_") && !k.name.startsWith("blob_"))
+        .filter(k => !k.name.startsWith("tombstone_") && !k.name.startsWith("blob_") && k.name !== INDEX_KEY)
         .map(k => ({
           name: k.name,
           metadata: unpackMetadata(k.name, "", k.metadata),
         }));
+
+      // インデックスキャッシュを非同期で保存（次回以降の list() 呼び出しを削減可能に）
+      try {
+        context.waitUntil(kv.put(INDEX_KEY, JSON.stringify({ files: items, updatedAt: Date.now() }), { expirationTtl: 86400 }));
+      } catch (e) {}
+
       return new Response(JSON.stringify({ success: true, files: items }), {
         status: 200,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
     } catch (err) {
-      return new Response(JSON.stringify({ error: err.message }), {
-        status: 500,
+      console.warn("KV list error:", err.message);
+      // 🛡️ KV list() の1日1000回上限等に引っかかった場合でも、インデックスキャッシュがあればそれを返却して画面真っ白を防ぐ
+      if (cachedIndex && Array.isArray(cachedIndex.files)) {
+        return new Response(JSON.stringify({ success: true, files: cachedIndex.files, cached: true, warning: err.message }), {
+          status: 200,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+        });
+      }
+
+      // キャッシュもない場合は空配列で安全に返却（500でクラッシュさせない）
+      return new Response(JSON.stringify({ success: true, files: [], warning: err.message }), {
+        status: 200,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
     }
