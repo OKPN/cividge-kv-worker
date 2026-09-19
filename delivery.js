@@ -467,41 +467,15 @@ async function cleanupExpiredAlias(env, request, key, expectedCid) {
     }
     await (env.CIVIDGE_KV || env.IPFS_KV).delete(key);
 
-    // KV list は1,000件ずつなので、全ページを確認できた場合だけ「最後」と断定する。
-    let cursor = undefined;
-    let isCidShared = false;
-    do {
-      const page = await (env.CIVIDGE_KV || env.IPFS_KV).list({ limit: 1000, ...(cursor ? { cursor } : {}) });
-      isCidShared = (page.keys || []).some((item) => {
-        if (item.name.startsWith("tombstone_") || item.name.startsWith("blob_")) return false;
-        return (item.metadata?.c || item.metadata?.cid) === expectedCid;
-      });
-      cursor = page.list_complete === false ? page.cursor : undefined;
-    } while (!isCidShared && cursor);
-
-    if (!isCidShared) {
-      // 自宅 Kubo が次回起動した際に回収できるよう、無期限で墓標を保持する。
-      await (env.CIVIDGE_KV || env.IPFS_KV).put(`tombstone_${expectedCid}`, "1").catch(() => {});
-
-      // S3実体削除用の墓標を作成（管理画面が開いた際にブラウザのS3クライアントが実体削除して墓標を消去する）
+    // [INV-CORE-001] [INV-CORE-004] 配信エッジでの重い kv.list() 全件走査および無駄な墓標 put() は完全撤去。
+    // botやクローラーが期限切れURLを踏むたびに1日1,000回の最貴重枠（list()）を連打消費する脆弱性を根絶。
+    // R2 の場合は Worker 自身が R2 バインディングを持っていれば実体とサムネイルを即時消去。
+    const isR2 = latestMeta.backend === "r2" || latestMeta.b === "r2" || expectedCid === "r2";
+    if (isR2 && env.R2_BUCKET) {
       const s3TargetKey = latestMeta.s3Key || latestMeta.s || (key.includes(":") ? key.split(":")[1] : key);
       if (s3TargetKey) {
-        await (env.CIVIDGE_KV || env.IPFS_KV).put(`tombstone_s3_${encodeURIComponent(s3TargetKey)}`, "1").catch(() => {});
-        // ⚡ R2 の場合は Worker 自身が R2 バインディングを持っていれば実体とサムネイルも即時消去
-        if ((latestMeta.backend === "r2" || latestMeta.b === "r2" || expectedCid === "r2") && env.R2_BUCKET) {
-          await env.R2_BUCKET.delete(s3TargetKey).catch(() => {});
-          await env.R2_BUCKET.delete(`${s3TargetKey}.thumb.webp`).catch(() => {});
-        }
-      }
-
-      // Filebase 用の限定 RPC key がある運用では、最後の別名で pin も解放する。
-      const filebaseKey = (env.FILEBASE_IPFS_API_KEY || "").trim();
-      if (filebaseKey) {
-        const release = await fetch(`https://rpc.filebase.io/api/v0/pin/rm?arg=${encodeURIComponent(expectedCid)}`, {
-          method: "POST",
-          headers: { Authorization: `Bearer ${filebaseKey}` },
-        });
-        if (!release.ok) console.warn(`Filebase unpin failed for expired CID (${release.status})`);
+        await env.R2_BUCKET.delete(s3TargetKey).catch(() => {});
+        await env.R2_BUCKET.delete(`${s3TargetKey}.thumb.webp`).catch(() => {});
       }
     }
 
