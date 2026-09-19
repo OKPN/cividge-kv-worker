@@ -412,6 +412,23 @@ function renderNotFoundResponse(request, cdnCacheSeconds = 300, context = null) 
   return res;
 }
 
+// ⚡ 正常メディアレスポンスを Cache API（エッジキャッシュ）に書き込み、
+// 2回目以降の同一 URL アクセスでの KV 読み取り・ストレージ問い合わせを完全ゼロ化
+function saveResponseToEdgeCache(request, res, context, hasPassword = false) {
+  if (
+    !hasPassword &&
+    request.method === "GET" &&
+    res &&
+    res.status === 200 &&
+    typeof caches !== "undefined" &&
+    caches.default
+  ) {
+    try {
+      context?.waitUntil?.(caches.default.put(request, res.clone())) || caches.default.put(request, res.clone()).catch(() => {});
+    } catch (_) {}
+  }
+}
+
 function capCacheToExpiry(defaultSeconds, expiresAt) {
   if (!expiresAt) return defaultSeconds;
   const remainingSeconds = Math.ceil((Number(expiresAt) - Date.now()) / 1000);
@@ -812,8 +829,9 @@ export async function onRequest(context) {
         };
         const ext = extMatch[1].toLowerCase();
         headers.set("Content-Type", meta.mime || mimeMap[ext] || "application/octet-stream");
-        setImageDimensionHeaders(headers, meta);
-        return new Response(directData, { status: 200, headers });
+        const res = new Response(directData, { status: 200, headers });
+        saveResponseToEdgeCache(request, res, context, hasPassword);
+        return res;
       }
     } catch (directErr) {
       console.warn("Direct blob read error:", directErr);
@@ -859,8 +877,9 @@ export async function onRequest(context) {
             headers.set("Vary", "Accept-Encoding");
           }
           r2Obj.writeHttpMetadata(headers);
-          headers.set("Content-Type", meta.mime || headers.get("Content-Type") || "application/octet-stream");
-          return new Response(isHead ? null : r2Obj.body, { status: 200, headers });
+          const res = new Response(isHead ? null : r2Obj.body, { status: 200, headers });
+          saveResponseToEdgeCache(request, res, context, hasPassword);
+          return res;
         }
       } catch (r2Err) {
         console.warn("R2 read error:", r2Err);
@@ -1061,8 +1080,10 @@ export async function onRequest(context) {
   const ext = extMatch[1].toLowerCase();
   headers.set("Content-Type", mimeMap[ext] || upstreamResponse.headers.get("content-type") || "application/octet-stream");
 
-  return new Response(isHead ? null : upstreamResponse.body, {
+  const res = new Response(isHead ? null : upstreamResponse.body, {
     status: upstreamResponse.status,  // 200 or 206 をそのまま返す
     headers,
   });
+  saveResponseToEdgeCache(request, res, context, hasPassword);
+  return res;
 }
