@@ -14,7 +14,7 @@ routes = [
 [vars]
 # Static Pages public entry points allowed to identify their original host.
 # Comma-separated list of hostnames (e.g. your Pages frontend/relay domains)
-STATIC_RELAY_PUBLIC_HOSTS = "content-relay.pages.dev,testunko.pages.dev"
+STATIC_RELAY_PUBLIC_HOSTS = "your-public-relay.pages.dev,another-relay.pages.dev"
 # The backend custom domain host behind static Pages relay.
 STATIC_RELAY_BACKEND_HOSTS = "relay.your-domain.com"
 

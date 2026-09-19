@@ -162,13 +162,6 @@ export async function onRequestGet(context) {
     }
 
     const kv = env.CIVIDGE_KV || env.IPFS_KV;
-    const INDEX_KEY = "__cividge_ledger_index__";
-
-    // ⚡ まず高速・1日10万回無料の get() でインデックスキャッシュの存在を確認
-    let cachedIndex = null;
-    try {
-      cachedIndex = await kv.get(INDEX_KEY, "json");
-    } catch (e) {}
 
     try {
       // See: [INV-LEDGER-002] (KV 走査における全件網羅 / 1,000 件制限の克服)
@@ -183,7 +176,7 @@ export async function onRequestGet(context) {
       } while (cursor);
 
       const items = allRawKeys
-        .filter(k => !k.name.startsWith("tombstone_") && !k.name.startsWith("blob_") && k.name !== INDEX_KEY)
+        .filter(k => !k.name.startsWith("tombstone_") && !k.name.startsWith("blob_"))
         .map(k => ({
           name: k.name,
           metadata: unpackMetadata(k.name, "", k.metadata),
@@ -195,14 +188,6 @@ export async function onRequestGet(context) {
       });
     } catch (err) {
       console.warn("KV list error:", err.message);
-      // 🛡️ KV list() の1日1000回上限等に引っかかった場合でも、インデックスキャッシュがあればそれを返却して画面真っ白を防ぐ
-      if (cachedIndex && Array.isArray(cachedIndex.files)) {
-        return new Response(JSON.stringify({ success: true, files: cachedIndex.files, cached: true, warning: err.message }), {
-          status: 200,
-          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-        });
-      }
-
       // キャッシュもない場合は空配列で安全に返却（500でクラッシュさせない）
       return new Response(JSON.stringify({ success: true, files: [], warning: err.message }), {
         status: 200,
@@ -556,9 +541,10 @@ export async function onRequestDelete(context) {
     const existing = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(key);
     const existingCid = existing?.value || "";
 
+    // [INV-CORE-001] 実在しない blob_ キーを無条件 delete() して書き込み枠（1日1,000回）を浪費するバグを根絶
     if (existing?.metadata?.blobKey) {
       await (env.CIVIDGE_KV || env.IPFS_KV).delete(existing.metadata.blobKey).catch(() => {});
-    } else {
+    } else if (existing?.metadata?.backend === "kv" || existing?.metadata?.b === "kv") {
       await (env.CIVIDGE_KV || env.IPFS_KV).delete("blob_" + key).catch(() => {});
     }
     await (env.CIVIDGE_KV || env.IPFS_KV).delete(key);

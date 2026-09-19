@@ -680,49 +680,8 @@ export async function onRequest(context) {
   );
   let hasValidLedgerRecord = Boolean(isIpfsRecord || isR2Record);
   if (!hasValidLedgerRecord) {
-    if (env && env.R2_BUCKET) {
-      try {
-        const r2FallbackObj = await env.R2_BUCKET.get(filename);
-        if (r2FallbackObj) {
-          // ⚡ R2 オンデマンド自己修復（On-Demand Self-Healing）:
-          // R2 バケットに実体が存在したため、KV 台帳レコードを裏で自動生成・復旧
-          const autoKvSync = async () => {
-            try {
-              if (env.CIVIDGE_KV || env.IPFS_KV) {
-                const autoMeta = {
-                  b: "r2",
-                  backend: "r2",
-                  cid: "r2",
-                  s: r2FallbackObj.size,
-                  size: r2FallbackObj.size,
-                  s3Key: filename,
-                  mime: r2FallbackObj.httpMetadata?.contentType || "",
-                  t: Math.floor(Date.now() / 1000),
-                };
-                const hostKey = `${url.hostname.toLowerCase()}:${filename}`;
-                await (env.CIVIDGE_KV || env.IPFS_KV).put(hostKey, "r2", { metadata: autoMeta });
-                await (env.CIVIDGE_KV || env.IPFS_KV).put(filename, "r2", { metadata: autoMeta });
-                console.log(`⚡ On-Demand Self-Heal: Auto-registered KV for R2 file ${filename}`);
-              }
-            } catch (syncErr) {
-              console.warn("On-Demand KV auto-sync failed:", syncErr);
-            }
-          };
-          context.waitUntil?.(autoKvSync()) || autoKvSync();
-
-          targetCid = "r2";
-          meta = { backend: "r2", b: "r2", s3Key: filename, mime: r2FallbackObj.httpMetadata?.contentType };
-          isR2Record = true;
-          hasValidLedgerRecord = true;
-        } else {
-          return renderNotFoundResponse(request, 60);
-        }
-      } catch (r2Err) {
-        return renderNotFoundResponse(request, 60);
-      }
-    } else {
-      return renderNotFoundResponse(request, 60);
-    }
+    // [INV-DELIVERY-004] [INV-CORE-003] 台帳に存在しない未知のキーは即座に404門前払い（無駄なR2検索・過保護な自己修復は完全排除）
+    return renderNotFoundResponse(request, 86400);
   }
 
   // ⏳ 時限アップロードの有効期限チェック（期限切れは即座に404、短縮キー e にも対応）
@@ -837,8 +796,10 @@ export async function onRequest(context) {
     });
   }
 
-  // 3. KV に実データ（blobKey または blob_<filename>）が直接格納されている場合は即時配信
-  if (env && (env.CIVIDGE_KV || env.IPFS_KV)) {
+  // 3. KV に実データ（blobKey または backend: "kv"）が明示的に格納されている場合のみ即時配信
+  // [INV-CORE-001] 通常の R2/IPFS 配信時に存在しない blob_ キーを空振り get() して KV 読み込み枠を倍速浪費するバグを根絶
+  const isKvDirectStorage = Boolean(meta.blobKey || meta.backend === "kv" || meta.b === "kv");
+  if (isKvDirectStorage && env && (env.CIVIDGE_KV || env.IPFS_KV)) {
     try {
       const blobKey = meta.blobKey || ("blob_" + filename);
       const directData = await (env.CIVIDGE_KV || env.IPFS_KV).get(blobKey, "arrayBuffer");
