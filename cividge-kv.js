@@ -104,33 +104,7 @@ export async function onRequestGet(context) {
     });
   }
 
-  // 0. tombstones / tombstones_s3 パラメータがある場合は未回収の墓標一覧を返却（管理者のみ）
-  if (url.searchParams.get("tombstones_s3") === "1") {
-    if (!verifyAdminAuth(request, env)) {
-      return new Response(JSON.stringify({ error: "Unauthorized: Admin token required" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-      });
-    }
-    try {
-      const list = await (env.CIVIDGE_KV || env.IPFS_KV).list({ prefix: "tombstone_s3_", limit: 1000 });
-      const tombstonesS3 = (list.keys || []).map(k => {
-        const raw = k.name.replace(/^tombstone_s3_/, "");
-        try { return decodeURIComponent(raw); } catch { return raw; }
-      });
-      return new Response(JSON.stringify({ success: true, tombstonesS3 }), {
-        status: 200,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-      });
-    } catch (err) {
-      console.warn("tombstones_s3 list error:", err.message);
-      return new Response(JSON.stringify({ success: true, tombstonesS3: [], warning: err.message }), {
-        status: 200,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-      });
-    }
-  }
-
+  // 0. tombstones パラメータがある場合は未回収の墓標一覧を返却（管理者のみ、Kubo専用）
   if (url.searchParams.get("tombstones") === "1") {
     if (!verifyAdminAuth(request, env)) {
       return new Response(JSON.stringify({ error: "Unauthorized: Admin token required" }), {
@@ -140,7 +114,6 @@ export async function onRequestGet(context) {
     }
     try {
       const list = await (env.CIVIDGE_KV || env.IPFS_KV).list({ prefix: "tombstone_", limit: 1000 });
-      // S3用の墓標は除外し、Kubo用のCID墓標のみ返却
       const tombstones = (list.keys || [])
         .filter(k => !k.name.startsWith("tombstone_s3_"))
         .map(k => k.name.replace(/^tombstone_/, ""));
