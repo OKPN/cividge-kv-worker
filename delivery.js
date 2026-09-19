@@ -337,9 +337,13 @@ function renderOgpHtml(filename, rawUrl, ext, isVideo, origin, thumbnailKey = nu
   const title = `${filename}`;
   const siteName = "Cividge Media";
   // 動画の場合は同名先頭フレームサムネイル（.thumb.webp）を最優先指定
-  const videoThumbUrl = `${origin}/${encodeURIComponent(thumbnailKey || `${filename}.thumb.webp`)}`;
+  // クローラーが og:image を取得しに来た際に OGP HTML ではなく画像実体を返すよう ?raw=1 を付与
+  const separator = rawUrl.includes("?") ? "&" : "?";
+  const rawMediaUrl = `${rawUrl}${separator}raw=1`;
+  const videoThumbUrl = `${origin}/${encodeURIComponent(thumbnailKey || `${filename}.thumb.webp`)}?raw=1`;
   const mediaUrl = rawUrl;
-  const thumbUrl = isVideo ? videoThumbUrl : mediaUrl;
+  const thumbUrl = isVideo ? videoThumbUrl : rawMediaUrl;
+  const mimeType = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : (ext === "png" ? "image/png" : (ext === "webp" ? "image/webp" : "application/octet-stream"));
 
   return `<!DOCTYPE html>
 <html lang="ja">
@@ -352,6 +356,7 @@ function renderOgpHtml(filename, rawUrl, ext, isVideo, origin, thumbnailKey = nu
   <meta property="og:url" content="${mediaUrl}">
   <meta property="og:image" content="${thumbUrl}">
   <meta property="og:image:secure_url" content="${thumbUrl}">
+  <meta property="og:image:type" content="${mimeType}">
   ${isVideo ? `
   <meta property="og:type" content="video.other">
   <meta property="og:video" content="${mediaUrl}">
@@ -779,9 +784,12 @@ export async function onRequest(context) {
   // 🤖 SNSクローラー（Misskey Summaly, Twitter, Discord等）への OGP HTML 即時応答
   // OGP HTML を即座に返すことで、Misskey/SummalyBot がメタデータとサムネイル画像を確実に取得・カード展開できるようにする
   const userAgent = request.headers.get("user-agent") || "";
+  const acceptHeader = (request.headers.get("accept") || "").toLowerCase();
+  const isImageAccept = acceptHeader.startsWith("image/") || (acceptHeader.includes("image/") && !acceptHeader.includes("text/html"));
+  const isRawRequested = url.searchParams.has("raw") || url.searchParams.has("thumb");
   const crawlerExt = extMatch[1].toLowerCase();
   const isCrawlerVideo = (crawlerExt === "mp4" || crawlerExt === "webm");
-  if (!hasPassword && isSocialCrawler(userAgent)) {
+  if (!hasPassword && !isRawRequested && !isImageAccept && isSocialCrawler(userAgent)) {
     const ogpThumbnailKey = meta.th || meta.thumbnailKey || ((meta.k_s3 || meta.s3Key) ? `${meta.k_s3 || meta.s3Key}.thumb.webp` : null);
     const ogpHtml = renderOgpHtml(filename, request.url, crawlerExt, isCrawlerVideo, url.origin, ogpThumbnailKey);
     return new Response(ogpHtml, {
