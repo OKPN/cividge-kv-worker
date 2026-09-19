@@ -189,11 +189,6 @@ export async function onRequestGet(context) {
           metadata: unpackMetadata(k.name, "", k.metadata),
         }));
 
-      // インデックスキャッシュを非同期で保存（次回以降の list() 呼び出しを削減可能に）
-      try {
-        context.waitUntil(kv.put(INDEX_KEY, JSON.stringify({ files: items, updatedAt: Date.now() }), { expirationTtl: 86400 }));
-      } catch (e) {}
-
       return new Response(JSON.stringify({ success: true, files: items }), {
         status: 200,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
@@ -569,22 +564,32 @@ export async function onRequestDelete(context) {
     await (env.CIVIDGE_KV || env.IPFS_KV).delete(key);
 
     // 🪦 墓標（Tombstone / Unpin予約）の発行判定:
-    // CID が存在する場合、他のキーが同じ CID を参照していなければ、将来 Kubo 起動時にアンピンできるよう墓標を登録
-    // See: [INV-LEDGER-001] (参照残存時のアンピン禁止) & [INV-LEDGER-002] (全件走査)
+    // クライアント側でローカル台帳により共有有無を判定して make_tombstone=0/1 が渡された場合、
+    // 重い全件走査（1日1,000回枠の list() 消費）を完全にスキップして即座に処理する。
+    const makeTombstoneParam = url.searchParams.get("make_tombstone");
     if (existingCid) {
-      let cursor = undefined;
-      let isCidShared = false;
-      do {
-        const page = await (env.CIVIDGE_KV || env.IPFS_KV).list({ limit: 1000, ...(cursor ? { cursor } : {}) });
-        isCidShared = (page.keys || []).some(k => {
-          if (k.name === key || k.name.startsWith("tombstone_") || k.name.startsWith("blob_")) return false;
-          const itemCid = k.metadata?.cid || k.metadata?.c;
-          return itemCid === existingCid;
-        });
-        cursor = page.list_complete === false ? page.cursor : undefined;
-      } while (!isCidShared && cursor);
+      let shouldMakeTombstone = false;
+      if (makeTombstoneParam === "1") {
+        shouldMakeTombstone = true;
+      } else if (makeTombstoneParam === "0") {
+        shouldMakeTombstone = false;
+      } else {
+        // パラメータ未指定の旧クライアントのみ全件走査で安全確認（フォールバック）
+        let cursor = undefined;
+        let isCidShared = false;
+        do {
+          const page = await (env.CIVIDGE_KV || env.IPFS_KV).list({ limit: 1000, ...(cursor ? { cursor } : {}) });
+          isCidShared = (page.keys || []).some(k => {
+            if (k.name === key || k.name.startsWith("tombstone_") || k.name.startsWith("blob_")) return false;
+            const itemCid = k.metadata?.cid || k.metadata?.c;
+            return itemCid === existingCid;
+          });
+          cursor = page.list_complete === false ? page.cursor : undefined;
+        } while (!isCidShared && cursor);
+        shouldMakeTombstone = !isCidShared;
+      }
 
-      if (!isCidShared) {
+      if (shouldMakeTombstone) {
         // 回収されて実体が削除されるまで確実に残すため無期限で墓標を保存
         await (env.CIVIDGE_KV || env.IPFS_KV).put("tombstone_" + existingCid, "1").catch(() => {});
       }
