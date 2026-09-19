@@ -38,6 +38,9 @@ function unpackMetadata(name, cid, meta = {}) {
 
   const allowedHost = keyHost || meta.d || meta.allowedHost || null;
 
+  const contentCid = meta.c_cid || meta.contentCid || null;
+  const backend = meta.b || meta.backend || null;
+
   return {
     ...meta,
     rawKey: name,
@@ -50,6 +53,8 @@ function unpackMetadata(name, cid, meta = {}) {
     unpinned: isUnpinned,
     kuboStatus,
     s3Key,
+    contentCid,
+    backend,
     ...(thumbnailKey ? { thumbnailKey, th: thumbnailKey } : {}),
     ...(width && height ? { width, height, w: width, h: height } : {}),
     ...(allowedHost ? { allowedHost, d: allowedHost } : {}),
@@ -396,6 +401,8 @@ export async function onRequestPost(context) {
     const inheritedThumbnailKey = thumbnailKey || (existingMetadata && (existingMetadata.th || existingMetadata.thumbnailKey)) || "";
     const inheritedWidth = Math.floor(Number(width)) || (existingMetadata && Math.floor(Number(existingMetadata.w ?? existingMetadata.width))) || 0;
     const inheritedHeight = Math.floor(Number(height)) || (existingMetadata && Math.floor(Number(existingMetadata.h ?? existingMetadata.height))) || 0;
+    const inheritedContentCid = body.contentCid || body.c_cid || (existingMetadata && (existingMetadata.c_cid || existingMetadata.contentCid)) || "";
+    const inheritedBackend = body.backend || body.b || (existingMetadata && (existingMetadata.b || existingMetadata.backend)) || "";
     const civitaiTemporary = body.civitaiTemporary === undefined
       ? Boolean(existingMetadata?.ct || existingMetadata?.civitaiTemporary)
       : Boolean(body.civitaiTemporary);
@@ -410,6 +417,8 @@ export async function onRequestPost(context) {
       ...(inheritedWidth > 0 && inheritedHeight > 0 ? { w: inheritedWidth, h: inheritedHeight } : {}),
       ...(calculatedExpiresAt ? { e: Math.floor(Number(calculatedExpiresAt) / 1000) } : {}),
       ...(existingLastKuboPinAttempt ? { k: Math.floor(Number(existingLastKuboPinAttempt) / 1000) } : {}),
+      ...(inheritedContentCid ? { c_cid: inheritedContentCid } : {}),
+      ...(inheritedBackend ? { b: inheritedBackend } : {}),
       ...(civitaiTemporary ? { ct: 1 } : {}),
       ...passwordMeta,
     };
@@ -428,6 +437,8 @@ export async function onRequestPost(context) {
       unpinned: Boolean(flags & 1),
       kuboStatus: finalKuboStatus,
       allowedHost: allowedHost || null,
+      contentCid: inheritedContentCid || null,
+      backend: inheritedBackend || null,
       ...(compressedMeta.w && compressedMeta.h ? { width: compressedMeta.w, height: compressedMeta.h } : {}),
       ...(calculatedExpiresAt ? { expiresAt: calculatedExpiresAt } : {}),
       ...(civitaiTemporary ? { civitaiTemporary: true, ct: 1 } : {}),

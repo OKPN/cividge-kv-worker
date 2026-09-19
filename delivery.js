@@ -842,9 +842,14 @@ export async function onRequest(context) {
     }
   }
 
-  // ⚡ 3.5. R2 ストレージの配信処理（台帳が R2 の場合は R2 バケットのみを検索し、IPFS へは無駄打ちしない）
-  // See: [INV-DELIVERY-004] (R2 と IPFS の相互排他ルーティング)
-  const isR2 = !isIpfsRecord && Boolean(isR2Record || targetCid === "r2");
+  // ⚡ 3.5. R2 ストレージの配信処理（台帳が R2 の場合は R2 バケットを優先検索）
+  // See: [INV-DELIVERY-004] (R2 と IPFS の相互排他ルーティング ＆ R2→Kubo フォールバック)
+  const isOriginR2 = Boolean(
+    targetCid === "r2" ||
+    meta.backend === "r2" ||
+    meta.b === "r2"
+  );
+  const isR2 = !isIpfsRecord && Boolean(isR2Record || isOriginR2);
   if (isR2) {
     if (env && env.R2_BUCKET) {
       try {
@@ -883,13 +888,25 @@ export async function onRequest(context) {
         console.warn("R2 read error:", r2Err);
       }
     }
-    // R2 レコードなのに R2 バケットに存在しない場合は、IPFS を探さずに即座に 404 を返却（無駄打ちゼロ）
-    return renderNotFoundResponse(request, 60);
+
+    // 🪐 R2 実体未検出時の Kubo / IPFS フォールバック判定:
+    // contentCid が記録されており、Kubo/IPFS に実体が移行している可能性がある場合は IPFS 探索へ
+    const r2ContentCid = meta.contentCid || meta.c_cid || (meta.cid && meta.cid !== "r2" ? meta.cid : null);
+    if (!r2ContentCid) {
+      // CID を持たない純粋な R2 レコードは即座に 404（無駄打ちゼロ）
+      return renderNotFoundResponse(request, 60);
+    }
+    // contentCid が存在する場合は、Filebase を除外した IPFS ゲートウェイルーティングへフォールスルー
   }
 
   // 候補ターゲット（CID、S3Key、ファイル名）を順次試行
+  const r2ContentCid = meta.contentCid || meta.c_cid || (meta.cid && meta.cid !== "r2" ? meta.cid : null);
   const candidates = [];
-  if (targetCid) candidates.push(targetCid);
+  if (r2ContentCid) {
+    candidates.push(r2ContentCid);
+  } else if (targetCid && targetCid !== "r2") {
+    candidates.push(targetCid);
+  }
   const effectiveS3Key = meta.k_s3 || meta.s3Key;
   if (effectiveS3Key && !candidates.includes(effectiveS3Key)) candidates.push(effectiveS3Key);
   if (!candidates.includes(filename)) candidates.push(filename);
@@ -916,7 +933,12 @@ export async function onRequest(context) {
     orderedGateways.push(customKuboGateway);
   }
 
-  if (isKuboPinned) {
+  if (isOriginR2) {
+    // ⚡ R2 起源ファイル（Kubo移行後）:
+    // Filebase には最初から保存されていないため、Filebase ゲートウェイは 100% 完全に除外（無駄打ち・帯域浪費・404待機を根絶）。
+    // 公共ゲートウェイ群（DHT経由で自宅Kuboからブロックを取得）のみを探索。
+    orderedGateways.push(...publicGateways);
+  } else if (isKuboPinned) {
     // 🟣 自宅 Kubo 保全済み:
     // DHT 経由で自宅 Kubo からブロックを取り寄せる公共GWを最優先にし、Filebase 帯域消費をゼロ化。
     // 自宅 PC が電源オフの時だけ、Filebase を最後のフォールバックとして叩いて 404 を防ぐ。
