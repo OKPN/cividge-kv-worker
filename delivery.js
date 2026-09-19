@@ -323,6 +323,9 @@ function isSocialCrawler(userAgent = "") {
     ua.includes("discordbot") ||
     ua.includes("telegrambot") ||
     ua.includes("facebookexternalhit") ||
+    ua.includes("whatsapp") ||
+    ua.includes("line") ||
+    ua.includes("linespider") ||
     ua.includes("slackbot") ||
     ua.includes("bluesky") ||
     ua.includes("mastodon")
