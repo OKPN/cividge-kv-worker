@@ -554,35 +554,13 @@ export async function onRequestDelete(context) {
     await (env.CIVIDGE_KV || env.IPFS_KV).delete(key);
 
     // 🪦 墓標（Tombstone / Unpin予約）の発行判定:
-    // [INV-CORE-001] [INV-CORE-004] 純粋な IPFS CID（Qm..., baf...）のみ対象。
-    // R2 ファイル（cid === "r2" 等）や非CID値で無意味な tombstone_r2 を書き込んで枠（1,000回）を浪費するバグを根絶。
+    // [INV-CORE-001] [INV-CORE-004] [INV-CORE-005] Local-First 原則:
+    // クライアント側（台帳全体を保持）で判断した make_tombstone === "1" の時のみ墓標を発行。
+    // Worker 側での無駄な kv.list() 全件走査フォールバック（1日1,000回枠の浪費バグ）は完全撤去。
     const makeTombstoneParam = url.searchParams.get("make_tombstone");
-    if (existingCid && isRealIpfsCid(existingCid)) {
-      let shouldMakeTombstone = false;
-      if (makeTombstoneParam === "1") {
-        shouldMakeTombstone = true;
-      } else if (makeTombstoneParam === "0") {
-        shouldMakeTombstone = false;
-      } else {
-        // パラメータ未指定の旧クライアントのみ全件走査で安全確認（フォールバック）
-        let cursor = undefined;
-        let isCidShared = false;
-        do {
-          const page = await (env.CIVIDGE_KV || env.IPFS_KV).list({ limit: 1000, ...(cursor ? { cursor } : {}) });
-          isCidShared = (page.keys || []).some(k => {
-            if (k.name === key || k.name.startsWith("tombstone_") || k.name.startsWith("blob_")) return false;
-            const itemCid = k.metadata?.cid || k.metadata?.c;
-            return itemCid === existingCid;
-          });
-          cursor = page.list_complete === false ? page.cursor : undefined;
-        } while (!isCidShared && cursor);
-        shouldMakeTombstone = !isCidShared;
-      }
-
-      if (shouldMakeTombstone) {
-        // 回収されて実体が削除されるまで確実に残すため無期限で墓標を保存
-        await (env.CIVIDGE_KV || env.IPFS_KV).put("tombstone_" + existingCid, "1").catch(() => {});
-      }
+    if (existingCid && isRealIpfsCid(existingCid) && makeTombstoneParam === "1") {
+      // 回収されて実体が削除されるまで確実に残すため無期限で墓標を保存
+      await (env.CIVIDGE_KV || env.IPFS_KV).put("tombstone_" + existingCid, "1").catch(() => {});
     }
 
     // 🚀 リンク抹消: エッジに残っている画像キャッシュを即座に消滅させる
