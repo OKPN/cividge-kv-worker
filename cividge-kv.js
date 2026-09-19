@@ -273,16 +273,21 @@ export async function onRequestPost(context) {
       }
     } catch (e) {}
 
-    const existingCid = existingValue || (existingMetadata && (existingMetadata.c || existingMetadata.cid)) || "";
-
     // 🛡️ CID衝突ガード:
-    // 同一ファイル名が既に存在し、かつ中身（CID）が異なる場合は上書き破壊を防ぐため409 Conflictで弾く
-    if (existingCid && cid && existingCid !== cid) {
+    // 同一ファイル名が既に存在し、かつ中身（実体CID）が異なる場合は上書き破壊を防ぐため409 Conflictで弾く。
+    // ※ "r2" というマーカー値は IPFS CID ではないため、R2 のメタデータ更新や CID 同期時には衝突とみなさない。
+    const isRealIpfsCid = (c) => typeof c === "string" && c !== "r2" && (c.startsWith("Qm") || c.startsWith("baf") || c.length > 20);
+    const existingRealCid = isRealIpfsCid(existingMetadata?.contentCid || existingMetadata?.c_cid)
+      ? (existingMetadata?.contentCid || existingMetadata?.c_cid)
+      : (isRealIpfsCid(existingCid) ? existingCid : "");
+    const newRealCid = isRealIpfsCid(contentCid) ? contentCid : (isRealIpfsCid(cid) ? cid : "");
+
+    if (existingRealCid && newRealCid && existingRealCid !== newRealCid) {
       return new Response(JSON.stringify({
         error: "Conflict: A different file with the same name already exists.",
         code: "CID_CONFLICT",
-        existingCid,
-        newCid: cid,
+        existingCid: existingRealCid,
+        newCid: newRealCid,
       }), {
         status: 409,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
