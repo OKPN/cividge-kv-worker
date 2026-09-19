@@ -384,34 +384,32 @@ function renderOgpHtml(filename, rawUrl, ext, isVideo, origin, thumbnailKey = nu
 </html>`;
 }
 
-function renderNotFoundResponse(request, cdnCacheSeconds = 60) {
+function renderNotFoundResponse(request, cdnCacheSeconds = 300, context = null) {
   const accept = request.headers.get("accept") || "";
   const headers = {
-    // 公開メディアの miss は短時間だけ負のキャッシュに載せる。`no-cache` では
-    // Workers Cache が毎回 Worker を再実行するため、ランダム query による
-    // 同一パスの再試行を抑止できない。
+    // 公開メディアの miss は短時間負のキャッシュに載せる（DoS・枠枯渇防止）
     "Cache-Control": cdnCacheSeconds > 0 ? `public, max-age=${cdnCacheSeconds}` : "no-store",
     ...(cdnCacheSeconds > 0 ? { "Cloudflare-CDN-Cache-Control": `public, max-age=${cdnCacheSeconds}` } : {}),
   };
 
-  if (accept.includes("text/html")) {
-    return new Response(CATBOX_404_HTML, {
-      status: 404,
-      headers: {
-        ...headers,
-        "Content-Type": "text/html; charset=utf-8",
-      },
-    });
-  }
-
-  return new Response(CATBOX_404_SVG, {
+  const isHtml = accept.includes("text/html");
+  const res = new Response(isHtml ? CATBOX_404_HTML : CATBOX_404_SVG, {
     status: 404,
     headers: {
       ...headers,
-      "Content-Type": "image/svg+xml; charset=utf-8",
+      "Content-Type": isHtml ? "text/html; charset=utf-8" : "image/svg+xml; charset=utf-8",
       "Access-Control-Allow-Origin": "*",
     },
   });
+
+  // ⚡ エッジキャッシュ（Cache API）に404を書き込み、同一パスの反復 DoS 攻撃での KV 消費を完全ゼロ化
+  if (cdnCacheSeconds > 0 && typeof caches !== "undefined" && caches.default && request.method === "GET") {
+    try {
+      context?.waitUntil?.(caches.default.put(request, res.clone())) || caches.default.put(request, res.clone()).catch(() => {});
+    } catch (_) {}
+  }
+
+  return res;
 }
 
 function capCacheToExpiry(defaultSeconds, expiresAt) {
@@ -532,6 +530,16 @@ export async function onRequest(context) {
     });
   }
 
+  // ⚡ エッジキャッシュ（Cache API）最前線ガード:
+  // 過去にアクセスされた正常メディアまたは 404 レスポンスは、KV を叩かず即座に返却（KV消費 0回）
+  const edgeCache = typeof caches !== "undefined" ? caches.default : null;
+  if (edgeCache && (request.method === "GET" || request.method === "HEAD")) {
+    try {
+      const cached = await edgeCache.match(request);
+      if (cached) return cached;
+    } catch (_) {}
+  }
+
   const url = new URL(request.url);
   const pathname = url.pathname;
   // 🛡️ メディア配信エッジ判定:
@@ -600,79 +608,53 @@ export async function onRequest(context) {
   if (env && (env.CIVIDGE_KV || env.IPFS_KV)) {
     try {
       const currentHost = url.hostname.toLowerCase();
-      // 静的 Pages 入口から背後の Worker へ転送された場合だけ、入口ホストの
-      // ドメイン別台帳を引く。値は環境変数で許可したホストに限定するため、
-      // 任意の query で別ホストの名前空間を読ませることはできない。
-      const relayHost = (url.searchParams.get("__cividge_relay") || "")
-        .trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0].split(":")[0];
       const allowedRelayHosts = String(env.STATIC_RELAY_PUBLIC_HOSTS || "")
         .split(",").map((host) => host.trim().toLowerCase()).filter(Boolean);
-      // `r/` は query 除去ルールと共存できる静的公開入口の印。
-      // 旧 `?r` / `__cividge_relay=<host>` も移行期間は受け付ける。
       const isRelayRequest = hasStaticRelayPathMarker || url.searchParams.has("r");
-      let candidateRelayHosts = [];
-      if (allowedRelayHosts.includes(relayHost)) {
-        candidateRelayHosts.push(relayHost);
-      } else if (isRelayRequest) {
-        // 静的リレー経由の場合は、許可された全Pagesホストを照会候補とする
-        candidateRelayHosts.push(...allowedRelayHosts);
-      }
 
-      const lookupDomainKey = async (host) => {
-        let result = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(`${host}:${filename}`);
-        let keyName = filename;
-        if ((!result || result.value === null || result.value === undefined) && filename !== rawFilename) {
-          result = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(`${host}:${rawFilename}`);
-          keyName = rawFilename;
-        }
-        return { result, keyName };
-      };
+      // [INV-DELIVERY-005] 単一ホストの特定:
+      // 1. クエリパラメータ __cividge_relay
+      // 2. Referer ヘッダー（リダイレクト元Pagesホスト）
+      // 3. 静的リレー経由だが特定不能なら第1リレーホスト
+      // 4. 直接アクセスなら受信した currentHost
+      let targetHost = currentHost;
+      if (isRelayRequest) {
+        const queryRelayHost = (url.searchParams.get("__cividge_relay") || "")
+          .trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0].split(":")[0];
+        let refererHost = "";
+        try {
+          const ref = request.headers.get("Referer");
+          if (ref) refererHost = new URL(ref).hostname.toLowerCase();
+        } catch (_) {}
 
-      let resolvedHost = "";
-      let kvRes = null;
-      let resolvedFilename = filename;
-      let isDomainSpecific = false;
-
-      // 1. 静的リレー候補ホスト（content-relay, testunko など）から順次キーを探索
-      for (const host of candidateRelayHosts) {
-        const lookup = await lookupDomainKey(host);
-        if (lookup.result && lookup.result.value !== null && lookup.result.value !== undefined) {
-          resolvedHost = host;
-          kvRes = lookup.result;
-          resolvedFilename = lookup.keyName;
-          isDomainSpecific = true;
-          break;
+        if (allowedRelayHosts.includes(queryRelayHost)) {
+          targetHost = queryRelayHost;
+        } else if (allowedRelayHosts.includes(refererHost)) {
+          targetHost = refererHost;
+        } else if (allowedRelayHosts.length > 0) {
+          targetHost = allowedRelayHosts[0];
         }
       }
 
-      // 2. リレー候補で見つからなければ、直接アクセスされた背後ホストで照会
-      if (!isDomainSpecific) {
-        resolvedHost = currentHost;
-        const lookup = await lookupDomainKey(currentHost);
-        if (lookup.result && lookup.result.value !== null && lookup.result.value !== undefined) {
-          kvRes = lookup.result;
-          resolvedFilename = lookup.keyName;
-          isDomainSpecific = true;
-        }
-      }
+      // [INV-DELIVERY-005] 総当りループ探索を完全撤廃し、特定された対象ホストのみ1回照会する
+      let kvRes = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(`${targetHost}:${filename}`);
+      let resolvedHost = targetHost;
+      let isDomainSpecific = Boolean(kvRes && kvRes.value !== null && kvRes.value !== undefined);
 
-      // 3. 見つからなければ従来のファイル名単体キーでフォールバック照会
-      if (!isDomainSpecific) {
+      // 旧形式（ホスト名プレフィックスなし）単体キーのフォールバック照会（直接アクセス時のみ1回）
+      if (!isDomainSpecific && targetHost === currentHost) {
         kvRes = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(filename);
-      }
-      if ((!kvRes || kvRes.value === null || kvRes.value === undefined) && filename !== rawFilename) {
-        kvRes = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(rawFilename);
+        if (kvRes && kvRes.value !== null && kvRes.value !== undefined) {
+          isDomainSpecific = false;
+        }
       }
 
       if (kvRes && (kvRes.value !== undefined && kvRes.value !== null)) {
         targetCid = kvRes.value || "";
         meta = kvRes.metadata || {};
-        resolvedKvKey = isDomainSpecific ? `${resolvedHost}:${resolvedFilename}` : filename;
-        // 旧形式や単体キーのレコードでも allowedHost が設定されている。
-        // 静的 Pages 入口からの正規 marker がある場合は、候補ホストの中から
-        // レコードの allowedHost と合致するものを __resolvedPublicHost に設定する。
+        resolvedKvKey = isDomainSpecific ? `${resolvedHost}:${filename}` : filename;
         const allowedHost = meta.d || meta.allowedHost || "";
-        const matchedRelayHost = candidateRelayHosts.find(h => allowedHost.includes(h));
+        const matchedRelayHost = allowedRelayHosts.find(h => allowedHost.includes(h));
         meta.__resolvedPublicHost = isDomainSpecific
           ? resolvedHost
           : (matchedRelayHost || currentHost);
