@@ -1,0 +1,38 @@
+# wrangler.toml.example
+# Copy this file to wrangler.toml and update the bindings with your own values.
+
+name = "cividge-kv-worker"
+main = "server.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+# Custom Domains (optional - add your delivery domains here)
+routes = [
+  # { pattern = "media.your-domain.com", custom_domain = true }
+]
+
+[vars]
+# Static Pages public entry points allowed to identify their original host.
+# Comma-separated list of hostnames (e.g. your Pages frontend/relay domains)
+STATIC_RELAY_PUBLIC_HOSTS = "content-relay.pages.dev,testunko.pages.dev"
+# The backend custom domain host behind static Pages relay.
+STATIC_RELAY_BACKEND_HOSTS = "relay.your-domain.com"
+
+# Secrets (Do NOT put plaintext tokens here! Use `npx wrangler secret put` instead):
+# - ADMIN_API_TOKEN: Secret token for admin endpoints (/api/cividge-kv)
+# - UPLOAD_TOKEN: Secret token for external uploads (/api/upload)
+# - FILEBASE_IPFS_API_KEY: (Optional) Filebase RPC API key for IPFS unpinning
+
+# Cloudflare R2 Bucket binding
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "your-bucket-name"
+
+# Cloudflare KV Namespaces (can point to the same KV namespace ID)
+[[kv_namespaces]]
+binding = "CIVIDGE_KV"
+id = "your_kv_namespace_id"
+
+[[kv_namespaces]]
+binding = "IPFS_KV"
+id = "your_kv_namespace_id"

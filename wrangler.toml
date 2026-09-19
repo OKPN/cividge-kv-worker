@@ -21,8 +21,6 @@ STATIC_RELAY_PUBLIC_HOSTS = "content-relay.pages.dev,testunko.pages.dev,punipuni
 # The custom-zone endpoint behind the static Pages relay.  Its /r/<file> URL is
 # globally purged when CLOUDFLARE_ZONE_ID and CLOUDFLARE_PURGE_TOKEN are set.
 STATIC_RELAY_BACKEND_HOSTS = "relay.k7m.f5.si"
-ADMIN_API_TOKEN = "cividge_secret_99f821a603c4"
-UPLOAD_TOKEN = "o33eVwZHlbJt8cKhCuNwLZYdtYqz1omSebbxJlZ0"
 
 [[r2_buckets]]
 binding = "R2_BUCKET"
