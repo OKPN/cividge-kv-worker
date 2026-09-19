@@ -501,6 +501,7 @@ async function cleanupExpiredAlias(env, request, key, expectedCid) {
 
 export async function onRequest(context) {
   const { request, env } = context;
+  const isHead = request.method === "HEAD";
 
   // ⚡ CORS プリフライト（OPTIONS）は最前線で即時204返却（無駄な処理・待機時間を完全排除）
   if (request.method === "OPTIONS") {
@@ -604,7 +605,7 @@ export async function onRequest(context) {
       const lookupDomainKey = async (host) => {
         let result = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(`${host}:${filename}`);
         let keyName = filename;
-        if ((!result || !result.value) && filename !== rawFilename) {
+        if ((!result || result.value === null || result.value === undefined) && filename !== rawFilename) {
           result = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(`${host}:${rawFilename}`);
           keyName = rawFilename;
         }
@@ -619,7 +620,7 @@ export async function onRequest(context) {
       // 1. 静的リレー候補ホスト（content-relay, testunko など）から順次キーを探索
       for (const host of candidateRelayHosts) {
         const lookup = await lookupDomainKey(host);
-        if (lookup.result && lookup.result.value) {
+        if (lookup.result && lookup.result.value !== null && lookup.result.value !== undefined) {
           resolvedHost = host;
           kvRes = lookup.result;
           resolvedFilename = lookup.keyName;
@@ -632,18 +633,18 @@ export async function onRequest(context) {
       if (!isDomainSpecific) {
         resolvedHost = currentHost;
         const lookup = await lookupDomainKey(currentHost);
-        if (lookup.result && lookup.result.value) {
+        if (lookup.result && lookup.result.value !== null && lookup.result.value !== undefined) {
           kvRes = lookup.result;
           resolvedFilename = lookup.keyName;
           isDomainSpecific = true;
         }
       }
 
-      // 2. 見つからなければ従来のファイル名単体キーでフォールバック照会
+      // 3. 見つからなければ従来のファイル名単体キーでフォールバック照会
       if (!isDomainSpecific) {
         kvRes = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(filename);
       }
-      if ((!kvRes || !kvRes.value) && filename !== rawFilename) {
+      if ((!kvRes || kvRes.value === null || kvRes.value === undefined) && filename !== rawFilename) {
         kvRes = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(rawFilename);
       }
 
@@ -668,8 +669,18 @@ export async function onRequest(context) {
   // 🛡️ 台帳存在チェック（ランダムパス攻撃防御）:
   // 台帳に存在しないファイル名は、R2 / IPFS どちらのストレージも検索しない。
   // 攻撃で上流アクセスを発生させず、エッジ最前線で即座に 404 返却する。
-  const isR2Record = targetCid === "r2" || meta.backend === "r2" || (Boolean(resolvedKvKey) && Boolean(meta.k_s3 || meta.s3Key) && Boolean(env.R2_BUCKET));
-  const hasValidLedgerRecord = Boolean(targetCid || isR2Record);
+  const isIpfsRecord = Boolean(
+    (targetCid && targetCid !== "r2") ||
+    (meta.c && meta.c !== "r2") ||
+    (meta.cid && meta.cid !== "r2")
+  );
+  const isR2Record = !isIpfsRecord && Boolean(
+    targetCid === "r2" ||
+    meta.backend === "r2" ||
+    meta.b === "r2" ||
+    (resolvedKvKey && Boolean(env.R2_BUCKET))
+  );
+  const hasValidLedgerRecord = Boolean(isIpfsRecord || isR2Record);
   if (!hasValidLedgerRecord) {
     return renderNotFoundResponse(request, 60);
   }
@@ -833,7 +844,7 @@ export async function onRequest(context) {
 
   // ⚡ 3.5. R2 ストレージの配信処理（台帳が R2 の場合は R2 バケットのみを検索し、IPFS へは無駄打ちしない）
   // See: [INV-DELIVERY-004] (R2 と IPFS の相互排他ルーティング)
-  const isR2 = Boolean(isR2Record || targetCid === "r2");
+  const isR2 = !isIpfsRecord && Boolean(isR2Record || targetCid === "r2");
   if (isR2) {
     if (env && env.R2_BUCKET) {
       try {
@@ -927,8 +938,6 @@ export async function onRequest(context) {
   // （週1回の上流アクセスでIPFSノードのGC消去を回避・延命し、Filebase転送枠も死守）
   // 通常ピン留め中は 1年間（31,536,000秒）キャッシュ
   const UPSTREAM_CACHE_SECONDS = capCacheToExpiry(isUnpinned ? (7 * 86400) : 31536000, expiresTimestamp);
-
-  const isHead = request.method === "HEAD";
 
   let upstreamResponse = null;
   const maxFetchAttempts = isWithinGracePeriod ? 2 : 1; // 30秒以内の初期同期なら1回自動リトライ

@@ -186,7 +186,7 @@ export async function onRequestGet(context) {
   // 2. key パラメータがある場合は単一照会
   try {
     const value = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(key);
-    if (!value || !value.value) {
+    if (!value || value.value === null || value.value === undefined) {
       return new Response(JSON.stringify({ found: false, key }), {
         status: 404,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
