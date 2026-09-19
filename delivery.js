@@ -555,7 +555,7 @@ export async function onRequest(context) {
   // 誤って遮断してしまう。
   const requestHost = (request.headers.get("Host") || url.hostname).toLowerCase().split(":")[0];
   if (requestHost.endsWith(".workers.dev")) {
-    return renderNotFoundResponse(request, 86400);
+    return renderNotFoundResponse(request, 86400, context);
   }
 
   // 静的 Pages 互換レイヤーは query ではなく内部パスで印を渡す。
@@ -577,7 +577,7 @@ export async function onRequest(context) {
     });
   }
   if (rawFilename.startsWith("api/")) {
-    return renderNotFoundResponse(request);
+    return renderNotFoundResponse(request, 300, context);
   }
 
   let filename = rawFilename;
@@ -588,18 +588,18 @@ export async function onRequest(context) {
   }
 
   if (!filename) {
-    return renderNotFoundResponse(request);
+    return renderNotFoundResponse(request, 300, context);
   }
 
   const extMatch = pathname.match(/\.(webp|png|jpe?g|gif|jxl|avif|bmp|ico|mp4|webm|mov|m4v|avi|ogv|mp3|wav|ogg|m4a|flac|aac|pdf|txt|md|json|csv)$/i) ||
                    filename.match(/\.(webp|png|jpe?g|gif|jxl|avif|bmp|ico|mp4|webm|mov|m4v|avi|ogv|mp3|wav|ogg|m4a|flac|aac|pdf|txt|md|json|csv)$/i);
   if (!extMatch) {
-    return renderNotFoundResponse(request, 86400);
+    return renderNotFoundResponse(request, 86400, context);
   }
 
   // 🛡️ ファイル名長上限ガード: 100文字を超えるリクエストはKVを検索せず即座に404（24時間キャッシュ）
   if (Array.from(filename).length > 100) {
-    return renderNotFoundResponse(request, 86400);
+    return renderNotFoundResponse(request, 86400, context);
   }
 
   let targetCid = null;
@@ -681,7 +681,7 @@ export async function onRequest(context) {
   let hasValidLedgerRecord = Boolean(isIpfsRecord || isR2Record);
   if (!hasValidLedgerRecord) {
     // [INV-DELIVERY-004] [INV-CORE-003] 台帳に存在しない未知のキーは即座に404門前払い（無駄なR2検索・過保護な自己修復は完全排除）
-    return renderNotFoundResponse(request, 86400);
+    return renderNotFoundResponse(request, 86400, context);
   }
 
   // ⏳ 時限アップロードの有効期限チェック（期限切れは即座に404、短縮キー e にも対応）
@@ -690,7 +690,7 @@ export async function onRequest(context) {
     // waitUntil により 404 を待たせず、期限切れアクセス時だけ後始末する。
     const cleanup = cleanupExpiredAlias(env, request, resolvedKvKey, targetCid);
     context.waitUntil?.(cleanup) || cleanup;
-    return renderNotFoundResponse(request);
+    return renderNotFoundResponse(request, 300, context);
   }
 
   // 🌐 配信ドメイン制限チェック（各ドメインは完全独立：設定されたドメイン以外からのアクセスは即座に404で遮断）
@@ -700,7 +700,7 @@ export async function onRequest(context) {
     // 静的入口を正規に経由した場合は、入口側の台帳ホストを検証対象にする。
     const currentHostname = meta.__resolvedPublicHost || url.hostname.toLowerCase();
     if (allowedHostnames.length > 0 && !allowedHostnames.includes(currentHostname)) {
-      return renderNotFoundResponse(request, 60);
+      return renderNotFoundResponse(request, 60, context);
     }
   }
 
@@ -898,7 +898,7 @@ export async function onRequest(context) {
     const r2ContentCid = meta.contentCid || meta.c_cid || (meta.cid && meta.cid !== "r2" ? meta.cid : null);
     if (!r2ContentCid) {
       // CID を持たない純粋な R2 レコードは即座に 404（無駄打ちゼロ）
-      return renderNotFoundResponse(request, 60);
+      return renderNotFoundResponse(request, 60, context);
     }
     // contentCid が存在する場合は、Filebase を除外した IPFS ゲートウェイルーティングへフォールスルー
   }
@@ -1015,7 +1015,7 @@ export async function onRequest(context) {
     // ⚠️ 登録から30秒以内のファイルは初期同期ラグの可能性が高いため、エッジに404を焼き付けない (0秒 / no-store)
     // 30秒を超えた長期不在（自宅ノードオフライン等）は、Worker防護のため通常通り60秒キャッシュする
     const notFoundTtl = isWithinGracePeriod ? 0 : 60;
-    return renderNotFoundResponse(request, notFoundTtl);
+    return renderNotFoundResponse(request, notFoundTtl, context);
   }
 
   const headers = new Headers();
