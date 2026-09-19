@@ -244,7 +244,7 @@ export async function onRequestPost(context) {
 
   try {
     const body = await request.json();
-    const { key, cid, size, mime, lastModified, password, dataBase64, ttl, expiresAt, thumbnailKey, width, height } = body;
+    const { key, cid, size, mime, lastModified, password, dataBase64, ttl, expiresAt, thumbnailKey, width, height, contentCid, backend } = body;
 
     if (!key) {
       return new Response(JSON.stringify({ error: "Missing 'key' in request body" }), {
@@ -272,6 +272,8 @@ export async function onRequestPost(context) {
         }
       }
     } catch (e) {}
+
+    const existingCid = existingValue || (existingMetadata && (existingMetadata.c || existingMetadata.cid)) || "";
 
     // 🛡️ CID衝突ガード:
     // 同一ファイル名が既に存在し、かつ中身（実体CID）が異なる場合は上書き破壊を防ぐため409 Conflictで弾く。
