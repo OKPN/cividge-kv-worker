@@ -654,11 +654,17 @@ export async function onRequest(context) {
       let resolvedHost = targetHost;
       let isDomainSpecific = Boolean(kvRes && kvRes.value !== null && kvRes.value !== undefined);
 
-      // 旧形式（ホスト名プレフィックスなし）単体キーのフォールバック照会（直接アクセス時のみ1回）
-      if (!isDomainSpecific && targetHost === currentHost) {
-        kvRes = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(filename);
-        if (kvRes && kvRes.value !== null && kvRes.value !== undefined) {
-          isDomainSpecific = false;
+      // [INV-DELIVERY-005] 単体キー（ホスト名プレフィックスなし）のフォールバック照会（1回のみ）
+      // プレフィックス付きで見つからなかった場合、単体キーを照会し、所属ドメイン（d/allowedHost）を照合して採用
+      if (!isDomainSpecific) {
+        const fallbackRes = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(filename);
+        if (fallbackRes && fallbackRes.value !== null && fallbackRes.value !== undefined) {
+          const fallbackMeta = fallbackRes.metadata || {};
+          const allowedHost = String(fallbackMeta.d || fallbackMeta.allowedHost || "").toLowerCase();
+          if (!allowedHost || allowedHost.includes(targetHost) || targetHost === currentHost) {
+            kvRes = fallbackRes;
+            isDomainSpecific = false;
+          }
         }
       }
 
