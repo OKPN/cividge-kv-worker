@@ -617,9 +617,18 @@ async function purgeHybridCache(request, env, key, extraDomains = []) {
       try { return new URL(host).origin; } catch (e) { return null; }
     })
     .filter(Boolean);
-  const relayTargetPath = `/r/${encodeURIComponent(pureFilename)}`;
+  const relayHosts = String(env.STATIC_RELAY_PUBLIC_HOSTS || "")
+    .split(",").map(h => h.trim().toLowerCase()).filter(Boolean);
+  const encodedFile = encodeURIComponent(pureFilename);
+  const relayTargetPaths = [
+    `/r/${encodedFile}`,
+    ...relayHosts.flatMap(h => [
+      `/r/${h.split(".")[0]}/${encodedFile}`,
+      `/r/${h}/${encodedFile}`
+    ])
+  ];
   const globalUrlsToPurge = backendRelayOrigins.flatMap(origin => [
-    `${origin}${relayTargetPath}`,
+    ...relayTargetPaths.map(p => `${origin}${p}`),
     // 互換レイヤー導入前の plain path も、移行中のキャッシュを残さないよう併せて消す。
     `${origin}${targetPath}`,
   ]);

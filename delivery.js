@@ -549,13 +549,32 @@ export async function onRequest(context) {
     return renderNotFoundResponse(request, 86400, context);
   }
 
+  const allowedRelayHosts = String(env?.STATIC_RELAY_PUBLIC_HOSTS || "")
+    .split(",").map((host) => host.trim().toLowerCase()).filter(Boolean);
+
   // 静的 Pages 互換レイヤーは query ではなく内部パスで印を渡す。
   // 背後ドメイン側で query を捨てても、どの公開入口の台帳を参照すべきか失わない。
+  // サポートする形式:
+  // 1. フォルダ構造（新形式・クエリ不要）: /r/<relay-name>/<file> （例: /r/punipuni-media/yep59jt5.jpg）
+  // 2. フルホストフォルダ構造: /r/<full-host>/<file> （例: /r/punipuni-media.pages.dev/yep59jt5.jpg）
+  // 3. 旧形式: /r/<file>?__cividge_relay=...
   const STATIC_RELAY_PATH_PREFIX = "r/";
   let rawFilename = pathname.replace(/^\/+/, "");
+  let pathRelayHost = "";
   const hasStaticRelayPathMarker = rawFilename.startsWith(STATIC_RELAY_PATH_PREFIX);
   if (hasStaticRelayPathMarker) {
     rawFilename = rawFilename.slice(STATIC_RELAY_PATH_PREFIX.length);
+    const slashIdx = rawFilename.indexOf("/");
+    if (slashIdx !== -1) {
+      const segment = rawFilename.slice(0, slashIdx).toLowerCase();
+      const matchedHost = allowedRelayHosts.find(
+        (h) => h === segment || h.split(".")[0] === segment
+      );
+      if (matchedHost) {
+        pathRelayHost = matchedHost;
+        rawFilename = rawFilename.slice(slashIdx + 1);
+      }
+    }
   }
   if (rawFilename.startsWith("404-character.")) {
     return new Response(getCharacterWebpBytes(), {
@@ -604,10 +623,11 @@ export async function onRequest(context) {
       const isRelayRequest = hasStaticRelayPathMarker || url.searchParams.has("r");
 
       // [INV-DELIVERY-005] 単一ホストの特定:
-      // 1. クエリパラメータ __cividge_relay
-      // 2. Referer ヘッダー（リダイレクト元Pagesホスト）
-      // 3. 静的リレー経由だが特定不能なら第1リレーホスト
-      // 4. 直接アクセスなら受信した currentHost
+      // 1. フォルダ構造（パス）から抽出された pathRelayHost （最優先・クエリ不要）
+      // 2. クエリパラメータ __cividge_relay （後方互換）
+      // 3. Referer ヘッダー（リダイレクト元Pagesホスト）（後方互換）
+      // 4. 静的リレー経由だが特定不能なら第1リレーホスト
+      // 5. 直接アクセスなら受信した currentHost
       let targetHost = currentHost;
       if (isRelayRequest) {
         const queryRelayHost = (url.searchParams.get("__cividge_relay") || "")
@@ -618,7 +638,9 @@ export async function onRequest(context) {
           if (ref) refererHost = new URL(ref).hostname.toLowerCase();
         } catch (_) {}
 
-        if (allowedRelayHosts.includes(queryRelayHost)) {
+        if (pathRelayHost) {
+          targetHost = pathRelayHost;
+        } else if (allowedRelayHosts.includes(queryRelayHost)) {
           targetHost = queryRelayHost;
         } else if (allowedRelayHosts.includes(refererHost)) {
           targetHost = refererHost;
