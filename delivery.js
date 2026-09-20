@@ -913,12 +913,14 @@ export async function onRequest(context) {
   const isKuboPinned = meta.kuboStatus === "pinned" || Boolean((meta.f || 0) & 2);
   const isUnpinned = Boolean(meta.unpinned) || Boolean((meta.f || 0) & 1);
 
-  // 公共ゲートウェイ群（Protocol Labs / Pinata / 4EVERLAND など DHT 経由で探索可能なノード）
+  // 公共ゲートウェイ群（地域分散・高可用性パブリック IPFS ゲートウェイ）
+  // See: [INV-DELIVERY-003] (現役オープンゲートウェイの多重冗長フォールバック)
   const publicGateways = [
-    "https://dweb.link/ipfs",
-    "https://ipfs.io/ipfs",
-    "https://gateway.pinata.cloud/ipfs",
-    "https://4everland.io/ipfs",
+    "https://apac.orbitor.dev/ipfs",    // アジア太平洋 (APAC - 日本・近隣最速)
+    "https://dget.top/ipfs",             // 高速オープンゲートウェイ (グローバル)
+    "https://ipfs.orbitor.dev/ipfs",    // 北米・グローバル (Orbitor Main)
+    "https://eu.orbitor.dev/ipfs",      // 欧州 (EU)
+    "https://latam.orbitor.dev/ipfs",   // 中南米 (LATAM)
   ];
   const filebaseGateway = "https://ipfs.filebase.io/ipfs";
 

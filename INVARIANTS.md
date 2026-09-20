@@ -117,14 +117,38 @@
 
 ---
 
-### [INV-DELIVERY-003] ストレージ状態に応じたゲートウェイ動的優先ルーティング
+### [INV-DELIVERY-003] ストレージ状態に応じたゲートウェイ動的優先ルーティング ＆ 地域分散オープンゲートウェイ選定
 * **規則 (Rule)**:  
-  上流 IPFS ゲートウェイへの問い合わせ順序は、KV 台帳のピン状態（`kuboStatus`、`unpinned` フラグ）に応じて動的に制御し、Filebase のダウンロード帯域（Egress）を保護しなければならない (MUST)。
+  上流 IPFS ゲートウェイへの問い合わせ順序は、KV 台帳のピン状態（`kuboStatus`、`unpinned` フラグ）に応じて動的に制御し、Filebase のダウンロード帯域（Egress）を保護しなければならない (MUST)。また、特定の私設回線（トンネル）に依存せず、公平でオープンな IPFS 分散ネットワークを通じてブロックを取得するため、429 で遮断する死滅したゲートウェイを排除し、地域分散された現役オープンゲートウェイ群を多重フォールバックとして維持しなければならない (MUST)。
 
 * **満たすべき性質 (Required Behavior)**:  
-  1. **Kubo Pin 済み (`kuboStatus: "pinned"`)**: DHT 経由で自宅 Kubo からブロックを取り寄せる公共ゲートウェイ（`dweb.link`, `ipfs.io`, `Pinata` 等）を最優先にし、Filebase ゲートウェイは自宅オフライン時の最終フォールバックに配置すること（Filebase 帯域消費をゼロ化）。
-  2. **Filebase Pin 留め中 または アンピン漂流中 (`unpinned: true`)**: 最もデータ実体およびエッジキャッシュが最後まで残存している Filebase ゲートウェイを最優先で問い合わせ、ダメなら公共ゲートウェイへフォールバックすること。※漂流中ファイルはエッジに 7日間キャッシュされるため Filebase 帯域への影響も極小。
-  3. 自宅 Kubo の専用ゲートウェイ（`KUBO_GATEWAY_URL`）が設定されている場合は、最優先で問い合わせること。
+  1. **地域分散・高可用性パブリックゲートウェイ群の選定 (Gateways Pool)**:
+     - **アジア太平洋（APAC）**: `https://apac.orbitor.dev/ipfs`（日本・アジア近隣最速。自宅ノードとの物理距離が近く、ミリ秒単位で DHT ブロックを吸い上げ可能）
+     - **グローバル / 高速オープン**: `https://dget.top/ipfs`（高可用性オープンノード）
+     - **北米（North America）**: `https://ipfs.orbitor.dev/ipfs`（Orbitor メインクラスタ）
+     - **欧州（Europe）**: `https://eu.orbitor.dev/ipfs`（欧州分散ノード）
+     - **中南米（LATAM）**: `https://latam.orbitor.dev/ipfs`（中南米分散ノード）
+     - ※`ipfs.io`, `dweb.link`, `gateway.pinata.cloud` 等の無料非認証アクセスを 429（Too Many Requests）で遮断するゲートウェイは候補から除外すること。
+  2. **Kubo Pin 済み (`kuboStatus: "pinned"`)**: DHT 経由で自宅 Kubo からブロックを取り寄せる上記現役公共ゲートウェイ群を最優先にし、Filebase ゲートウェイは自宅オフライン時の最終フォールバックに配置すること（Filebase 帯域消費をゼロ化）。
+  3. **Filebase Pin 留め中 または アンピン漂流中 (`unpinned: true`)**: 最もデータ実体およびエッジキャッシュが最後まで残存している Filebase ゲートウェイ（`ipfs.filebase.io`）を最優先で問い合わせ、ダメなら公共ゲートウェイへフォールバックすること。※漂流中ファイルはエッジに 7日間キャッシュされるため Filebase 帯域への影響も極小。
+  4. 自宅 Kubo の専用ゲートウェイ（`KUBO_GATEWAY_URL`）が設定されている場合は、最優先で問い合わせること。
+
+---
+
+### [INV-KUBO-001] 自宅 Kubo ノードの対外疎通と自律分散配信の必須要件
+* **規則 (Rule)**:  
+  自宅 Kubo を Cividge の自律分散ストレージとして機能させるためには、単にローカルでデーモンを起動するだけでは不十分であり、世界中の IPFS ピアから自律的にブロックを発見・取得できる通信要件を満たさなければならない (MUST)。
+
+* **理由 (Rationale)**:  
+  特定の私設直通回線（Cloudflare Tunnel 等）で特定ノードを贔屓する構成は、IPFS 本来のコンテンツ指向自律分散（Content Addressing）に反する。自宅ノードがあくまで「IPFS ネットワークに参加する対等な一ピア」として振る舞い、世界中のオープンゲートウェイから DHT 経由でブロックを引き抜いてもらうためには、外界からの着信受付と DHT への所持告知が必須となる。
+
+* **満たすべき性質 (Required Behavior)**:  
+  1. **対外到達性（Inbound Dial-in / NAT越え）の確保**:
+     - ルーターのポート開放を強いることなく、UPnP（`Swarm.DisableNatPortMap: false`）、AutoNAT、または AutoRelay / Hole Punching（`Protocols: /libp2p/dcutr`）により、外部の IPFS ピアが自宅 PC へ P2P 接続（TCP/UDP/QUIC）できるポートを確保・アナウンスすること。
+  2. **DHT サーバー参加モードの必須 (`Routing.Type: auto` または `dht`)**:
+     - `dhtclient`（クライアント専用）モードは、他ノードからブロックを探すことしかできず、自分が持つブロックの Provider Record（所持情報）を世界地図にアナウンスしないため、自律配信目的では絶対に使用してはならない (MUST NOT)。必ず `auto` 以上に設定し、Pin 留めしたブロックを世界中の DHT へ自律告知すること。
+  3. **楽観的 Provide の有効化 (`Experimental.OptimisticProvide: true`)**:
+     - Pin 留めしたブロックの DHT アナウンス遅延を最小化し、世界中のゲートウェイから即座に発見可能とすること。
 
 ---
 
