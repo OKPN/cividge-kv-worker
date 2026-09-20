@@ -449,11 +449,14 @@ export async function onRequestPost(context) {
         t: Math.floor(now / 1000),
         ...(storageBackend ? { backend: storageBackend } : { backend: "kv" }),
         ...(targetCid ? { cid: targetCid } : {}),
+        k_s3: shortKey,
+        s3Key: shortKey,
         ...(cleanHostname ? { allowedHost: cleanHostname, d: cleanHostname } : {}),
         ...passwordMeta,
       };
 
-      await (env.CIVIDGE_KV || env.IPFS_KV).put(shortKey, targetCid || shortKey, { metadata: kvMetadata });
+      const targetKvKey = cleanHostname ? `${cleanHostname}:${shortKey}` : shortKey;
+      await (env.CIVIDGE_KV || env.IPFS_KV).put(targetKvKey, targetCid || shortKey, { metadata: kvMetadata });
     }
 
     // 8. レスポンス返却

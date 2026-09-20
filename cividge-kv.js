@@ -404,7 +404,7 @@ export async function onRequestPost(context) {
       t: Math.floor((lastModified || Date.now()) / 1000),
       ...(flags > 0 ? { f: flags } : {}),
       ...(allowedHost ? { d: allowedHost } : {}),
-      ...(inheritedS3Key && inheritedS3Key !== key ? { k_s3: inheritedS3Key } : {}),
+      ...(inheritedS3Key ? { k_s3: inheritedS3Key } : {}),
       ...(inheritedThumbnailKey ? { th: inheritedThumbnailKey } : {}),
       ...(inheritedWidth > 0 && inheritedHeight > 0 ? { w: inheritedWidth, h: inheritedHeight } : {}),
       ...(calculatedExpiresAt ? { e: Math.floor(Number(calculatedExpiresAt) / 1000) } : {}),

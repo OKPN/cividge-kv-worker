@@ -644,39 +644,24 @@ export async function onRequest(context) {
           targetHost = queryRelayHost;
         } else if (allowedRelayHosts.includes(refererHost)) {
           targetHost = refererHost;
-        } else if (allowedRelayHosts.length > 0) {
-          targetHost = allowedRelayHosts[0];
+        } else {
+          // [INV-DELIVERY-006] 身元不明な直接アクセス時に特定ホストを暗黙採用しない
+          targetHost = currentHost;
         }
       }
 
-      // [INV-DELIVERY-005] 総当りループ探索を完全撤廃し、特定された対象ホストのみ1回照会する
-      let kvRes = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(`${targetHost}:${filename}`);
-      let resolvedHost = targetHost;
-      let isDomainSpecific = Boolean(kvRes && kvRes.value !== null && kvRes.value !== undefined);
-
-      // [INV-DELIVERY-005] 単体キー（ホスト名プレフィックスなし）のフォールバック照会（1回のみ）
-      // プレフィックス付きで見つからなかった場合、単体キーを照会し、所属ドメイン（d/allowedHost）を照合して採用
-      if (!isDomainSpecific) {
-        const fallbackRes = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(filename);
-        if (fallbackRes && fallbackRes.value !== null && fallbackRes.value !== undefined) {
-          const fallbackMeta = fallbackRes.metadata || {};
-          const allowedHost = String(fallbackMeta.d || fallbackMeta.allowedHost || "").toLowerCase();
-          if (!allowedHost || allowedHost.includes(targetHost) || targetHost === currentHost) {
-            kvRes = fallbackRes;
-            isDomainSpecific = false;
-          }
-        }
-      }
+      // [INV-DELIVERY-005] [INV-DELIVERY-006] 総当り・単体キー特権フォールバックを完全排除し、特定ホストのキーのみ1回直撃照会
+      const resolvedHost = targetHost;
+      const targetLookupKey = `${resolvedHost}:${filename}`;
+      const kvRes = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(targetLookupKey);
 
       if (kvRes && (kvRes.value !== undefined && kvRes.value !== null)) {
         targetCid = kvRes.value || "";
         meta = kvRes.metadata || {};
-        resolvedKvKey = isDomainSpecific ? `${resolvedHost}:${filename}` : filename;
+        resolvedKvKey = targetLookupKey;
         const allowedHost = meta.d || meta.allowedHost || "";
         const matchedRelayHost = allowedRelayHosts.find(h => allowedHost.includes(h));
-        meta.__resolvedPublicHost = isDomainSpecific
-          ? resolvedHost
-          : (matchedRelayHost || currentHost);
+        meta.__resolvedPublicHost = resolvedHost;
       }
     } catch (kvErr) {
       console.warn("IPFS_KV get error:", kvErr);
