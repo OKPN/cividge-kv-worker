@@ -17,7 +17,7 @@ routes = [
 [vars]
 # Static Pages public entry points allowed to identify their original host.
 # Add comma-separated hosts here when another relay is intentionally deployed.
-STATIC_RELAY_PUBLIC_HOSTS = "content-relay.pages.dev,testunko.pages.dev,punipuni-media.pages.dev"
+STATIC_RELAY_PUBLIC_HOSTS = "content-relay.pages.dev,testunko.pages.dev,punipuni-media.pages.dev,test-up.pages.dev"
 # The custom-zone endpoint behind the static Pages relay.  Its /r/<file> URL is
 # globally purged when CLOUDFLARE_ZONE_ID and CLOUDFLARE_PURGE_TOKEN are set.
 STATIC_RELAY_BACKEND_HOSTS = "relay.k7m.f5.si"
@@ -30,6 +30,10 @@ bucket_name = "cividge"
 binding = "CIVIDGE_KV"
 id = "ff45707014424ab3afac57fda8c305de"
 
-[[kv_namespaces]]
-binding = "IPFS_KV"
-id = "ff45707014424ab3afac57fda8c305de"
+[[durable_objects.bindings]]
+name = "OBJECT_LIFECYCLE"
+class_name = "ObjectLifecycle"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ObjectLifecycle"]

@@ -73,6 +73,7 @@ Set your secret admin API token in .dev.vars:
 ```env
 ADMIN_API_TOKEN="your_strong_secret_token_here"
 UPLOAD_TOKEN="a_separate_upload_only_token"
+TEST_UPLOAD_TOKEN="optional_test_upload_only_token"
 FILEBASE_IPFS_API_KEY="your_filebase_bucket_scoped_ipfs_rpc_api_key"
 ```
 
@@ -88,11 +89,6 @@ workers_dev = true
 binding = "CIVIDGE_KV"
 id = "<your-kv-namespace-id>"
 
-# Backward compatibility alias
-[[kv_namespaces]]
-binding = "IPFS_KV"
-id = "<your-kv-namespace-id>"
-
 [secrets]
 required = ["ADMIN_API_TOKEN"]
 ```
@@ -104,6 +100,7 @@ Set the secret on Cloudflare:
 ```bash
 npx wrangler secret put ADMIN_API_TOKEN
 npx wrangler secret put UPLOAD_TOKEN
+npx wrangler secret put TEST_UPLOAD_TOKEN
 npx wrangler secret put FILEBASE_IPFS_API_KEY
 ```
 
@@ -140,7 +137,7 @@ https://your-public-relay.pages.dev/example.mp4
 The redirect destination is only an implementation detail:
 
 ```text
-https://media.example.com/r/example.mp4
+https://media.example.com/r/your-public-relay/example.mp4
 ```
 
 In `wrangler.toml`, allow the public Pages hostname so the Worker can resolve
@@ -209,16 +206,27 @@ properties of public content distribution rather than the Worker routing layer.
 
 ### External upload API / Filebase
 
-`POST /api/upload?storage=filebase` uploads to Filebase through its IPFS RPC API and registers the returned CID in `CIVIDGE_KV`. It accepts only `UPLOAD_TOKEN` (not `ADMIN_API_TOKEN`) and requires both secrets below:
+`POST /api/upload?storage=filebase` uploads to Filebase through its IPFS RPC API and registers the returned CID in `CIVIDGE_KV`. It accepts `UPLOAD_TOKEN` or the optional `TEST_UPLOAD_TOKEN` (never `ADMIN_API_TOKEN`) and requires the secrets below:
 
 - `UPLOAD_TOKEN`: the token used only by external upload clients such as the Windows **Send To** batch. Do not reuse `ADMIN_API_TOKEN`. The generated batch contains this token in plain text: never share, commit, or place it in a shared folder; rotate the secret immediately if it leaks.
+- `TEST_UPLOAD_TOKEN`: an optional second upload-only credential for a test client. It has the same upload capability as `UPLOAD_TOKEN`; use a separate Worker and storage bindings when the test uploads must be isolated from production.
 - `FILEBASE_IPFS_API_KEY`: a bucket-scoped Filebase IPFS RPC API key. This stays in the Worker and must never be placed in a browser, BAT file, or repository.
 
 ### Expiring links (no Cron)
 
-Expiry is stored as metadata rather than Cloudflare KV native TTL. On the first request after an expiry, the delivery Worker returns 404, removes only that alias, and checks whether another alias still references the CID. Only the final alias creates the Kubo unpin tombstone; when `FILEBASE_IPFS_API_KEY` is configured, it also requests Filebase to remove the pin. There is no scheduled scan or work while an expired URL remains unvisited.
+Expiry is stored as Link metadata rather than Cloudflare KV native TTL. A
+public GET performs one canonical `host:filename` lookup and returns 404 when
+that Link is expired. GET never deletes KV records, repairs state, probes
+storage, creates tombstones, or performs physical cleanup.
 
-The client sends `UPLOAD_TOKEN` only as an `Authorization: Bearer` header. Do not place tokens in URL query strings.
+Link removal and expiry collection are lifecycle mutations. They must pass
+through the ObjectRef-named Durable Object, remove only the selected delivery
+projection, and leave every peer Link and Placement intact. An Object becomes
+release-eligible only after the authoritative Link set and pending-removal set
+are both empty. R2/Filebase/Kubo cleanup then uses generation-bound Placement
+claims so a stale or duplicated executor cannot authorize deletion.
+
+The client sends its upload token only as an `Authorization: Bearer` header. Do not place tokens in URL query strings.
 
 The generated Windows **Send To** batch uses a raw-body streaming upload (`X-Upload-Filename` plus `--data-binary`) and accepts files up to **99 MB**, below Cloudflare Free/Pro's 100 MB request limit. Legacy `multipart/form-data` clients remain supported with an 80 MiB ceiling because their bodies must be buffered for parsing.
 

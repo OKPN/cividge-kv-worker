@@ -15,7 +15,7 @@ export async function onRequestOptions() {
 // 🔑 投稿専用 API トークンの疎通・一致検証ハンドラ
 export async function onRequestGet(context) {
   const { request, env } = context;
-  if (!verifyAuth(request, env)) {
+  if (!verifyUploadAuth(request, env)) {
     return new Response(JSON.stringify({ success: false, valid: false, error: "Unauthorized: Invalid or missing token" }), {
       status: 401,
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store" },
@@ -228,18 +228,23 @@ async function uploadStreamToFilebase(fileStream, filename, contentType, env) {
 }
 
 // 投稿トークンの検証。管理トークンは投稿 API に流用しない。
-function verifyAuth(request, env) {
-  const uploadToken = (env.UPLOAD_TOKEN || "").trim();
+export function verifyUploadAuth(request, env) {
+  // Both values have the same upload-only capability. TEST_UPLOAD_TOKEN is
+  // intentionally not an admin credential; it merely lets a separate test
+  // client use a distinct secret.
+  const uploadTokens = [env.UPLOAD_TOKEN, env.TEST_UPLOAD_TOKEN]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
 
-  // UPLOAD_TOKEN が未設定なら API 自体を無効化する。
-  if (!uploadToken) return false;
+  // No upload credential configured: disable this API entirely.
+  if (uploadTokens.length === 0) return false;
 
   let clientToken = "";
   const authHeader = (request.headers.get("Authorization") || "").trim();
   if (authHeader) {
     clientToken = authHeader.startsWith("Bearer ") ? authHeader.substring(7).trim() : authHeader;
   }
-  return clientToken === uploadToken;
+  return uploadTokens.includes(clientToken);
 }
 
 export async function onRequestPost(context) {
@@ -247,15 +252,15 @@ export async function onRequestPost(context) {
   const url = new URL(request.url);
 
   // 1. 認証チェック
-  if (!verifyAuth(request, env)) {
+  if (!verifyUploadAuth(request, env)) {
     return new Response(JSON.stringify({ success: false, error: "Unauthorized: Invalid or missing token" }), {
       status: 401,
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
   }
 
-  if (!(env.CIVIDGE_KV || env.IPFS_KV)) {
-    return new Response(JSON.stringify({ success: false, error: "IPFS_KV binding is not configured" }), {
+  if (!env.CIVIDGE_KV || !env.OBJECT_LIFECYCLE) {
+    return new Response(JSON.stringify({ success: false, error: "CIVIDGE_KV and OBJECT_LIFECYCLE bindings are required" }), {
       status: 503,
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
@@ -409,7 +414,6 @@ export async function onRequestPost(context) {
     }
 
     // 6. ストレージへの保存
-    const blobKey = `blob_${shortKey}`;
     let targetCid = null;
     const storageBackend = (url.searchParams.get("storage") || request.headers.get("X-Storage-Backend") || "").trim().toLowerCase();
 
@@ -425,10 +429,7 @@ export async function onRequestPost(context) {
     } else if (storageBackend === "r2") {
       throw new Error("R2 投稿は未設定です。Worker に R2_BUCKET binding を設定してください。");
     } else if (fileBuffer) {
-      // storage 未指定時のみ、後方互換として KV に直接実データを保持する。
-      if ((env.CIVIDGE_KV || env.IPFS_KV)) {
-        await (env.CIVIDGE_KV || env.IPFS_KV).put(blobKey, fileBuffer);
-      }
+      throw new Error("storage=filebase or storage=r2 is required");
     } else {
       throw new Error("ストリーミング投稿では storage=filebase または storage=r2 を指定してください。");
     }
@@ -436,27 +437,29 @@ export async function onRequestPost(context) {
     const uploadedSize = fileBuffer ? fileBuffer.byteLength : streamByteLength();
     if (uploadedSize === 0) throw new Error("No file content uploaded");
 
-    // 7. KV にルーティング登録（キーは shortKey 単体とし、ドメイン制限は allowedHost メタデータで管理）
-    if ((env.CIVIDGE_KV || env.IPFS_KV)) {
-      const now = Date.now();
-      const kvMetadata = {
-        blobKey,
+    // 7. Link publication uses the same control-plane endpoint as every
+    // other caller. Upload owns physical creation; it never owns KV or
+    // lifecycle mutation directly.
+    const registryUrl = new URL("/api/cividge-kv", request.url);
+    const registryResponse = await fetch(registryUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${(env.ADMIN_API_TOKEN || env.API_TOKEN || "").trim()}`,
+      },
+      body: JSON.stringify({
+        key: `${cleanHostname}:${shortKey}`,
+        cid: storageBackend === "r2" ? "r2" : targetCid,
         size: uploadedSize,
-        s: uploadedSize,
         mime: contentType,
-        registeredAt: now,
-        lastModified: now,
-        t: Math.floor(now / 1000),
-        ...(storageBackend ? { backend: storageBackend } : { backend: "kv" }),
-        ...(targetCid ? { cid: targetCid } : {}),
-        k_s3: shortKey,
         s3Key: shortKey,
-        ...(cleanHostname ? { allowedHost: cleanHostname, d: cleanHostname } : {}),
-        ...passwordMeta,
-      };
-
-      const targetKvKey = cleanHostname ? `${cleanHostname}:${shortKey}` : shortKey;
-      await (env.CIVIDGE_KV || env.IPFS_KV).put(targetKvKey, targetCid || shortKey, { metadata: kvMetadata });
+        password,
+        backend: storageBackend,
+      }),
+    });
+    if (!registryResponse.ok) {
+      const detail = await registryResponse.json().catch(() => ({}));
+      throw new Error(detail.error || `Link registration failed (${registryResponse.status})`);
     }
 
     // 8. レスポンス返却

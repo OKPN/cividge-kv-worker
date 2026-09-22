@@ -1,5 +1,7 @@
 // cividge-kv.js
-// Cividge 統合台帳 API: ファイル名と CID/実体・期限・パスワード・配信ドメインの KV 登録・照会・削除・一覧 API
+// Cividge delivery projection API.  Link/Object lifecycle authority lives in
+// ObjectLifecycle; this module only projects canonical Links into delivery KV.
+import { callLifecycle } from "./lifecycle-api.js";
 
 export async function onRequestOptions() {
   return new Response(null, {
@@ -17,6 +19,52 @@ function isRealIpfsCid(c) {
   return typeof c === "string" && c !== "r2" && (c.startsWith("Qm") || c.startsWith("baf") || c.length > 20);
 }
 
+function parseCanonicalLinkKey(value) {
+  const key = String(value || "").trim();
+  const separator = key.indexOf(":");
+  if (separator <= 0 || separator === key.length - 1) return null;
+  const host = key.slice(0, separator).toLowerCase();
+  const filename = key.slice(separator + 1);
+  if (!host || !filename || host.includes("/") || /\s/.test(host)) return null;
+  return { key: `${host}:${filename}`, host, filename };
+}
+
+function objectRefForRegistration({ backend, cid, contentCid, s3Key, thumbnailKey, kuboStatus }) {
+  const normalizedBackend = String(backend || "").toLowerCase();
+  if (normalizedBackend === "r2" || cid === "r2") {
+    const key = String(s3Key || "").trim();
+    if (!key) throw new Error("R2 ObjectRef requires s3Key");
+    const placements = [{ kind: "r2", executor: "worker", locator: { key, ...(thumbnailKey ? { thumbnailKey } : {}) } }];
+    return {
+      objectRef: `r2:${key}`,
+      placements,
+    };
+  }
+  const ipfsCid = String(contentCid || cid || "").trim();
+  if (!isRealIpfsCid(ipfsCid)) throw new Error("IPFS ObjectRef requires a CID");
+  const placements = [{
+    kind: "filebase",
+    executor: "browser",
+    locator: {
+      key: String(s3Key || "").trim(),
+      cid: ipfsCid,
+      ...(thumbnailKey ? { thumbnailKey } : {}),
+    },
+  }];
+  return { objectRef: `ipfs:${ipfsCid.toLowerCase()}`, placements };
+}
+
+function objectRefForExisting(value, metadata = {}) {
+  return objectRefForRegistration({
+    backend: metadata.b || metadata.backend || (value === "r2" ? "r2" : "filebase"),
+    cid: value,
+    contentCid: metadata.c_cid || metadata.contentCid,
+    s3Key: metadata.k_s3 || metadata.s3Key,
+    thumbnailKey: metadata.th || metadata.thumbnailKey,
+    kuboStatus: metadata.kuboStatus,
+  });
+}
+
 function unpackMetadata(name, cid, meta = {}) {
   const flags = meta.f || 0;
   const isUnpinned = meta.unpinned !== undefined ? Boolean(meta.unpinned) : Boolean(flags & 1);
@@ -29,7 +77,7 @@ function unpackMetadata(name, cid, meta = {}) {
   const colonIdx = name.indexOf(":");
   let keyHost = null;
   let displayName = name;
-  if (colonIdx > 0 && !name.startsWith("tombstone_") && !name.startsWith("blob_")) {
+  if (colonIdx > 0 && !name.startsWith("blob_")) {
     keyHost = name.substring(0, colonIdx);
     displayName = name.substring(colonIdx + 1);
   }
@@ -88,8 +136,8 @@ export async function onRequestGet(context) {
   const url = new URL(request.url);
   const key = url.searchParams.get("key");
 
-  if (!env || !(env.CIVIDGE_KV || env.IPFS_KV)) {
-    return new Response(JSON.stringify({ error: "IPFS_KV binding not configured" }), {
+  if (!env?.CIVIDGE_KV) {
+    return new Response(JSON.stringify({ error: "CIVIDGE_KV binding not configured" }), {
       status: 500,
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
@@ -104,33 +152,7 @@ export async function onRequestGet(context) {
     });
   }
 
-  // 0. tombstones パラメータがある場合は未回収の墓標一覧を返却（管理者のみ、Kubo専用）
-  if (url.searchParams.get("tombstones") === "1") {
-    if (!verifyAdminAuth(request, env)) {
-      return new Response(JSON.stringify({ error: "Unauthorized: Admin token required" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-      });
-    }
-    try {
-      const list = await (env.CIVIDGE_KV || env.IPFS_KV).list({ prefix: "tombstone_", limit: 1000 });
-      const tombstones = (list.keys || [])
-        .filter(k => !k.name.startsWith("tombstone_s3_"))
-        .map(k => k.name.replace(/^tombstone_/, ""));
-      return new Response(JSON.stringify({ success: true, tombstones }), {
-        status: 200,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-      });
-    } catch (err) {
-      console.warn("tombstones list error:", err.message);
-      return new Response(JSON.stringify({ success: true, tombstones: [], warning: err.message }), {
-        status: 200,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-      });
-    }
-  }
-
-  // 1. key パラメータがない場合は、KV に登録されている全キーの一覧を返却（管理者のみ）
+  // key パラメータがない場合は、KV に登録されている全キーの一覧を返却（管理者のみ）
   if (!key) {
     if (!verifyAdminAuth(request, env)) {
       return new Response(JSON.stringify({ error: "Unauthorized: Admin token required for listing keys" }), {
@@ -139,7 +161,7 @@ export async function onRequestGet(context) {
       });
     }
 
-    const kv = env.CIVIDGE_KV || env.IPFS_KV;
+    const kv = env.CIVIDGE_KV;
 
     try {
       // See: [INV-LEDGER-002] (KV 走査における全件網羅 / 1,000 件制限の克服)
@@ -154,7 +176,7 @@ export async function onRequestGet(context) {
       } while (cursor);
 
       const items = allRawKeys
-        .filter(k => !k.name.startsWith("tombstone_") && !k.name.startsWith("blob_"))
+        .filter(k => !k.name.startsWith("blob_"))
         .map(k => ({
           name: k.name,
           metadata: unpackMetadata(k.name, "", k.metadata),
@@ -176,7 +198,7 @@ export async function onRequestGet(context) {
 
   // 2. key パラメータがある場合は単一照会
   try {
-    const value = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(key);
+    const value = await env.CIVIDGE_KV.getWithMetadata(key);
     if (!value || value.value === null || value.value === undefined) {
       return new Response(JSON.stringify({ found: false, key }), {
         status: 404,
@@ -204,8 +226,8 @@ export async function onRequestGet(context) {
 export async function onRequestPost(context) {
   const { request, env } = context;
 
-  if (!env || !(env.CIVIDGE_KV || env.IPFS_KV)) {
-    return new Response(JSON.stringify({ error: "IPFS_KV binding not configured" }), {
+  if (!env?.CIVIDGE_KV) {
+    return new Response(JSON.stringify({ error: "CIVIDGE_KV binding not configured" }), {
       status: 500,
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
@@ -230,36 +252,35 @@ export async function onRequestPost(context) {
 
   try {
     const body = await request.json();
-    const { key, cid, size, mime, lastModified, password, dataBase64, ttl, expiresAt, thumbnailKey, width, height, contentCid, backend } = body;
+    let { key, cid, size, mime, lastModified, password, dataBase64, ttl, expiresAt, thumbnailKey, width, height, contentCid, backend } = body;
 
-    if (!key) {
+    const link = parseCanonicalLinkKey(key);
+    if (!link) {
       return new Response(JSON.stringify({ error: "Missing 'key' in request body" }), {
         status: 400,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
     }
+    key = link.key;
 
     // 既存のレコード・メタデータを事前に取得（パスワード・kuboStatus・allowedHost等の継承用）
     let existingMetadata = null;
     let existingValue = "";
     try {
-      const existing = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(key);
+      const existing = await env.CIVIDGE_KV.getWithMetadata(key);
       if (existing) {
         existingValue = existing.value || "";
         if (existing.metadata) existingMetadata = existing.metadata;
       }
-      // もし key が domain:filename 形式で未登録なら、同一ファイル名単体キーからメタデータをフォールバック取得
-      if (!existingValue && key.includes(":")) {
-        const pureName = key.split(":").slice(1).join(":");
-        const fallback = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(pureName);
-        if (fallback) {
-          existingValue = fallback.value || "";
-          if (fallback.metadata) existingMetadata = fallback.metadata;
-        }
-      }
     } catch (e) {}
 
     const existingCid = existingValue || (existingMetadata && (existingMetadata.c || existingMetadata.cid)) || "";
+    if (existingMetadata && body.createOnly) {
+      return new Response(JSON.stringify({ error: "Conflict: Link already exists.", code: "LINK_CONFLICT" }), {
+        status: 409,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
 
     // 🛡️ CID衝突ガード:
     // 同一ファイル名が既に存在し、かつ中身（実体CID）が異なる場合は上書き破壊を防ぐため409 Conflictで弾く。
@@ -357,34 +378,12 @@ export async function onRequestPost(context) {
     const isUnpinned = Boolean(body.unpinned) || Boolean(existingFlags & 1);
     if (isUnpinned) flags |= 1;
 
-    const finalKuboStatus = existingKuboStatus || (existingFlags & 2 ? "pinned" : (existingFlags & 4 ? "not_pinned" : null));
+    let finalKuboStatus = existingKuboStatus || (existingFlags & 2 ? "pinned" : (existingFlags & 4 ? "not_pinned" : null));
     if (finalKuboStatus === "pinned") flags |= 2;
     else if (finalKuboStatus === "not_pinned") flags |= 4;
 
-    // 🌐 配信ドメイン制限 (allowedHost / domain):
-    // カンマ区切りの複数ドメイン対応（同一CIDであれば複数ドメインでの配信を統合許可）
-    const normalizeDomainList = (val) => {
-      if (!val) return [];
-      const arr = Array.isArray(val) ? val : String(val).split(",");
-      return arr.map(h => String(h).trim().toLowerCase().replace(/^https?:\/\//, "").split('/')[0].split(':')[0]).filter(Boolean);
-    };
-
-    let allowedHost = null;
-    const incomingDomains = normalizeDomainList(body.allowedHost || body.domain || body.d);
-    const existingDomains = normalizeDomainList(existingMetadata && (existingMetadata.d || existingMetadata.allowedHost));
-
-    if (incomingDomains.length > 0) {
-      if (body.overwriteAllowedHost) {
-        // プルダウンでの切り替えなど、明示的なドメイン上書き指定の場合
-        allowedHost = incomingDomains.join(",");
-      } else {
-        // 既存のドメインと新規ドメインを統合（同一CIDなら同一ファイル名のまま複数ドメインからの配信を許容）
-        const mergedDomains = [...new Set([...existingDomains, ...incomingDomains])];
-        allowedHost = mergedDomains.join(",");
-      }
-    } else if (existingDomains.length > 0) {
-      allowedHost = existingDomains.join(",");
-    }
+    // The canonical key owns the Link's sole host.  Metadata cannot add peers.
+    const allowedHost = link.host;
 
     // 圧縮メタデータオブジェクト（1レコード数十バイトに極小化）
     // c: cid, s: size, t: lastModified(秒), f: flags(ビット), e: expiresAt(秒), k: lastKuboPinAttempt(秒), d: allowedHost, w/h: image dimensions
@@ -398,6 +397,23 @@ export async function onRequestPost(context) {
     const civitaiTemporary = body.civitaiTemporary === undefined
       ? Boolean(existingMetadata?.ct || existingMetadata?.civitaiTemporary)
       : Boolean(body.civitaiTemporary);
+    const lifecycle = objectRefForRegistration({
+      backend: inheritedBackend,
+      cid: safeCid,
+      contentCid: inheritedContentCid,
+      s3Key: inheritedS3Key,
+      thumbnailKey: inheritedThumbnailKey,
+      kuboStatus: finalKuboStatus,
+    });
+    if (existingMetadata) {
+      const existingObject = objectRefForExisting(existingValue, existingMetadata);
+      if (existingObject.objectRef !== lifecycle.objectRef) {
+        return new Response(JSON.stringify({ error: "A Link cannot be reassigned to a different ObjectRef; remove it and create a new Link instead." }), {
+          status: 409,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+        });
+      }
+    }
     const compressedMeta = {
       ...(safeCid ? { c: safeCid } : {}),
       s: inheritedSize,
@@ -415,9 +431,33 @@ export async function onRequestPost(context) {
       ...passwordMeta,
     };
 
-    // KV に登録。期限はメタデータ e だけで管理し、アクセス時の掃除対象として残す。
+    // Authorize the Link relation before publishing the delivery projection.
+    // If KV publication fails afterwards, a harmless orphan membership remains;
+    // the reverse ordering could make a live URL invisible to lifecycle authority.
+    let lifecycleState;
+    if (existingMetadata) {
+      const inspected = await callLifecycle(env, { action: "inspect", objectRef: lifecycle.objectRef });
+      lifecycleState = inspected.lifecycle;
+      if (!lifecycleState?.links?.includes(key)) {
+        throw new Error("Existing delivery projection is not owned by lifecycle authority");
+      }
+    } else {
+      lifecycleState = (await callLifecycle(env, {
+        action: "createLink",
+        objectRef: lifecycle.objectRef,
+        linkKey: key,
+        placements: lifecycle.placements,
+      })).lifecycle;
+    }
+    finalKuboStatus = lifecycleState?.placements?.kubo?.state === "PRESENT" ? "pinned" : "not_pinned";
+    flags = finalKuboStatus === "pinned" ? ((flags | 2) & ~4) : ((flags | 4) & ~2);
+    compressedMeta.f = flags;
+    compressedMeta.kuboStatus = finalKuboStatus;
+
+    // KV に登録。期限はメタデータ e だけで管理する。公開GETはこのprojectionを
+    // canonical keyで一回だけ読み、DOやstorageを参照しない。
     const putOptions = { metadata: compressedMeta };
-    await (env.CIVIDGE_KV || env.IPFS_KV).put(key, safeCid, putOptions);
+    await env.CIVIDGE_KV.put(key, safeCid, putOptions);
 
     // クライアント側へは旧形式互換のオブジェクトも含めて返却
     const returnedMeta = {
@@ -438,10 +478,9 @@ export async function onRequestPost(context) {
     };
 
     // 🚀 URL再利用・即時反映: 直前までの404エッジキャッシュを即時パージ
-    const extraDomainsToPurge = allowedHost ? allowedHost.split(",") : [];
-    context.waitUntil?.(purgeHybridCache(request, env, key, extraDomainsToPurge)) || purgeHybridCache(request, env, key, extraDomainsToPurge);
+    context.waitUntil?.(purgeHybridCache(request, env, key)) || purgeHybridCache(request, env, key);
 
-    return new Response(JSON.stringify({ success: true, key, cid: safeCid, metadata: returnedMeta }), {
+    return new Response(JSON.stringify({ success: true, key, cid: safeCid, objectRef: lifecycle.objectRef, metadata: returnedMeta }), {
       status: 200,
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
@@ -453,15 +492,14 @@ export async function onRequestPost(context) {
   }
 }
 
-// DELETE: キーの削除（リンク抹消 / 遮断）および 墓標（アンピン予約）の回収
+// DELETE removes a Link projection only. It never authorizes physical cleanup.
 export async function onRequestDelete(context) {
   const { request, env } = context;
   const url = new URL(request.url);
   const key = url.searchParams.get("key");
-  const tombstoneCid = url.searchParams.get("tombstone");
 
-  if (!env || !(env.CIVIDGE_KV || env.IPFS_KV)) {
-    return new Response(JSON.stringify({ error: "IPFS_KV binding not configured" }), {
+  if (!env?.CIVIDGE_KV) {
+    return new Response(JSON.stringify({ error: "CIVIDGE_KV binding not configured" }), {
       status: 500,
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
@@ -475,72 +513,72 @@ export async function onRequestDelete(context) {
     });
   }
 
-  // 1. 墓標の回収完了（KuboでのUnpin完了通知、またはS3実体削除完了通知）
-  const tombstoneS3 = url.searchParams.get("tombstone_s3");
-  if (tombstoneS3) {
-    try {
-      await (env.CIVIDGE_KV || env.IPFS_KV).delete("tombstone_s3_" + encodeURIComponent(tombstoneS3));
-      return new Response(JSON.stringify({ success: true, clearedTombstoneS3: tombstoneS3 }), {
-        status: 200,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-      });
-    } catch (err) {
-      return new Response(JSON.stringify({ error: err.message }), {
-        status: 500,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-      });
-    }
-  }
-
-  if (tombstoneCid) {
-    try {
-      await (env.CIVIDGE_KV || env.IPFS_KV).delete("tombstone_" + tombstoneCid);
-      return new Response(JSON.stringify({ success: true, clearedTombstone: tombstoneCid }), {
-        status: 200,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-      });
-    } catch (err) {
-      return new Response(JSON.stringify({ error: err.message }), {
-        status: 500,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-      });
-    }
-  }
-
   if (!key) {
-    return new Response(JSON.stringify({ error: "Missing 'key' or 'tombstone' query parameter" }), {
+    return new Response(JSON.stringify({ error: "Missing 'key' query parameter" }), {
       status: 400,
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
   }
 
   try {
-    const existing = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(key);
-    const existingCid = existing?.value || "";
-
-    // [INV-CORE-001] 実在しない blob_ キーを無条件 delete() して書き込み枠（1日1,000回）を浪費するバグを根絶
-    if (existing?.metadata?.blobKey) {
-      await (env.CIVIDGE_KV || env.IPFS_KV).delete(existing.metadata.blobKey).catch(() => {});
-    } else if (existing?.metadata?.backend === "kv" || existing?.metadata?.b === "kv") {
-      await (env.CIVIDGE_KV || env.IPFS_KV).delete("blob_" + key).catch(() => {});
+    const canonical = parseCanonicalLinkKey(key);
+    if (!canonical) {
+      return new Response(JSON.stringify({ error: "Invalid canonical Link key" }), {
+        status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
     }
-    await (env.CIVIDGE_KV || env.IPFS_KV).delete(key);
+    const existing = await env.CIVIDGE_KV.getWithMetadata(key);
+    if (!existing?.metadata) {
+      const retryObjectRef = url.searchParams.get("objectRef");
+      if (retryObjectRef) {
+        await callLifecycle(env, { action: "completeRemoveLink", objectRef: retryObjectRef, linkKey: canonical.key });
+      }
+      return new Response(JSON.stringify({ success: true, deletedKey: canonical.key, alreadyAbsent: true }), {
+        status: 200, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+    const lifecycle = objectRefForExisting(existing.value || "", existing.metadata);
 
-    // 🪦 墓標（Tombstone / Unpin予約）の発行判定:
-    // [INV-CORE-001] [INV-CORE-004] [INV-CORE-005] Local-First 原則:
-    // クライアント側（台帳全体を保持）で判断した make_tombstone === "1" の時のみ墓標を発行。
-    // Worker 側での無駄な kv.list() 全件走査フォールバック（1日1,000回枠の浪費バグ）は完全撤去。
-    const makeTombstoneParam = url.searchParams.get("make_tombstone");
-    if (existingCid && isRealIpfsCid(existingCid) && makeTombstoneParam === "1") {
-      // 回収されて実体が削除されるまで確実に残すため無期限で墓標を保存
-      await (env.CIVIDGE_KV || env.IPFS_KV).put("tombstone_" + existingCid, "1").catch(() => {});
+    // The authority first marks the Link as retiring. It still counts as a
+    // reference until KV deletion succeeds, so a partial failure cannot make
+    // a publicly reachable Object eligible for physical release.
+    await callLifecycle(env, { action: "beginRemoveLink", objectRef: lifecycle.objectRef, linkKey: canonical.key });
+    try {
+      await env.CIVIDGE_KV.delete(canonical.key);
+    } catch (error) {
+      return new Response(JSON.stringify({
+        error: error.message,
+        retryable: true,
+        objectRef: lifecycle.objectRef,
+        linkKey: canonical.key,
+      }), {
+        status: 503,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+    try {
+      await callLifecycle(env, { action: "completeRemoveLink", objectRef: lifecycle.objectRef, linkKey: canonical.key });
+    } catch (error) {
+      // The delivery projection is already gone, but the authoritative Link
+      // still counts as a reference until this transition succeeds. Return
+      // enough canonical identity for an idempotent retry; never guess from
+      // browser/local state.
+      return new Response(JSON.stringify({
+        error: error.message,
+        retryable: true,
+        projectionDeleted: true,
+        objectRef: lifecycle.objectRef,
+        linkKey: canonical.key,
+      }), {
+        status: 503,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
     }
 
     // 🚀 リンク抹消: エッジに残っている画像キャッシュを即座に消滅させる
-    const deleteExtraDomains = existing?.metadata?.d || existing?.metadata?.allowedHost ? (existing.metadata.d || existing.metadata.allowedHost).split(",") : [];
-    context.waitUntil?.(purgeHybridCache(request, env, key, deleteExtraDomains)) || purgeHybridCache(request, env, key, deleteExtraDomains);
+    context.waitUntil?.(purgeHybridCache(request, env, canonical.key)) || purgeHybridCache(request, env, canonical.key);
 
-    return new Response(JSON.stringify({ success: true, deletedKey: key }), {
+    return new Response(JSON.stringify({ success: true, deletedKey: canonical.key, objectRef: lifecycle.objectRef }), {
       status: 200,
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
@@ -555,16 +593,13 @@ export async function onRequestDelete(context) {
 // 🌐 ハイブリッド Cache Purge ヘルパー
 // プランA (独自ドメイン設定時): REST Purge API で世界300箇所の全エッジから即時抹消
 // プランB (pages.dev無料運用時): Cache API (caches.default) でローカルPoPから即時抹消
-// ※ ローカル Cache API の削除先は Request Origin / Referer / allowedHost から動的に解決する。
-//    Zone API は他ゾーンや pages.dev を渡すと失敗し得るため、明示設定した同一ゾーンの
-//    互換レイヤーだけを対象にする。
-async function purgeHybridCache(request, env, key, extraDomains = []) {
+// Zone API の対象はcanonical Link hostと明示設定のrelayだけに限定する。
+async function purgeHybridCache(request, env, key) {
   if (!key) return;
   const colonIdx = key.indexOf(":");
-  const pureFilename = (colonIdx > 0 && !key.startsWith("tombstone_") && !key.startsWith("blob_")) ? key.substring(colonIdx + 1) : key;
-  const keyHost = (colonIdx > 0 && !key.startsWith("tombstone_") && !key.startsWith("blob_")) ? key.substring(0, colonIdx) : null;
+  const pureFilename = colonIdx > 0 ? key.substring(colonIdx + 1) : key;
+  const keyHost = colonIdx > 0 ? key.substring(0, colonIdx) : null;
 
-  const reqUrl = new URL(request.url);
   const targetPath = `/${encodeURIComponent(pureFilename)}`;
   
   const targetDomains = new Set();
@@ -572,38 +607,6 @@ async function purgeHybridCache(request, env, key, extraDomains = []) {
     targetDomains.add(`https://${keyHost}`);
   }
   
-  // 1. リクエスト自体のオリジン
-  if (reqUrl.origin) {
-    targetDomains.add(reqUrl.origin);
-  }
-  
-  // 2. クライアント側の Origin / Referer ヘッダー（フロントエンドのドメイン）
-  const originHeader = request.headers.get("origin");
-  if (originHeader) {
-    try { targetDomains.add(new URL(originHeader).origin); } catch (e) {}
-  }
-  const refererHeader = request.headers.get("referer");
-  if (refererHeader) {
-    try { targetDomains.add(new URL(refererHeader).origin); } catch (e) {}
-  }
-  
-  // 3. 引数で渡されたドメイン（allowedHost や body からの指定）
-  for (const d of extraDomains) {
-    if (!d) continue;
-    const clean = String(d).trim().toLowerCase();
-    const withProto = clean.startsWith("http") ? clean : `https://${clean}`;
-    try { targetDomains.add(new URL(withProto).origin); } catch (e) {}
-  }
-
-  // 4. 環境変数でパージ対象ドメインが指定されている場合（PURGE_DOMAINS=domain1.com,domain2.pages.dev）
-  if (env.PURGE_DOMAINS) {
-    const customList = String(env.PURGE_DOMAINS).split(",").map(s => s.trim()).filter(Boolean);
-    for (const d of customList) {
-      const withProto = d.startsWith("http") ? d : `https://${d}`;
-      try { targetDomains.add(new URL(withProto).origin); } catch (e) {}
-    }
-  }
-
   const urlsToPurge = Array.from(targetDomains).map(origin => `${origin}${targetPath}`);
 
   // 静的 Pages 公開入口は /<file> -> 独自ゾーンの /r/<file> へ送る。
@@ -620,18 +623,15 @@ async function purgeHybridCache(request, env, key, extraDomains = []) {
   const relayHosts = String(env.STATIC_RELAY_PUBLIC_HOSTS || "")
     .split(",").map(h => h.trim().toLowerCase()).filter(Boolean);
   const encodedFile = encodeURIComponent(pureFilename);
-  const relayTargetPaths = [
-    `/r/${encodedFile}`,
-    ...relayHosts.flatMap(h => [
-      `/r/${h.split(".")[0]}/${encodedFile}`,
-      `/r/${h}/${encodedFile}`
-    ])
-  ];
-  const globalUrlsToPurge = backendRelayOrigins.flatMap(origin => [
-    ...relayTargetPaths.map(p => `${origin}${p}`),
-    // 互換レイヤー導入前の plain path も、移行中のキャッシュを残さないよう併せて消す。
-    `${origin}${targetPath}`,
-  ]);
+  const relayTargetPaths = keyHost && relayHosts.includes(keyHost)
+    ? [
+        `/r/${keyHost.split(".")[0]}/${encodedFile}`,
+        `/r/${keyHost}/${encodedFile}`,
+      ]
+    : [];
+  const globalUrlsToPurge = backendRelayOrigins.flatMap(origin =>
+    relayTargetPaths.map(path => `${origin}${path}`)
+  );
 
   // Cache API でも実配信 URL を削除する。これは現在の PoP 限定の補助策。
   urlsToPurge.push(...globalUrlsToPurge);

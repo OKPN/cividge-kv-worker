@@ -466,44 +466,6 @@ function setImageDimensionHeaders(headers, meta = {}) {
   }
 }
 
-// 期限切れリンクは、最初にアクセスされた時だけ回収する。定期実行は行わない。
-// 同じ CID を参照する別名が残る限り pin は維持し、最後のリンクなら Kubo 用の
-// 墓標を作成する。FILEBASE_IPFS_API_KEY が設定済みの場合は Filebase pin も解放する。
-async function cleanupExpiredAlias(env, request, key, expectedCid) {
-  if (!(env?.CIVIDGE_KV || env?.IPFS_KV) || !key || !expectedCid) return;
-
-  try {
-    // 古いエッジ読み取り結果で、延長・再登録されたリンクを消さないよう再確認する。
-    const latest = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(key);
-    const latestMeta = latest?.metadata || {};
-    const latestExpiresAt = latestMeta.e ? latestMeta.e * 1000 : latestMeta.expiresAt;
-    if (!latest?.value || latest.value !== expectedCid || !latestExpiresAt || Date.now() <= Number(latestExpiresAt)) return;
-
-    if (latestMeta.blobKey) {
-      await (env.CIVIDGE_KV || env.IPFS_KV).delete(latestMeta.blobKey).catch(() => {});
-    }
-    await (env.CIVIDGE_KV || env.IPFS_KV).delete(key);
-
-    // [INV-CORE-001] [INV-CORE-004] 配信エッジでの重い kv.list() 全件走査および無駄な墓標 put() は完全撤去。
-    // botやクローラーが期限切れURLを踏むたびに1日1,000回の最貴重枠（list()）を連打消費する脆弱性を根絶。
-    // R2 の場合は Worker 自身が R2 バインディングを持っていれば実体とサムネイルを即時消去。
-    const isR2 = latestMeta.backend === "r2" || latestMeta.b === "r2" || expectedCid === "r2";
-    if (isR2 && env.R2_BUCKET) {
-      const s3TargetKey = latestMeta.s3Key || latestMeta.s || (key.includes(":") ? key.split(":")[1] : key);
-      if (s3TargetKey) {
-        await env.R2_BUCKET.delete(s3TargetKey).catch(() => {});
-        await env.R2_BUCKET.delete(`${s3TargetKey}.thumb.webp`).catch(() => {});
-      }
-    }
-
-    // 同じ URL が残っているエッジキャッシュをこの PoP から外す。
-    await caches.default.delete(request).catch(() => {});
-  } catch (err) {
-    // 配信の 404 自体は優先する。回収失敗時は次のアクセスで再試行される。
-    console.warn("Expired alias cleanup failed:", err);
-  }
-}
-
 export async function onRequest(context) {
   const { request, env } = context;
   const isHead = request.method === "HEAD";
@@ -554,10 +516,8 @@ export async function onRequest(context) {
 
   // 静的 Pages 互換レイヤーは query ではなく内部パスで印を渡す。
   // 背後ドメイン側で query を捨てても、どの公開入口の台帳を参照すべきか失わない。
-  // サポートする形式:
-  // 1. フォルダ構造（新形式・クエリ不要）: /r/<relay-name>/<file> （例: /r/punipuni-media/yep59jt5.jpg）
-  // 2. フルホストフォルダ構造: /r/<full-host>/<file> （例: /r/punipuni-media.pages.dev/yep59jt5.jpg）
-  // 3. 旧形式: /r/<file>?__cividge_relay=...
+  // サポートする形式は一つだけ: /r/<relay-name>/<file>。
+  // relay identifier は輸送情報であり、canonical Link identity ではない。
   const STATIC_RELAY_PATH_PREFIX = "r/";
   let rawFilename = pathname.replace(/^\/+/, "");
   let pathRelayHost = "";
@@ -565,16 +525,14 @@ export async function onRequest(context) {
   if (hasStaticRelayPathMarker) {
     rawFilename = rawFilename.slice(STATIC_RELAY_PATH_PREFIX.length);
     const slashIdx = rawFilename.indexOf("/");
-    if (slashIdx !== -1) {
-      const segment = rawFilename.slice(0, slashIdx).toLowerCase();
-      const matchedHost = allowedRelayHosts.find(
-        (h) => h === segment || h.split(".")[0] === segment
-      );
-      if (matchedHost) {
-        pathRelayHost = matchedHost;
-        rawFilename = rawFilename.slice(slashIdx + 1);
-      }
-    }
+    if (slashIdx === -1) return renderNotFoundResponse(request, 86400, context);
+    const segment = rawFilename.slice(0, slashIdx).toLowerCase();
+    const matchedHost = allowedRelayHosts.find(
+      (h) => h === segment || h.split(".")[0] === segment
+    );
+    if (!matchedHost) return renderNotFoundResponse(request, 86400, context);
+    pathRelayHost = matchedHost;
+    rawFilename = rawFilename.slice(slashIdx + 1);
   }
   if (rawFilename.startsWith("404-character.")) {
     return new Response(getCharacterWebpBytes(), {
@@ -615,56 +573,26 @@ export async function onRequest(context) {
   let targetCid = null;
   let meta = {};
   let resolvedKvKey = "";
-  if (env && (env.CIVIDGE_KV || env.IPFS_KV)) {
+  if (env?.CIVIDGE_KV) {
     try {
       const currentHost = url.hostname.toLowerCase();
-      const allowedRelayHosts = String(env.STATIC_RELAY_PUBLIC_HOSTS || "")
-        .split(",").map((host) => host.trim().toLowerCase()).filter(Boolean);
-      const isRelayRequest = hasStaticRelayPathMarker || url.searchParams.has("r");
-
-      // [INV-DELIVERY-005] 単一ホストの特定:
-      // 1. フォルダ構造（パス）から抽出された pathRelayHost （最優先・クエリ不要）
-      // 2. クエリパラメータ __cividge_relay （後方互換）
-      // 3. Referer ヘッダー（リダイレクト元Pagesホスト）（後方互換）
-      // 4. 静的リレー経由だが特定不能なら第1リレーホスト
-      // 5. 直接アクセスなら受信した currentHost
-      let targetHost = currentHost;
-      if (isRelayRequest) {
-        const queryRelayHost = (url.searchParams.get("__cividge_relay") || "")
-          .trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0].split(":")[0];
-        let refererHost = "";
-        try {
-          const ref = request.headers.get("Referer");
-          if (ref) refererHost = new URL(ref).hostname.toLowerCase();
-        } catch (_) {}
-
-        if (pathRelayHost) {
-          targetHost = pathRelayHost;
-        } else if (allowedRelayHosts.includes(queryRelayHost)) {
-          targetHost = queryRelayHost;
-        } else if (allowedRelayHosts.includes(refererHost)) {
-          targetHost = refererHost;
-        } else {
-          // [INV-DELIVERY-006] 身元不明な直接アクセス時に特定ホストを暗黙採用しない
-          targetHost = currentHost;
-        }
-      }
+      // Exactly one canonical key. Query strings and Referer cannot select a
+      // different Link identity.
+      const targetHost = pathRelayHost || currentHost;
 
       // [INV-DELIVERY-005] [INV-DELIVERY-006] 総当り・単体キー特権フォールバックを完全排除し、特定ホストのキーのみ1回直撃照会
       const resolvedHost = targetHost;
       const targetLookupKey = `${resolvedHost}:${filename}`;
-      const kvRes = await (env.CIVIDGE_KV || env.IPFS_KV).getWithMetadata(targetLookupKey);
+      const kvRes = await env.CIVIDGE_KV.getWithMetadata(targetLookupKey);
 
       if (kvRes && (kvRes.value !== undefined && kvRes.value !== null)) {
         targetCid = kvRes.value || "";
         meta = kvRes.metadata || {};
         resolvedKvKey = targetLookupKey;
-        const allowedHost = meta.d || meta.allowedHost || "";
-        const matchedRelayHost = allowedRelayHosts.find(h => allowedHost.includes(h));
         meta.__resolvedPublicHost = resolvedHost;
       }
     } catch (kvErr) {
-      console.warn("IPFS_KV get error:", kvErr);
+      console.warn("CIVIDGE_KV get error:", kvErr);
     }
   }
 
@@ -691,9 +619,8 @@ export async function onRequest(context) {
   // ⏳ 時限アップロードの有効期限チェック（期限切れは即座に404、短縮キー e にも対応）
   const expiresTimestamp = meta.e ? (meta.e * 1000) : meta.expiresAt;
   if (expiresTimestamp && Date.now() > Number(expiresTimestamp)) {
-    // waitUntil により 404 を待たせず、期限切れアクセス時だけ後始末する。
-    const cleanup = cleanupExpiredAlias(env, request, resolvedKvKey, targetCid);
-    context.waitUntil?.(cleanup) || cleanup;
+    // Expiry is a read-only Link availability decision.  Cleanup is an explicit
+    // mutation because this request cannot authoritatively prove final reference.
     return renderNotFoundResponse(request, 300, context);
   }
 
@@ -803,10 +730,10 @@ export async function onRequest(context) {
   // 3. KV に実データ（blobKey または backend: "kv"）が明示的に格納されている場合のみ即時配信
   // [INV-CORE-001] 通常の R2/IPFS 配信時に存在しない blob_ キーを空振り get() して KV 読み込み枠を倍速浪費するバグを根絶
   const isKvDirectStorage = Boolean(meta.blobKey || meta.backend === "kv" || meta.b === "kv");
-  if (isKvDirectStorage && env && (env.CIVIDGE_KV || env.IPFS_KV)) {
+  if (isKvDirectStorage && env?.CIVIDGE_KV) {
     try {
       const blobKey = meta.blobKey || ("blob_" + filename);
-      const directData = await (env.CIVIDGE_KV || env.IPFS_KV).get(blobKey, "arrayBuffer");
+      const directData = await env.CIVIDGE_KV.get(blobKey, "arrayBuffer");
       if (directData) {
         const headers = new Headers();
         headers.set("Access-Control-Allow-Origin", "*");

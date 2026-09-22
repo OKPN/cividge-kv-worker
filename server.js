@@ -1,6 +1,8 @@
 import * as cividgeKv from "./cividge-kv.js";
+import * as lifecycleApi from "./lifecycle-api.js";
 import * as uploadApi from "./upload.js";
 import { onRequest as onDelivery } from "./delivery.js";
+export { ObjectLifecycle } from "./lifecycle.js";
 
 export default {
   async fetch(request, env, ctx) {
@@ -35,9 +37,18 @@ export default {
       return new Response(res.body, { status: res.status, headers });
     }
 
-    // 🪐 Cividge 統合台帳 API (/api/cividge-kv および 旧 /api/ipfs-kv の両対応)
-    const isKvApi = pathname === "/api/cividge-kv" || pathname.startsWith("/api/cividge-kv?") ||
-                    pathname === "/api/ipfs-kv" || pathname.startsWith("/api/ipfs-kv?");
+    if (pathname === "/api/lifecycle") {
+      const res = request.method === "POST"
+        ? await lifecycleApi.onRequestPost({ request, env })
+        : new Response("Method Not Allowed", { status: 405 });
+      const headers = new Headers(res.headers);
+      headers.set("Access-Control-Allow-Origin", "*");
+      headers.set("Cache-Control", "no-store");
+      return new Response(res.body, { status: res.status, headers });
+    }
+
+    // Canonical control-plane endpoint for delivery projection mutations.
+    const isKvApi = pathname === "/api/cividge-kv" || pathname.startsWith("/api/cividge-kv?");
     if (isKvApi) {
       const context = { request, env, waitUntil: (p) => ctx.waitUntil(p), next: () => new Response("404", { status: 404 }) };
       let res;

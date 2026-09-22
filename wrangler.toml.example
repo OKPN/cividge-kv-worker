@@ -21,6 +21,7 @@ STATIC_RELAY_BACKEND_HOSTS = "relay.your-domain.com"
 # Secrets (Do NOT put plaintext tokens here! Use `npx wrangler secret put` instead):
 # - ADMIN_API_TOKEN: Secret token for admin endpoints (/api/cividge-kv)
 # - UPLOAD_TOKEN: Secret token for external uploads (/api/upload)
+# - TEST_UPLOAD_TOKEN: Optional second upload-only token for a test client
 # - FILEBASE_IPFS_API_KEY: (Optional) Filebase RPC API key for IPFS unpinning
 
 # Cloudflare R2 Bucket binding
@@ -28,11 +29,7 @@ STATIC_RELAY_BACKEND_HOSTS = "relay.your-domain.com"
 binding = "R2_BUCKET"
 bucket_name = "your-bucket-name"
 
-# Cloudflare KV Namespaces (can point to the same KV namespace ID)
+# Cloudflare KV Namespace used by the canonical delivery projection.
 [[kv_namespaces]]
 binding = "CIVIDGE_KV"
-id = "your_kv_namespace_id"
-
-[[kv_namespaces]]
-binding = "IPFS_KV"
 id = "your_kv_namespace_id"
