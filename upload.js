@@ -1,6 +1,8 @@
 // upload.js
 // Cloudflare Worker: 外部スクリプト・Windows「送る」バッチ用 POST アップロード API
 
+import { onRequestPost as registerCanonicalLink } from "./cividge-kv.js";
+
 export async function onRequestOptions() {
   return new Response(null, {
     status: 204,
@@ -475,7 +477,7 @@ export async function onRequestPost(context) {
     // other caller. Upload owns physical creation; it never owns KV or
     // lifecycle mutation directly.
     const registryUrl = new URL("/api/cividge-kv", request.url);
-    const registryResponse = await fetch(registryUrl, {
+    const registryRequest = new Request(registryUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -489,7 +491,16 @@ export async function onRequestPost(context) {
         s3Key: shortKey,
         password,
         backend: storageBackend,
+        createOnly: true,
       }),
+    });
+    // Do not fetch the Worker's own public URL. Besides adding a second
+    // routing/failure surface, same-Worker self-fetch is not a lifecycle
+    // primitive. Invoke the one canonical registry handler in-process.
+    const registryResponse = await registerCanonicalLink({
+      request: registryRequest,
+      env,
+      waitUntil: context.waitUntil,
     });
     if (!registryResponse.ok) {
       const detail = await registryResponse.json().catch(() => ({}));

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { putR2Upload, verifyUploadAuth } from "../upload.js";
+import { onRequestPost, putR2Upload, verifyUploadAuth } from "../upload.js";
 
 function requestWithToken(token) {
   return new Request("https://example.test/api/upload", {
@@ -51,4 +51,58 @@ test("unknown-length raw R2 uploads are safely buffered with an exact stored siz
   assert.equal(stored.key, "stream.webp");
   assert.deepEqual(stored.bytes, bytes);
   assert.equal(stored.options.customMetadata.size, String(bytes.byteLength));
+});
+
+test("R2 upload publishes its canonical Link through the in-process registry", async () => {
+  const records = new Map();
+  const lifecycleCalls = [];
+  const env = {
+    TEST_UPLOAD_TOKEN: "test-upload-token",
+    ADMIN_API_TOKEN: "admin-token",
+    R2_BUCKET: {
+      async put(_key, body) { await new Response(body).arrayBuffer(); },
+    },
+    CIVIDGE_KV: {
+      async getWithMetadata(key) { return records.get(key) || { value: null, metadata: null }; },
+      async put(key, value, options) { records.set(key, { value, metadata: options.metadata }); },
+    },
+    OBJECT_LIFECYCLE: {
+      idFromName(value) { return value; },
+      get() {
+        return {
+          async fetch(_url, options) {
+            const body = JSON.parse(options.body);
+            lifecycleCalls.push(body);
+            return Response.json({
+              lifecycle: {
+                objectRef: body.objectRef,
+                links: [body.linkKey],
+                placements: { r2: { state: "PRESENT" } },
+              },
+            });
+          },
+        };
+      },
+    },
+  };
+  const request = new Request(
+    "https://worker.example/api/upload?storage=r2&domain=test-up.pages.dev&naming=original",
+    {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer test-upload-token",
+        "Content-Type": "image/webp",
+        "X-Upload-Filename": "fresh.webp",
+      },
+      body: new TextEncoder().encode("fresh-r2-object"),
+    },
+  );
+
+  const response = await onRequestPost({ request, env, waitUntil() {} });
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.url, "https://test-up.pages.dev/fresh.webp");
+  assert.equal(records.has("test-up.pages.dev:fresh.webp"), true);
+  assert.equal(lifecycleCalls[0].action, "createLink");
+  assert.equal(lifecycleCalls[0].objectRef, "r2:fresh.webp");
 });
