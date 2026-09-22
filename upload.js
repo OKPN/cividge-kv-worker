@@ -82,6 +82,42 @@ function createSizeLimitedStream(source, maxBytes) {
   return { body, getByteLength: () => byteLength };
 }
 
+export async function putR2Upload(bucket, key, fileStream, fileBuffer, declaredLength, contentType) {
+  const metadata = {
+    httpMetadata: { contentType },
+    customMetadata: { size: String(declaredLength || fileBuffer?.byteLength || 0) },
+  };
+  if (fileBuffer) {
+    await bucket.put(key, fileBuffer, metadata);
+    return fileBuffer.byteLength;
+  }
+
+  // A size-limiting ReadableStream no longer carries the request body's
+  // implicit length. R2 requires either bytes or a FixedLengthStream. Preserve
+  // streaming for ordinary raw-body clients when Content-Length is known.
+  if (declaredLength > 0 && typeof FixedLengthStream !== "undefined") {
+    const fixed = new FixedLengthStream(declaredLength);
+    await Promise.all([
+      bucket.put(key, fixed.readable, metadata),
+      fileStream.pipeTo(fixed.writable),
+    ]);
+    return declaredLength;
+  }
+
+  // Chunked/unknown-length uploads cannot be sent to R2 as a generic stream.
+  // The input stream is already guarded by MAX_UPLOAD_BYTES; buffer only this
+  // exceptional path and retain the stricter buffered ceiling.
+  const buffered = await new Response(fileStream).arrayBuffer();
+  if (buffered.byteLength > MAX_BUFFERED_UPLOAD_BYTES) {
+    throw new Error(`Chunked R2 upload too large (Max: ${MAX_BUFFERED_UPLOAD_LABEL})`);
+  }
+  await bucket.put(key, buffered, {
+    ...metadata,
+    customMetadata: { size: String(buffered.byteLength) },
+  });
+  return buffered.byteLength;
+}
+
 function createFilebaseMultipartStream(fileStream, filename, contentType) {
   const boundary = `----cividge-${crypto.randomUUID()}`;
   const safeFilename = String(filename || "upload_file").replace(/[\r\n"]/g, "_");
@@ -417,15 +453,14 @@ export async function onRequestPost(context) {
     let targetCid = null;
     const storageBackend = (url.searchParams.get("storage") || request.headers.get("X-Storage-Backend") || "").trim().toLowerCase();
 
+    let uploadedSize = 0;
     if (storageBackend === "filebase") {
       targetCid = fileStream
         ? await uploadStreamToFilebase(fileStream, originalFilename || shortKey, contentType, env)
         : await uploadToFilebase(fileBuffer, originalFilename || shortKey, contentType, env);
+      uploadedSize = fileBuffer ? fileBuffer.byteLength : streamByteLength();
     } else if (storageBackend === "r2" && env.R2_BUCKET) {
-      await env.R2_BUCKET.put(shortKey, fileStream || fileBuffer, {
-        httpMetadata: { contentType },
-        customMetadata: { size: String(declaredLength || 0) },
-      });
+      uploadedSize = await putR2Upload(env.R2_BUCKET, shortKey, fileStream, fileBuffer, declaredLength, contentType);
     } else if (storageBackend === "r2") {
       throw new Error("R2 投稿は未設定です。Worker に R2_BUCKET binding を設定してください。");
     } else if (fileBuffer) {
@@ -434,7 +469,6 @@ export async function onRequestPost(context) {
       throw new Error("ストリーミング投稿では storage=filebase または storage=r2 を指定してください。");
     }
 
-    const uploadedSize = fileBuffer ? fileBuffer.byteLength : streamByteLength();
     if (uploadedSize === 0) throw new Error("No file content uploaded");
 
     // 7. Link publication uses the same control-plane endpoint as every
