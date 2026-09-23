@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { onRequest as deliver } from "../delivery.js";
-import { onRequestDelete, onRequestPost } from "../cividge-kv.js";
+import { onRequestDelete, onRequestPost, onRequestRetireOldLink } from "../cividge-kv.js";
 import { onRequestPost as onLifecyclePost, syncLifecycleProjection } from "../lifecycle-api.js";
 import { ObjectLifecycle } from "../lifecycle.js";
 import {
@@ -446,6 +446,111 @@ test("removeLink retries safely when authority completion fails after projection
   const retried = await onRequestDelete(makeContext(true));
   assert.equal(retried.status, 200);
   assert.equal(state.links.includes(linkKey), false);
+});
+
+test("temporary retirement deletes only an unowned old KV projection after exact inspection", async () => {
+  const key = "public.example:old.webp";
+  const peer = "mirror.example:peer.webp";
+  const cid = "QmOldContent";
+  const records = new Map([
+    [key, { value: cid, metadata: { b: "filebase", k_s3: "old.webp" } }],
+    [peer, { value: cid, metadata: { b: "filebase", k_s3: "old.webp" } }],
+  ]);
+  const kv = memoryKv(records);
+  const env = {
+    CIVIDGE_KV: kv,
+    ADMIN_API_TOKEN: "secret",
+    OBJECT_LIFECYCLE: {
+      idFromName: value => value,
+      get: () => ({ fetch: async () => Response.json({ lifecycle: null }) }),
+    },
+  };
+  const invoke = body => onRequestRetireOldLink({
+    request: new Request("https://worker.example/api/maintenance/retire-old-link", {
+      method: "POST",
+      headers: { Authorization: "Bearer secret", "Content-Type": "application/json" },
+      body: JSON.stringify({ key, ...body }),
+    }),
+    env,
+    waitUntil() {},
+  });
+  const inspection = await (await invoke({ action: "inspect" })).json();
+  assert.equal(inspection.owned, false);
+  assert.equal(inspection.objectRef, "ipfs:qmoldcontent");
+  assert.deepEqual(kv.calls.delete, []);
+
+  const changed = await invoke({ action: "retire", expectedFingerprint: "wrong", expectedObjectRef: inspection.objectRef });
+  assert.equal(changed.status, 409);
+  assert.equal(records.has(key), true);
+
+  records.set(key, { value: cid, metadata: { b: "filebase", k_s3: "old.webp", e: 123 } });
+  const stale = await invoke({
+    action: "retire",
+    expectedFingerprint: inspection.fingerprint,
+    expectedObjectRef: inspection.objectRef,
+  });
+  assert.equal(stale.status, 409);
+  assert.equal(records.has(key), true);
+  records.set(key, { value: cid, metadata: { b: "filebase", k_s3: "old.webp" } });
+
+  const retired = await invoke({
+    action: "retire",
+    expectedFingerprint: inspection.fingerprint,
+    expectedObjectRef: inspection.objectRef,
+  });
+  assert.equal(retired.status, 200);
+  assert.deepEqual(kv.calls.delete, [key]);
+  assert.equal(records.has(peer), true);
+});
+
+test("temporary retirement uses normal authority removal for an owned Link", async () => {
+  const key = "public.example:old.webp";
+  const peer = "mirror.example:peer.webp";
+  const cid = "QmOwnedContent";
+  const records = new Map([
+    [key, { value: cid, metadata: { b: "filebase", k_s3: "old.webp" } }],
+    [peer, { value: cid, metadata: { b: "filebase", k_s3: "old.webp" } }],
+  ]);
+  const kv = memoryKv(records);
+  const state = newLifecycle("ipfs:qmownedcontent", [
+    { kind: "filebase", executor: "browser", locator: { key: "old.webp", cid } },
+  ]);
+  addLink(state, key);
+  addLink(state, peer);
+  const env = {
+    CIVIDGE_KV: kv,
+    ADMIN_API_TOKEN: "secret",
+    OBJECT_LIFECYCLE: {
+      idFromName: value => value,
+      get: () => ({ fetch: async (_url, options) => {
+        const body = JSON.parse(options.body);
+        if (body.action === "beginRemoveLink") beginRemoveLink(state, body.linkKey);
+        if (body.action === "completeRemoveLink") completeRemoveLink(state, body.linkKey);
+        return Response.json({ lifecycle: state });
+      } }),
+    },
+  };
+  const invoke = body => onRequestRetireOldLink({
+    request: new Request("https://worker.example/api/maintenance/retire-old-link", {
+      method: "POST",
+      headers: { Authorization: "Bearer secret", "Content-Type": "application/json" },
+      body: JSON.stringify({ key, ...body }),
+    }),
+    env,
+    waitUntil() {},
+  });
+  const inspection = await (await invoke({ action: "inspect" })).json();
+  assert.equal(inspection.owned, true);
+  const retired = await invoke({
+    action: "retire",
+    expectedFingerprint: inspection.fingerprint,
+    expectedObjectRef: inspection.objectRef,
+  });
+  assert.equal(retired.status, 200);
+  assert.deepEqual(state.links, [peer]);
+  assert.equal(records.has(key), false);
+  assert.equal(records.has(peer), true);
+  assert.equal(state.placements.filebase.state, "PRESENT");
 });
 
 test("stale claim reports cannot mutate a newer placement generation", () => {

@@ -47,6 +47,18 @@ export default {
       return new Response(res.body, { status: res.status, headers });
     }
 
+    // One-off administration of delivery projections left by the old model.
+    if (pathname === "/api/maintenance/retire-old-link") {
+      const context = { request, env, waitUntil: (p) => ctx.waitUntil(p) };
+      const res = request.method === "POST"
+        ? await cividgeKv.onRequestRetireOldLink(context)
+        : new Response("Method Not Allowed", { status: 405 });
+      const headers = new Headers(res.headers);
+      headers.set("Access-Control-Allow-Origin", "*");
+      headers.set("Cache-Control", "no-store");
+      return new Response(res.body, { status: res.status, headers });
+    }
+
     // Canonical control-plane endpoint for delivery projection mutations.
     const isKvApi = pathname === "/api/cividge-kv" || pathname.startsWith("/api/cividge-kv?");
     if (isKvApi) {
