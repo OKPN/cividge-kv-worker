@@ -117,6 +117,9 @@ delete or recreate Durable Objects, R2 objects, Filebase pins, or Kubo pins;
 their authoritative/physical state remains. Existing public Links will not
 be delivered from an empty KV until current Cividge explicitly projects them
 again. Do not infer that a missing KV Link authorizes physical deletion.
+Existing Durable Object Link bindings can still affect reuse or later
+reprojection of the same identity. Edge-cached responses can also remain
+visible until their cache lifetime ends; neither is erased by a KV reset.
 
 ### 3. Deploy to Production
 
