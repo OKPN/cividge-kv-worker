@@ -22,14 +22,21 @@ export class LinkBinding {
         const object = parseObjectRef(body.objectRef);
         if (!object || !body.attemptId) throw new Error("ObjectRef and attemptId are required");
         if (state?.status === "RETIRING") return json({ error: "Link removal is in progress", code: "LIFECYCLE_CONFLICT" }, 409);
-        if (state?.objectRef && state.objectRef !== object.objectRef) {
+        if (state?.status !== "RETIRED" && state?.objectRef && state.objectRef !== object.objectRef) {
           return json({ error: "Link is bound or reserved for another Object", code: "LINK_OBJECT_CONFLICT" }, 409);
+        }
+        if (state?.status === "RETIRED") {
+          state.status = "RESERVED";
+          state.objectRef = object.objectRef;
+          state.attempt = null;
+          state.generation = (state.generation || 0) + 1;
         }
         if (state?.attempt && state.attempt.id !== body.attemptId) {
           return json({ error: "Link has an unfinished upload attempt", code: "RESERVATION_CONFLICT", attempt: state.attempt }, 409);
         }
         if (state?.status === "BOUND" && !body.acquirePlacement) return json({ binding: state, result: "bound" });
-        if (!state) state = { linkKey: link.key, objectRef: object.objectRef, status: "RESERVED", attempt: null };
+        if (!state) state = { linkKey: link.key, objectRef: object.objectRef,
+          status: "RESERVED", generation: 1, attemptGeneration: 0, attempt: null };
         if (!state.attempt) {
           if (body.placement && (!body.placement.kind ||
               !(body.placement.locator?.key || body.placement.locator?.cid))) {
@@ -41,9 +48,9 @@ export class LinkBinding {
             phase: "RESERVED",
             createdAt: Date.now(),
             expiresAt: Date.now() + ATTEMPT_LEASE_MS,
-            generation: (state.generation || 0) + 1,
+            generation: (state.attemptGeneration || 0) + 1,
           };
-          state.generation = state.attempt.generation;
+          state.attemptGeneration = state.attempt.generation;
         }
         await this.ctx.storage.put(STATE_KEY, state);
         return json({ binding: state, result: state.status === "BOUND" ? "reacquire" : "reserved" });
@@ -55,9 +62,9 @@ export class LinkBinding {
             Date.now() < state.attempt.expiresAt || !body.attemptId) {
           throw new Error("Upload attempt is not recoverable yet");
         }
-        state.generation = (state.generation || 0) + 1;
+        state.attemptGeneration = (state.attemptGeneration || 0) + 1;
         state.attempt = { ...state.attempt, id: String(body.attemptId),
-          generation: state.generation, createdAt: Date.now(), expiresAt: Date.now() + ATTEMPT_LEASE_MS };
+          generation: state.attemptGeneration, createdAt: Date.now(), expiresAt: Date.now() + ATTEMPT_LEASE_MS };
       } else if (action === "renew") {
         requireAttempt(state, body.attemptId, body.generation);
         state.attempt.expiresAt = Date.now() + ATTEMPT_LEASE_MS;
@@ -85,18 +92,17 @@ export class LinkBinding {
         state.status = "RETIRING";
       } else if (action === "completeRemove") {
         if (state.status !== "RETIRING") throw new Error("Link removal was not begun");
-        await this.ctx.storage.delete(STATE_KEY);
-        return json({ binding: null });
+        // Keep the generation so a delayed KV projection cannot impersonate
+        // a future explicit rebind of the same canonical Link key.
+        state.status = "RETIRED";
+        state.attempt = null;
       } else if (action === "abort") {
         requireAttempt(state, body.attemptId, body.generation);
         // The actuator must first attest that the planned physical key is
         // absent. Otherwise keep the durable attempt for later recovery.
         if (body.physicalAbsent !== true) throw new Error("Physical absence must be confirmed before abort");
         if (state.status === "BOUND") state.attempt = null;
-        else {
-          await this.ctx.storage.delete(STATE_KEY);
-          return json({ binding: null });
-        }
+        else { state.status = "RETIRED"; state.attempt = null; }
       } else {
         return json({ error: "Unknown Link action" }, 400);
       }

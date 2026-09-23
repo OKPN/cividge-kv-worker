@@ -17,6 +17,15 @@
   UI/cache only.
 - Public delivery performs one canonical KV lookup and never calls the Durable
   Object, lists Links, repairs state, or probes storage on a KV miss.
+
+### [INV-KV-DISPOSABLE-PROJECTION]
+
+KV holds delivery Link projections and runtime configuration, not Object or
+Placement lifecycle authority. An empty namespace may mark a clean semantic
+cutover when old projection data are disposable; legacy KV records require no
+compatibility path. Discarding KV does not delete ObjectLifecycle or
+LinkBinding Durable Object state, nor physical R2/Filebase/Kubo content. A KV
+miss must never authorize release or trigger storage discovery.
 - A Link mutation is authoritative only through `createLink` / `removeLink`.
   `requestRelease` may start whole-Object cleanup only when the authoritative
   Link set is empty.

@@ -31,7 +31,7 @@ bucket_name = "cividge"
 
 [[kv_namespaces]]
 binding = "CIVIDGE_KV"
-id = "ff45707014424ab3afac57fda8c305de"
+id = "5559ef420113489ab6f88aa0632817c9"
 
 [[durable_objects.bindings]]
 name = "OBJECT_LIFECYCLE"

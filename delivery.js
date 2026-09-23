@@ -528,11 +528,10 @@ export async function onRequest(context) {
     const slashIdx = rawFilename.indexOf("/");
     if (slashIdx === -1) return renderNotFoundResponse(request, 86400, context);
     const segment = rawFilename.slice(0, slashIdx).toLowerCase();
-    const matchedHost = allowedRelayHosts.find(
-      (h) => h === segment || h.split(".")[0] === segment
-    );
-    if (!matchedHost) return renderNotFoundResponse(request, 86400, context);
-    pathRelayHost = matchedHost;
+    const exact = allowedRelayHosts.filter((h) => h === segment);
+    const matches = exact.length ? exact : allowedRelayHosts.filter((h) => h.split(".")[0] === segment);
+    if (matches.length !== 1) return renderNotFoundResponse(request, 86400, context);
+    pathRelayHost = matches[0];
     rawFilename = rawFilename.slice(slashIdx + 1);
   }
   if (rawFilename.startsWith("404-character.")) {
@@ -542,6 +541,8 @@ export async function onRequest(context) {
         "Content-Type": "image/webp",
         "Cache-Control": "public, max-age=31536000, immutable",
         "Access-Control-Allow-Origin": "*",
+        "Access-Control-Expose-Headers": "X-Cividge-Relay-Host",
+        "X-Cividge-Relay-Host": pathRelayHost || requestHost,
       },
     });
   }

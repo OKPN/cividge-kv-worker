@@ -137,6 +137,13 @@ function verifyAdminAuth(request, env) {
   return clientToken === adminToken;
 }
 
+async function isCurrentLinkProjection(env, key, metadata) {
+  if (!parseCanonicalLinkKey(key)) return false;
+  const { binding } = await callLinkBinding(env, { action: "inspect", linkKey: key });
+  return binding?.status === "BOUND" && Number.isSafeInteger(Number(metadata?.g)) &&
+    Number(metadata.g) === binding.generation;
+}
+
 // GET: 単一キーの照会、または全キーの一覧取得
 export async function onRequestGet(context) {
   const { request, env } = context;
@@ -182,12 +189,19 @@ export async function onRequestGet(context) {
         cursor = page.list_complete === false ? page.cursor : undefined;
       } while (cursor);
 
-      const items = allRawKeys
-        .filter(k => !k.name.startsWith("blob_") && !k.name.startsWith("config:"))
-        .map(k => ({
-          name: k.name,
-          metadata: unpackMetadata(k.name, "", k.metadata),
-        }));
+      const candidates = allRawKeys.filter(k => !k.name.startsWith("blob_") && !k.name.startsWith("config:"));
+      const items = [];
+      // This is an admin control-plane list, not public GET. Check the Link
+      // authority in bounded batches so eventually consistent KV listings
+      // cannot resurrect a retired generation.
+      for (let offset = 0; offset < candidates.length; offset += 16) {
+        const batch = candidates.slice(offset, offset + 16);
+        const current = await Promise.all(batch.map(k => isCurrentLinkProjection(env, k.name, k.metadata)));
+        for (let index = 0; index < batch.length; index++) {
+          if (current[index]) items.push({ name: batch[index].name,
+            metadata: unpackMetadata(batch[index].name, "", batch[index].metadata) });
+        }
+      }
 
       return new Response(JSON.stringify({ success: true, files: items }), {
         status: 200,
@@ -195,9 +209,8 @@ export async function onRequestGet(context) {
       });
     } catch (err) {
       console.warn("KV list error:", err.message);
-      // キャッシュもない場合は空配列で安全に返却（500でクラッシュさせない）
-      return new Response(JSON.stringify({ success: true, files: [], warning: err.message }), {
-        status: 200,
+      return new Response(JSON.stringify({ error: "Authoritative Link list unavailable" }), {
+        status: 503,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
     }
@@ -206,7 +219,8 @@ export async function onRequestGet(context) {
   // 2. key パラメータがある場合は単一照会
   try {
     const value = await env.CIVIDGE_KV.getWithMetadata(key);
-    if (!value || value.value === null || value.value === undefined) {
+    if (!value || value.value === null || value.value === undefined ||
+        !(await isCurrentLinkProjection(env, key, value.metadata))) {
       return new Response(JSON.stringify({ found: false, key }), {
         status: 404,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
@@ -278,11 +292,13 @@ export async function onRequestPost(context) {
     key = link.key;
 
     // 既存のレコード・メタデータを事前に取得（パスワード・kuboStatus・allowedHost等の継承用）
+    const bindingAtStart = (await callLinkBinding(env, { action: "inspect", linkKey: key })).binding;
     let existingMetadata = null;
     let existingValue = "";
     try {
       const existing = await env.CIVIDGE_KV.getWithMetadata(key);
-      if (existing) {
+      if (existing && bindingAtStart?.status === "BOUND" &&
+          Number(existing.metadata?.g) === bindingAtStart.generation) {
         existingValue = existing.value || "";
         if (existing.metadata) existingMetadata = existing.metadata;
       }
@@ -506,6 +522,7 @@ export async function onRequestPost(context) {
     flags = finalKuboStatus === "pinned" ? ((flags | 2) & ~4) : ((flags | 4) & ~2);
     compressedMeta.f = flags;
     compressedMeta.kuboStatus = finalKuboStatus;
+    compressedMeta.g = binding.generation;
 
     // KV に登録。期限はメタデータ e だけで管理する。公開GETはこのprojectionを
     // canonical keyで一回だけ読み、DOやstorageを参照しない。
@@ -582,18 +599,26 @@ export async function onRequestDelete(context) {
         status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
     }
-    const existing = await env.CIVIDGE_KV.getWithMetadata(key);
-    if (!existing?.metadata) {
-      const binding = (await callLinkBinding(env, { action: "inspect", linkKey: canonical.key })).binding;
-      if (binding?.status === "RETIRING") {
-        await callLifecycle(env, { action: "completeRemoveLink", objectRef: binding.objectRef, linkKey: canonical.key });
-        await callLinkBinding(env, { action: "completeRemove", linkKey: canonical.key });
-      }
+    const binding = (await callLinkBinding(env, { action: "inspect", linkKey: canonical.key })).binding;
+    const expectedGeneration = url.searchParams.get("generation");
+    if (expectedGeneration !== null && Number(expectedGeneration) !== binding?.generation) {
+      return new Response(JSON.stringify({ error: "Link generation changed", code: "LINK_GENERATION_CONFLICT" }), {
+        status: 409, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+    if (!binding || binding.status === "RETIRED") {
+      // A delayed KV view is not authority. Do not issue another KV delete:
+      // a new explicit rebind may begin immediately after this observation.
       return new Response(JSON.stringify({ success: true, deletedKey: canonical.key, alreadyAbsent: true }), {
         status: 200, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
     }
-    const lifecycle = objectRefForExisting(existing.value || "", existing.metadata);
+    if (binding.status !== "BOUND" && binding.status !== "RETIRING") {
+      return new Response(JSON.stringify({ error: "Link mutation is in progress", code: "LIFECYCLE_CONFLICT" }), {
+        status: 409, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+    const lifecycle = { objectRef: binding.objectRef };
 
     await callLinkBinding(env, { action: "beginRemove", linkKey: canonical.key });
 

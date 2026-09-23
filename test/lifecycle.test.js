@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { onRequest as deliver } from "../delivery.js";
-import { onRequestDelete, onRequestPost } from "../cividge-kv.js";
+import { onRequestDelete, onRequestPost, onRequestGet } from "../cividge-kv.js";
 import { onRequestPost as onLifecyclePost, syncLifecycleProjection, isManagedRpcReleaseEnabled } from "../lifecycle-api.js";
 import { ObjectLifecycle } from "../lifecycle.js";
 import { LinkBinding } from "../link-binding.js";
@@ -100,6 +100,66 @@ test("unknown media uses exactly one canonical host-qualified KV lookup", async 
   assert.deepEqual(kv.calls.get, ["public.example:missing.webp"]);
 });
 
+test("relay probe identifies only the uniquely allowed canonical public host", async () => {
+  const env = { STATIC_RELAY_PUBLIC_HOSTS: "content-relay.pages.dev,content-cache.pages.dev" };
+  const correct = await deliver(context("https://relay.example/r/content-cache/404-character.webp", env));
+  assert.equal(correct.status, 200);
+  assert.equal(correct.headers.get("x-cividge-relay-host"), "content-cache.pages.dev");
+  const wrong = await deliver(context("https://relay.example/r/unknown/404-character.webp", env));
+  assert.equal(wrong.status, 404);
+  const ambiguous = await deliver(context("https://relay.example/r/content-cache/404-character.webp", {
+    STATIC_RELAY_PUBLIC_HOSTS: "content-cache.pages.dev,content-cache.example",
+  }));
+  assert.equal(ambiguous.status, 404);
+});
+
+test("retired Link generation hides stale KV and explicit rebind creates a newer generation", async () => {
+  const key = "public.example:again.webp";
+  const env = { ADMIN_API_TOKEN: "secret", LINK_BINDING: memoryBindingNamespace() };
+  await bindExisting(env, key, "r2:old");
+  const old = (await callLinkBinding(env, { action: "inspect", linkKey: key })).binding;
+  const records = new Map([[key, { value: "r2", metadata: { b: "r2", k_s3: "old", g: old.generation } }]]);
+  env.CIVIDGE_KV = {
+    getWithMetadata: async name => records.get(name) || { value: null, metadata: null },
+    list: async () => ({ keys: [...records].map(([name, entry]) => ({ name, metadata: entry.metadata })), list_complete: true }),
+  };
+  const list = () => onRequestGet({ request: new Request("https://worker.example/api/cividge-kv", {
+    headers: { Authorization: "Bearer secret" },
+  }), env });
+  assert.equal((await list()).status, 200);
+  assert.equal((await (await list()).json()).files.length, 1);
+  await callLinkBinding(env, { action: "beginRemove", linkKey: key });
+  await callLinkBinding(env, { action: "completeRemove", linkKey: key });
+  const retired = (await callLinkBinding(env, { action: "inspect", linkKey: key })).binding;
+  assert.equal(retired.status, "RETIRED");
+  assert.deepEqual((await (await list()).json()).files, []);
+  const reserved = (await callLinkBinding(env, { action: "reserve", linkKey: key,
+    objectRef: "r2:new", attemptId: "new-upload" })).binding;
+  await callLinkBinding(env, { action: "commit", linkKey: key,
+    attemptId: "new-upload", generation: reserved.attempt.generation });
+  assert.ok(reserved.generation > old.generation);
+  const staleDelete = await onRequestDelete({ request: new Request(
+    `https://worker.example/api/cividge-kv?key=${encodeURIComponent(key)}&generation=${old.generation}`, {
+      method: "DELETE", headers: { Authorization: "Bearer secret" },
+    }), env, waitUntil() {} });
+  assert.equal(staleDelete.status, 409);
+  assert.deepEqual((await (await list()).json()).files, []); // old KV projection is still stale
+  records.set(key, { value: "r2", metadata: { b: "r2", k_s3: "new", g: reserved.generation } });
+  assert.equal((await (await list()).json()).files.length, 1);
+});
+
+test("Placement reacquisition does not change a live Link generation", async () => {
+  const env = { LINK_BINDING: memoryBindingNamespace() };
+  const linkKey = "public.example:same.webp";
+  await bindExisting(env, linkKey, "ipfs:cid");
+  const before = (await callLinkBinding(env, { action: "inspect", linkKey })).binding;
+  const reserved = (await callLinkBinding(env, { action: "reserve", linkKey,
+    objectRef: "ipfs:cid", attemptId: "reacquire", acquirePlacement: true,
+    placement: { kind: "filebase_rpc", locator: { cid: "cid" } } })).binding;
+  assert.equal(reserved.generation, before.generation);
+  assert.ok(reserved.attempt.generation > before.attemptGeneration);
+});
+
 test("registry rejects bare Link keys and canonicalizes the host in accepted keys", async () => {
   const kv = memoryKv();
   const lifecycleCalls = [];
@@ -130,6 +190,7 @@ test("registry rejects bare Link keys and canonicalizes the host in accepted key
   assert.equal(canonical.status, 200);
   assert.equal(kv.calls.put[0].key, "public.example:ok.webp");
   assert.equal(kv.calls.put[0].options.metadata.d, "public.example");
+  assert.equal(kv.calls.put[0].options.metadata.g, 1);
   assert.equal(lifecycleCalls[0].objectRef, "r2:ok.webp");
 });
 

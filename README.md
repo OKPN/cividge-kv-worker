@@ -94,6 +94,30 @@ id = "<your-kv-namespace-id>"
 required = ["ADMIN_API_TOKEN"]
 ```
 
+### Fresh KV reset / clean semantic cutover
+
+When the domain schema or delivery projection changes substantially and old
+test data need not be retained, create a **new, empty** KV namespace and switch
+the Worker's `CIVIDGE_KV` binding to its ID. Do not copy keys, metadata, or
+values from the old namespace. Deploy and verify read/write through the new
+binding **before** deleting the old namespace. This is a clean baseline, not a
+repair or migration of the old schema.
+
+KV holds the delivery projection and runtime configuration, not Object
+lifecycle authority. The reset removes old Link/host/metadata/generation/
+`kuboStatus` projections and helps distinguish legacy ghost state from a bug
+in the current implementation. Any ghost state generated after a clean reset
+is more likely to come from current Cividge behavior. Old records have no
+compatibility guarantee.
+
+The reset also removes KV-stored configuration such as
+`config:ipfs_gateways`. Until the administrator saves a new GatewayConfig,
+the Worker uses its built-in gateway defaults. Resetting KV **does not**
+delete or recreate Durable Objects, R2 objects, Filebase pins, or Kubo pins;
+their authoritative/physical state remains. Existing public Links will not
+be delivered from an empty KV until current Cividge explicitly projects them
+again. Do not infer that a missing KV Link authorizes physical deletion.
+
 ### 3. Deploy to Production
 
 Set the secret on Cloudflare:
