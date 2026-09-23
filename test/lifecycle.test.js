@@ -14,6 +14,8 @@ import {
   requestPlacementAcquire,
   requestPlacementRelease,
   requestRelease,
+  recoverExpiredPlacementClaims,
+  PLACEMENT_CLAIM_LEASE_MS,
   removeLink,
 } from "../lifecycle-model.js";
 
@@ -244,6 +246,25 @@ test("same-host alternate name is a peer Link and preserves the source Link", ()
   addLink(state, "test-up.pages.dev:alternate.webp");
   assert.equal(state.links.includes("test-up.pages.dev:source.webp"), true);
   assert.equal(state.links.includes("test-up.pages.dev:alternate.webp"), true);
+});
+
+test("an abandoned Kubo acquisition claim becomes retryable without inferring PRESENT", () => {
+  const state = newLifecycle("ipfs:bafy-lease", [
+    { kind: "filebase", executor: "browser", locator: { key: "lease.webp", cid: "bafy-lease" } },
+  ]);
+  addLink(state, "public.example:lease.webp");
+  requestPlacementAcquire(state, { kind: "kubo", executor: "browser", locator: { cid: "bafy-lease" } });
+  const first = claimPlacement(state, "kubo", "acquire", "first", 1_000).task;
+  assert.equal(state.placements.kubo.state, "PINNING");
+  assert.equal(recoverExpiredPlacementClaims(state, 1_000 + PLACEMENT_CLAIM_LEASE_MS - 1), false);
+  assert.equal(recoverExpiredPlacementClaims(state, 1_000 + PLACEMENT_CLAIM_LEASE_MS), true);
+  assert.equal(state.placements.kubo.state, "PIN_REQUESTED");
+  assert.equal(state.placements.kubo.claim, null);
+  const second = claimPlacement(state, "kubo", "acquire", "second", 1_000 + PLACEMENT_CLAIM_LEASE_MS).task;
+  assert.ok(second.generation > first.generation);
+  assert.throws(() => reportPlacement(state, "kubo", { ...first, outcome: "present" }), /Stale/);
+  reportPlacement(state, "kubo", { ...second, outcome: "present" });
+  assert.equal(state.placements.kubo.state, "PRESENT");
 });
 
 test("pending Link removal remains a reference until projection deletion completes", () => {

@@ -7,6 +7,9 @@ export const PLACEMENT_STATES = new Set([
   "ABSENT", "PIN_REQUESTED", "PINNING", "PRESENT",
   "RELEASE_PENDING", "RELEASING", "RELEASED", "RETRYABLE",
 ]);
+// Longer than the browser's three-minute Kubo confirmation window so a valid
+// executor can report before the authority reclaims an abandoned claim.
+export const PLACEMENT_CLAIM_LEASE_MS = 240_000;
 
 export function parseObjectRef(value) {
   const ref = String(value || "").trim();
@@ -182,7 +185,7 @@ export function requestPlacementAcquire(current, rawPlacement) {
   return current;
 }
 
-export function claimPlacement(current, kind, operation, claimId) {
+export function claimPlacement(current, kind, operation, claimId, now = Date.now()) {
   const placement = current.placements[String(kind || "").toLowerCase()];
   if (!placement) throw new Error("Unknown placement");
   if (!claimId) throw new Error("claimId is required");
@@ -198,11 +201,41 @@ export function claimPlacement(current, kind, operation, claimId) {
     throw new Error("Object is not releasable");
   }
   placement.generation += 1;
-  placement.claim = { claimId: String(claimId), generation: placement.generation, operation: intent };
+  const claimedAt = Number(now);
+  placement.claim = {
+    claimId: String(claimId),
+    generation: placement.generation,
+    operation: intent,
+    claimedAt,
+    expiresAt: claimedAt + PLACEMENT_CLAIM_LEASE_MS,
+  };
   placement.state = acquire ? "PINNING" : "RELEASING";
   placement.error = null;
   if (release && current.links.length === 0) current.state = "RELEASING";
   return { lifecycle: current, task: taskForPlacement(placement) };
+}
+
+// Browser-held capabilities can disappear on reload or network failure. Claims
+// therefore have a durable lease: expiry revokes only the actuator claim and
+// returns the Placement to a claimable state. It never infers physical state.
+export function recoverExpiredPlacementClaims(current, now = Date.now()) {
+  let changed = false;
+  for (const placement of Object.values(current?.placements || {})) {
+    const claim = placement.claim;
+    if (!claim || !Number.isFinite(Number(claim.expiresAt)) || Number(claim.expiresAt) > Number(now)) continue;
+    if (placement.state === "PINNING" && claim.operation === "acquire") {
+      placement.state = "PIN_REQUESTED";
+    } else if (placement.state === "RELEASING" && claim.operation === "release") {
+      placement.state = "RETRYABLE";
+      if (current.links.length === 0) current.state = "RELEASE_PENDING";
+    } else {
+      continue;
+    }
+    placement.error = "Placement actuator claim expired";
+    placement.claim = null;
+    changed = true;
+  }
+  return changed;
 }
 
 function taskForPlacement(placement) {
@@ -213,6 +246,8 @@ function taskForPlacement(placement) {
     claimId: placement.claim.claimId,
     generation: placement.claim.generation,
     operation: placement.claim.operation,
+    claimedAt: placement.claim.claimedAt,
+    expiresAt: placement.claim.expiresAt,
   };
 }
 

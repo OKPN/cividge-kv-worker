@@ -101,6 +101,9 @@ export async function syncLifecycleProjection(env, lifecycle) {
     if (!existing || existing.value === null || existing.value === undefined) continue;
     const metadata = { ...(existing.metadata || {}) };
     let flags = Number(metadata.f || 0);
+    metadata.kuboPlacementState = kubo?.state || "ABSENT";
+    if (kubo?.claim?.expiresAt) metadata.kuboClaimExpiresAt = Number(kubo.claim.expiresAt);
+    else delete metadata.kuboClaimExpiresAt;
     if (filebase?.state === "RELEASED") flags |= 1;
     else flags &= ~1;
     if (kubo?.state === "PRESENT") {

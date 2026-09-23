@@ -5,11 +5,13 @@ import {
   completeRemoveLink,
   newLifecycle,
   parseObjectRef,
+  recoverExpiredPlacementClaims,
   reportPlacement,
   requestPlacementAcquire,
   requestPlacementRelease,
   requestRelease,
 } from "./lifecycle-model.js";
+import { syncLifecycleProjection } from "./lifecycle-api.js";
 
 const STATE_KEY = "lifecycle";
 
@@ -17,8 +19,9 @@ const STATE_KEY = "lifecycle";
 // storage is the authority for the Object <-> Link relation; delivery KV is
 // only a projection and is intentionally never read here.
 export class ObjectLifecycle {
-  constructor(ctx) {
+  constructor(ctx, env) {
     this.ctx = ctx;
+    this.env = env;
   }
 
   async fetch(request) {
@@ -28,6 +31,7 @@ export class ObjectLifecycle {
 
     let state = await this.ctx.storage.get(STATE_KEY);
     if (state && state.objectRef !== object.objectRef) return json({ error: "Durable Object identity mismatch" }, 409);
+    if (state && recoverExpiredPlacementClaims(state)) await this.persist(state);
     const action = body.action;
     try {
       if (action === "createLink") {
@@ -51,7 +55,7 @@ export class ObjectLifecycle {
       } else if (action === "claimPlacement") {
         if (!state) return json({ error: "Object lifecycle not found" }, 404);
         const claim = claimPlacement(state, body.placement, body.operation, crypto.randomUUID());
-        await this.ctx.storage.put(STATE_KEY, state);
+        await this.persist(state);
         return json({ lifecycle: state, claim: claim.task });
       } else if (action === "reportPlacement") {
         if (!state) return json({ error: "Object lifecycle not found" }, 404);
@@ -67,11 +71,29 @@ export class ObjectLifecycle {
       } else {
         return json({ error: "Unknown lifecycle action" }, 400);
       }
-      await this.ctx.storage.put(STATE_KEY, state);
+      await this.persist(state);
       return json({ lifecycle: state });
     } catch (error) {
       return json({ error: error.message }, 409);
     }
+  }
+
+  async alarm() {
+    const state = await this.ctx.storage.get(STATE_KEY);
+    if (!state) return;
+    const recovered = recoverExpiredPlacementClaims(state);
+    await this.persist(state);
+    if (recovered) await syncLifecycleProjection(this.env, state);
+  }
+
+  async persist(state) {
+    await this.ctx.storage.put(STATE_KEY, state);
+    const nextExpiry = Object.values(state?.placements || {})
+      .map(placement => Number(placement.claim?.expiresAt))
+      .filter(Number.isFinite)
+      .sort((left, right) => left - right)[0];
+    if (nextExpiry) await this.ctx.storage.setAlarm(nextExpiry);
+    else await this.ctx.storage.deleteAlarm();
   }
 }
 
