@@ -36,6 +36,20 @@ export class ObjectLifecycle {
     try {
       if (action === "createLink") {
         state = state || newLifecycle(object.objectRef, body.placements || []);
+        // A successful storage upload may re-establish a Placement belonging
+        // to a previously RELEASED ObjectRef. Run the existing acquire state
+        // machine inside this single DO turn so stale release claims cannot
+        // race the new Link into existence.
+        for (const placement of body.confirmedPlacements || []) {
+          requestPlacementAcquire(state, placement);
+          const currentPlacement = state.placements[String(placement.kind || "").toLowerCase()];
+          if (currentPlacement?.state === "PIN_REQUESTED") {
+            const claimed = claimPlacement(state, currentPlacement.kind, "acquire", crypto.randomUUID());
+            reportPlacement(state, currentPlacement.kind, { ...claimed.task, outcome: "present" });
+          } else if (currentPlacement?.state === "PINNING") {
+            throw new Error("Placement acquisition is already in progress");
+          }
+        }
         addLink(state, body.linkKey, body.placements || []);
       } else if (action === "beginRemoveLink") {
         if (!state) return json({ error: "Object lifecycle not found" }, 404);

@@ -31,7 +31,10 @@
 - `ACTIVE`, `RELEASE_PENDING`, `RELEASING`, `RELEASED` and the closed placement
   states are persisted before external I/O. A retryable failure never becomes a
   release success. A new Link can cancel `RELEASE_PENDING` only before any
-  Placement starts release; it cannot resurrect `RELEASING` or `RELEASED`.
+  Placement starts release. Plain `createLink` cannot resurrect `RELEASING` or
+  `RELEASED`; an explicit, successfully confirmed storage upload may re-acquire
+  a `RELEASED` Placement through a new generation and then recreate the Link.
+  `RELEASING` always remains non-linkable until its claim completes or expires.
 
 ---
 

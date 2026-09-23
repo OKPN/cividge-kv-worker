@@ -81,10 +81,14 @@ function activePreservingPlacement(current, exceptKind) {
 export function addLink(current, linkKey, placements = []) {
   const link = parseCanonicalLinkKey(linkKey);
   if (!link) throw new Error("Invalid canonical Link key");
+  // createLink is idempotent for the same ObjectRef + canonical Link pair.
+  // This lets an explicit upload restore a missing delivery projection without
+  // inventing a second Link or treating a retry as a rename.
+  if (current.links.includes(link.key)) return current;
   if (current.state === "RELEASED" || current.state === "RELEASING") throw new Error("Object is not linkable");
-  if (current.links.includes(link.key)) throw new Error("Link already exists");
   if (current.state === "RELEASE_PENDING") {
-    if (Object.values(current.placements).some(p => p.state === "RELEASING" || p.state === "RELEASED")) {
+    const placements = Object.values(current.placements);
+    if (placements.some(p => p.state === "RELEASING") || placements.every(p => p.state === "RELEASED")) {
       throw new Error("Object release has already started");
     }
     current.state = "ACTIVE";
@@ -169,7 +173,6 @@ export function requestPlacementRelease(current, kind) {
 
 export function requestPlacementAcquire(current, rawPlacement) {
   const requested = canonicalPlacement(rawPlacement, "PIN_REQUESTED");
-  if (requested.kind !== "kubo") throw new Error("Only Kubo acquisition requires an external actuator");
   const existing = current.placements[requested.kind];
   if (existing && ["PRESENT", "PIN_REQUESTED", "PINNING"].includes(existing.state)) return current;
   if (existing && !samePlacement(existing, requested)) throw new Error("A Placement cannot be reassigned to a different locator");

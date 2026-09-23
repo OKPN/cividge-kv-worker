@@ -4,6 +4,7 @@ import test from "node:test";
 import { onRequest as deliver } from "../delivery.js";
 import { onRequestDelete, onRequestPost } from "../cividge-kv.js";
 import { onRequestPost as onLifecyclePost, syncLifecycleProjection } from "../lifecycle-api.js";
+import { ObjectLifecycle } from "../lifecycle.js";
 import {
   addLink,
   beginRemoveLink,
@@ -235,7 +236,68 @@ test("createLink adds peer Links without changing an existing peer", () => {
   addLink(state, "testunko.pages.dev:shared.webp");
   assert.deepEqual(state.links, ["test-up.pages.dev:shared.webp", "testunko.pages.dev:shared.webp"]);
   assert.deepEqual(state.placements.r2, beforePlacement);
-  assert.throws(() => addLink(state, "testunko.pages.dev:shared.webp"), /already exists/);
+  addLink(state, "testunko.pages.dev:shared.webp");
+  assert.deepEqual(state.links, ["test-up.pages.dev:shared.webp", "testunko.pages.dev:shared.webp"]);
+});
+
+test("a confirmed Filebase re-upload can re-acquire a released ObjectRef and recreate the same Link", () => {
+  const placement = { kind: "filebase", executor: "browser", locator: { key: "same.webp", cid: "bafy-same" } };
+  const state = newLifecycle("ipfs:bafy-same", [placement]);
+  addLink(state, "public.example:same.webp");
+  removeLink(state, "public.example:same.webp");
+  requestRelease(state);
+  const release = claimPlacement(state, "filebase", "release", "release-old").task;
+  reportPlacement(state, "filebase", { ...release, outcome: "released" });
+  assert.equal(state.state, "RELEASED");
+
+  requestPlacementAcquire(state, placement);
+  const acquire = claimPlacement(state, "filebase", "acquire", "acquire-new").task;
+  reportPlacement(state, "filebase", { ...acquire, outcome: "present" });
+  addLink(state, "public.example:same.webp");
+
+  assert.equal(state.state, "ACTIVE");
+  assert.equal(state.placements.filebase.state, "PRESENT");
+  assert.deepEqual(state.links, ["public.example:same.webp"]);
+  assert.ok(acquire.generation > release.generation);
+  assert.throws(() => reportPlacement(state, "filebase", { ...release, outcome: "released" }), /Stale|Contradictory/);
+});
+
+test("createLink atomically re-acquires a confirmed released Placement", async () => {
+  const placement = { kind: "filebase", executor: "browser", locator: { key: "same.webp", cid: "bafy-do-same" } };
+  const released = newLifecycle("ipfs:bafy-do-same", [placement]);
+  addLink(released, "public.example:same.webp");
+  removeLink(released, "public.example:same.webp");
+  requestRelease(released);
+  const release = claimPlacement(released, "filebase", "release", "release-do").task;
+  reportPlacement(released, "filebase", { ...release, outcome: "released" });
+
+  const values = new Map([["lifecycle", released]]);
+  const lifecycle = new ObjectLifecycle({
+    storage: {
+      get: async key => structuredClone(values.get(key)),
+      put: async (key, value) => values.set(key, structuredClone(value)),
+      setAlarm: async () => {},
+      deleteAlarm: async () => {},
+    },
+  }, {});
+  const response = await lifecycle.fetch(new Request("https://object-lifecycle.internal/", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action: "createLink",
+      objectRef: "ipfs:bafy-do-same",
+      linkKey: "public.example:same.webp",
+      placements: [placement],
+      confirmedPlacements: [placement],
+    }),
+  }));
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.lifecycle.state, "ACTIVE");
+  assert.equal(body.lifecycle.placements.filebase.state, "PRESENT");
+  assert.deepEqual(body.lifecycle.links, ["public.example:same.webp"]);
+  assert.ok(body.lifecycle.placements.filebase.generation > release.generation);
 });
 
 test("same-host alternate name is a peer Link and preserves the source Link", () => {

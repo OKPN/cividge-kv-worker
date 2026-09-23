@@ -447,6 +447,10 @@ export async function onRequestPost(context) {
         objectRef: lifecycle.objectRef,
         linkKey: key,
         placements: lifecycle.placements,
+        // Only an explicit storage upload / verified duplicate may attest that
+        // a physical Placement is PRESENT again. Alias-only createLink calls
+        // intentionally cannot resurrect a released Object.
+        confirmedPlacements: body.confirmPlacementPresent ? lifecycle.placements : [],
       })).lifecycle;
     }
     finalKuboStatus = lifecycleState?.placements?.kubo?.state === "PRESENT" ? "pinned" : "not_pinned";
