@@ -271,6 +271,11 @@ test("createLink atomically re-acquires a confirmed released Placement", async (
   const release = claimPlacement(released, "filebase", "release", "release-do").task;
   reportPlacement(released, "filebase", { ...release, outcome: "released" });
 
+  // Simulate a lifecycle record persisted before Placement generations were
+  // introduced. A current upload must canonicalize it instead of issuing a
+  // NaN/null claim that rejects its own completion report as stale.
+  delete released.placements.filebase.generation;
+
   const values = new Map([["lifecycle", released]]);
   const lifecycle = new ObjectLifecycle({
     storage: {
@@ -297,7 +302,7 @@ test("createLink atomically re-acquires a confirmed released Placement", async (
   assert.equal(body.lifecycle.state, "ACTIVE");
   assert.equal(body.lifecycle.placements.filebase.state, "PRESENT");
   assert.deepEqual(body.lifecycle.links, ["public.example:same.webp"]);
-  assert.ok(body.lifecycle.placements.filebase.generation > release.generation);
+  assert.equal(body.lifecycle.placements.filebase.generation, 1);
 });
 
 test("same-host alternate name is a peer Link and preserves the source Link", () => {

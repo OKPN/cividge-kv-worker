@@ -203,7 +203,14 @@ export function claimPlacement(current, kind, operation, claimId, now = Date.now
   if (release && current.links.length === 0 && current.state !== "RELEASE_PENDING") {
     throw new Error("Object is not releasable");
   }
-  placement.generation += 1;
+  // Persisted lifecycle records created before claim generations existed can
+  // legitimately omit this field. Canonicalize at the mutation boundary so a
+  // newly-issued claim always has a finite, transport-safe generation. This
+  // preserves stale-report rejection without adding a legacy execution path.
+  const previousGeneration = Number(placement.generation);
+  placement.generation = Number.isSafeInteger(previousGeneration) && previousGeneration >= 0
+    ? previousGeneration + 1
+    : 1;
   const claimedAt = Number(now);
   placement.claim = {
     claimId: String(claimId),
