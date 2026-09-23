@@ -594,60 +594,6 @@ export async function onRequestDelete(context) {
   }
 }
 
-// Temporary, administrator-only repair for a historical delivery projection.
-// This endpoint is intentionally separate from normal Link deletion so it can
-// be removed after the affected old records have been retired. It never
-// releases an Object or a Placement.
-export async function onRequestRetireOldLink(context) {
-  const { request, env } = context;
-  const respond = (body, status = 200) => new Response(JSON.stringify(body), {
-    status,
-    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store" },
-  });
-  if (!verifyAdminAuth(request, env)) return respond({ error: "Admin token required" }, 401);
-  if (!env?.CIVIDGE_KV || !env?.OBJECT_LIFECYCLE) return respond({ error: "Lifecycle bindings are unavailable" }, 503);
-
-  try {
-    const body = await request.json();
-    const canonical = parseCanonicalLinkKey(body.key);
-    if (!canonical || canonical.key !== body.key) return respond({ error: "Exact canonical host:filename key required" }, 400);
-    if (body.action !== "inspect" && body.action !== "retire") return respond({ error: "Invalid maintenance action" }, 400);
-
-    const existing = await env.CIVIDGE_KV.getWithMetadata(canonical.key);
-    if (existing?.value === null || existing?.value === undefined) return respond({ found: false, key: canonical.key });
-    const object = objectRefForExisting(existing.value, existing.metadata || {});
-    const snapshot = JSON.stringify({ key: canonical.key, value: existing.value, metadata: existing.metadata || null });
-    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(snapshot));
-    const fingerprint = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
-    const inspected = await callLifecycle(env, { action: "inspect", objectRef: object.objectRef });
-    const state = inspected.lifecycle;
-    const owned = Boolean(state?.links?.includes(canonical.key) || state?.pendingLinkRemovals?.includes(canonical.key));
-    const result = { found: true, key: canonical.key, objectRef: object.objectRef, fingerprint, owned };
-    if (body.action === "inspect") return respond(result);
-    if (body.expectedFingerprint !== fingerprint || body.expectedObjectRef !== object.objectRef) {
-      return respond({ error: "Link changed since inspection; inspect again" }, 409);
-    }
-
-    if (owned) {
-      const deleteUrl = new URL(request.url);
-      deleteUrl.pathname = "/api/cividge-kv";
-      deleteUrl.search = "?key=" + encodeURIComponent(canonical.key);
-      const deletion = new Request(deleteUrl, { method: "DELETE", headers: request.headers });
-      const response = await onRequestDelete({ ...context, request: deletion });
-      if (!response.ok) return response;
-      return respond({ ...result, retired: true, method: "removeLink" });
-    }
-
-    // The Object authority has no such Link. Delete only this stale delivery
-    // projection. Never infer final-reference status or touch physical bytes.
-    await env.CIVIDGE_KV.delete(canonical.key);
-    context.waitUntil?.(purgeHybridCache(request, env, canonical.key)) || purgeHybridCache(request, env, canonical.key);
-    return respond({ ...result, retired: true, method: "unownedProjection" });
-  } catch (error) {
-    return respond({ error: error.message }, 409);
-  }
-}
-
 // 🌐 ハイブリッド Cache Purge ヘルパー
 // プランA (独自ドメイン設定時): REST Purge API で世界300箇所の全エッジから即時抹消
 // プランB (pages.dev無料運用時): Cache API (caches.default) でローカルPoPから即時抹消
