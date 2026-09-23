@@ -3,8 +3,10 @@ import test from "node:test";
 
 import { onRequest as deliver } from "../delivery.js";
 import { onRequestDelete, onRequestPost } from "../cividge-kv.js";
-import { onRequestPost as onLifecyclePost, syncLifecycleProjection } from "../lifecycle-api.js";
+import { onRequestPost as onLifecyclePost, syncLifecycleProjection, isManagedRpcReleaseEnabled } from "../lifecycle-api.js";
 import { ObjectLifecycle } from "../lifecycle.js";
+import { LinkBinding } from "../link-binding.js";
+import { callLinkBinding } from "../link-binding-api.js";
 import {
   addLink,
   beginRemoveLink,
@@ -37,6 +39,27 @@ function memoryKv(records = new Map()) {
       records.delete(key);
     },
   };
+}
+
+function memoryBindingNamespace() {
+  const objects = new Map();
+  return { idFromName: value => value, get(id) {
+    if (!objects.has(id)) {
+      const values = new Map();
+      const object = new LinkBinding({ storage: {
+        get: async key => values.get(key),
+        put: async (key, value) => values.set(key, structuredClone(value)),
+        delete: async key => values.delete(key),
+      } });
+      objects.set(id, object);
+    }
+    return { fetch: (url, options) => objects.get(id).fetch(new Request(url, options)) };
+  } };
+}
+
+async function bindExisting(env, linkKey, objectRef) {
+  const { binding } = await callLinkBinding(env, { action: "reserve", linkKey, objectRef, attemptId: "seed" });
+  await callLinkBinding(env, { action: "commit", linkKey, attemptId: "seed", generation: binding.attempt.generation });
 }
 
 function context(url, env) {
@@ -83,11 +106,14 @@ test("registry rejects bare Link keys and canonicalizes the host in accepted key
   const env = {
     CIVIDGE_KV: kv,
     ADMIN_API_TOKEN: "secret",
+    LINK_BINDING: memoryBindingNamespace(),
     OBJECT_LIFECYCLE: {
       idFromName: (name) => name,
       get: () => ({ fetch: async (_url, options) => {
         lifecycleCalls.push(JSON.parse(options.body));
-        return new Response(JSON.stringify({ lifecycle: {} }), { status: 200 });
+        return new Response(JSON.stringify({ lifecycle: {
+          placements: { r2: { state: "PRESENT", kind: "r2", executor: "worker", locator: { key: "ok.webp" } } },
+        } }), { status: 200 });
       } }),
     },
   };
@@ -121,6 +147,7 @@ test("creating an alias projection leaves the source Link and projection intact"
   const env = {
     CIVIDGE_KV: kv,
     ADMIN_API_TOKEN: "secret",
+    LINK_BINDING: memoryBindingNamespace(),
     OBJECT_LIFECYCLE: {
       idFromName: value => value,
       get: () => ({ fetch: async (_url, options) => {
@@ -193,6 +220,30 @@ test("a Link can cancel pending release but never resurrect releasing content", 
   requestRelease(releasing);
   claimPlacement(releasing, "r2", "release", "claim-r2");
   assert.throws(() => addLink(releasing, "public.example:y.webp"), /not linkable/);
+});
+
+test("uncertain RPC unpin cannot be converted back into a PRESENT Placement", () => {
+  const cid = "Qm" + "a".repeat(44);
+  const rpc = { kind: "filebase_rpc", executor: "worker", provenance: "cividge_worker_rpc", locator: { cid } };
+  const state = newLifecycle(`ipfs:${cid}`, [rpc]);
+  addLink(state, "public.example:rpc.webp");
+  removeLink(state, "public.example:rpc.webp");
+  requestRelease(state);
+  const task = claimPlacement(state, "filebase_rpc", "release", "rpc-release").task;
+  reportPlacement(state, "filebase_rpc", { ...task, outcome: "retryable", error: "response lost" });
+  assert.throws(() => addLink(state, "public.example:rpc.webp"), /release has already started/);
+  assert.equal(state.placements.filebase_rpc.state, "RETRYABLE");
+  assert.deepEqual(claimPlacement(state, "filebase_rpc", "release", "rpc-retry").task.locator, { cid });
+});
+
+test("RPC actuator requires dedicated bucket and durable Worker provenance", () => {
+  const cid = "Qm" + "a".repeat(44);
+  const rpc = { kind: "filebase_rpc", executor: "worker", provenance: "cividge_worker_rpc", locator: { cid } };
+  assert.throws(() => newLifecycle(`ipfs:${cid}`, [{ ...rpc, provenance: "browser_s3" }]), /provenance/);
+  assert.equal(isManagedRpcReleaseEnabled({ FILEBASE_DEDICATED_BUCKET: "false", FILEBASE_IPFS_API_KEY: "key" }, rpc), false);
+  assert.equal(isManagedRpcReleaseEnabled({ FILEBASE_DEDICATED_BUCKET: "true", FILEBASE_IPFS_API_KEY: "key" },
+    { kind: "filebase", executor: "browser", locator: { key: "x", cid } }), false);
+  assert.equal(isManagedRpcReleaseEnabled({ FILEBASE_DEDICATED_BUCKET: "true", FILEBASE_IPFS_API_KEY: "key" }, rpc), true);
 });
 
 test("duplicate actuator reports are idempotent and contradictory reports fail", () => {
@@ -368,6 +419,7 @@ test("removeLink retries safely after projection deletion failure", async () => 
   const env = {
     CIVIDGE_KV: kv,
     ADMIN_API_TOKEN: "secret",
+    LINK_BINDING: memoryBindingNamespace(),
     OBJECT_LIFECYCLE: {
       idFromName: value => value,
       get: () => ({ fetch: async (_url, options) => {
@@ -378,6 +430,7 @@ test("removeLink retries safely after projection deletion failure", async () => 
       } }),
     },
   };
+  await bindExisting(env, linkKey, "r2:retry-delete.webp");
   const makeContext = () => ({
     request: new Request("https://worker.example/api/cividge-kv?key=" + encodeURIComponent(linkKey), {
       method: "DELETE",
@@ -409,6 +462,7 @@ test("removeLink retries safely when authority completion fails after projection
   const env = {
     CIVIDGE_KV: kv,
     ADMIN_API_TOKEN: "secret",
+    LINK_BINDING: memoryBindingNamespace(),
     OBJECT_LIFECYCLE: {
       idFromName: value => value,
       get: () => ({ fetch: async (_url, options) => {
@@ -425,6 +479,7 @@ test("removeLink retries safely when authority completion fails after projection
       } }),
     },
   };
+  await bindExisting(env, linkKey, objectRef);
   const makeContext = (includeObjectRef = false) => ({
     request: new Request(
       "https://worker.example/api/cividge-kv?key=" + encodeURIComponent(linkKey)

@@ -2,6 +2,7 @@
 // Cloudflare Pages Function Middleware: 静的ファイル 404 / SPA フォールバック時のスマート中継 (Catbox風ハイブリッド404 & パスワード保護ゲート)
 
 import { CHARACTER_WEBP_BASE64 } from "./character_image.js";
+import { orderPublicGateways, readGatewayConfig } from "./gateway-config.js";
 
 let characterWebpBytes = null;
 function getCharacterWebpBytes() {
@@ -853,15 +854,9 @@ export async function onRequest(context) {
   const isKuboPinned = meta.kuboStatus === "pinned" || Boolean((meta.f || 0) & 2);
   const isUnpinned = Boolean(meta.unpinned) || Boolean((meta.f || 0) & 1);
 
-  // 公共ゲートウェイ群（地域分散・高可用性パブリック IPFS ゲートウェイ）
-  // See: [INV-DELIVERY-003] (現役オープンゲートウェイの多重冗長フォールバック)
-  const publicGateways = [
-    "https://apac.orbitor.dev/ipfs",    // アジア太平洋 (APAC - 日本・近隣最速)
-    "https://dget.top/ipfs",             // 高速オープンゲートウェイ (グローバル)
-    "https://ipfs.orbitor.dev/ipfs",    // 北米・グローバル (Orbitor Main)
-    "https://eu.orbitor.dev/ipfs",      // 欧州 (EU)
-    "https://latam.orbitor.dev/ipfs",   // 中南米 (LATAM)
-  ];
+  // Control-plane config is read only after the canonical Link lookup and
+  // cache miss. A gateway failure never mutates Object/Link/Placement state.
+  const publicGateways = orderPublicGateways(await readGatewayConfig(env), request.cf?.continent);
   const filebaseGateway = "https://ipfs.filebase.io/ipfs";
 
   // 自宅 Kubo の専用公開ゲートウェイ（環境変数 KUBO_GATEWAY_URL があれば最優先）

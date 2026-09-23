@@ -64,7 +64,9 @@ export class ObjectLifecycle {
         if (!state) return json({ error: "Object lifecycle not found" }, 404);
         requestPlacementRelease(state, body.placement);
       } else if (action === "requestPlacementAcquire") {
-        if (!state) return json({ error: "Object lifecycle not found" }, 404);
+        // A reserved Link may prepare a new Object before physical I/O. The
+        // Placement begins as PIN_REQUESTED, never falsely PRESENT.
+        state = state || newLifecycle(object.objectRef, []);
         requestPlacementAcquire(state, body.placement);
       } else if (action === "claimPlacement") {
         if (!state) return json({ error: "Object lifecycle not found" }, 404);

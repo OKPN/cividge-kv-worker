@@ -21,7 +21,8 @@ cividge-kv-worker serves as the decentralized backend routing and caching layer 
 - 🔒 **Edge Password Gate**:
   - Secure session-based verification gate using SHA-256 password hashes with zero origin overhead.
 - 🪐 **IPFS Multi-Gateway Failover**:
-  - Seamlessly falls back across multiple public IPFS gateways (ipfs.filebase.io, cloudflare-ipfs.com, ipfs.io, dweb.link) when primary nodes are congested.
+  - Public HTTP Gateway peers are selected by the delivery Worker's viewer-continent policy or an administrator's manual choice, then tried in order. Filebase's provider gateway remains a separate origin candidate.
+  - The frontend offers a built-in candidate catalog; the authenticated `GET/PUT /api/gateway-config` stores the actual runtime setting in `CIVIDGE_KV` (`config:ipfs_gateways`). KV propagation between regions is eventual.
 - 🛡️ **Edge Protection**:
   - Immediate 404 caching on delivery-only domains for non-media requests, fully conserving Worker execution quotas.
 
@@ -211,6 +212,12 @@ properties of public content distribution rather than the Worker routing layer.
 - `UPLOAD_TOKEN`: the token used only by external upload clients such as the Windows **Send To** batch. Do not reuse `ADMIN_API_TOKEN`. The generated batch contains this token in plain text: never share, commit, or place it in a shared folder; rotate the secret immediately if it leaks.
 - `TEST_UPLOAD_TOKEN`: an optional second upload-only credential for a test client. It has the same upload capability as `UPLOAD_TOKEN`; use a separate Worker and storage bindings when the test uploads must be isolated from production.
 - `FILEBASE_IPFS_API_KEY`: a bucket-scoped Filebase IPFS RPC API key. This stays in the Worker and must never be placed in a browser, BAT file, or repository.
+- `FILEBASE_DEDICATED_BUCKET=true` is required for Worker-managed Filebase RPC acquisition and physical unpin. The bucket selected by `FILEBASE_IPFS_API_KEY` **must be dedicated to Cividge Worker RPC placements**: do not mix browser/S3 uploads, external tools, or other applications' pins in that bucket. This is the ownership boundary (`Filebase bucket = Cividge-managed RPC Placement namespace`), not a performance preference. The default is `false`; without explicit confirmation the Worker neither acquires this Placement nor calls `pin/rm`.
+- If Filebase `/add` returns a CID different from the preflight CID, the Worker stops before Link publication, records the observed CID in the unfinished Link attempt, and requires manual bucket inspection. It never automatically calls CID-wide `pin/rm` for that unexpected CID.
+
+`[INV-FILEBASE-RPC-RELEASE-AUTHORITY]` ObjectLifecycle alone authorizes physical release. The Worker calls Filebase `pin/rm` only after claiming that authorized release, and reports success or a retryable failure back to ObjectLifecycle. A lost response is checked with read-only `pin/ls` before treating the pin as absent.
+
+`[INV-FILEBASE-RPC-ACTUATOR-SCOPE]` The Worker actuates only a durable `filebase_rpc` Placement with `cividge_worker_rpc` provenance and a valid CID. Browser/S3 `filebase` Placements and pins owned outside the exclusive RPC bucket never become Worker cleanup tasks. Browser S3 credentials remain in the browser.
 
 ### Expiring links (no Cron)
 
@@ -228,7 +235,7 @@ claims so a stale or duplicated executor cannot authorize deletion.
 
 The client sends its upload token only as an `Authorization: Bearer` header. Do not place tokens in URL query strings.
 
-The generated Windows **Send To** batch uses a raw-body streaming upload (`X-Upload-Filename` plus `--data-binary`) and accepts files up to **99 MB**, below Cloudflare Free/Pro's 100 MB request limit. Legacy `multipart/form-data` clients remain supported with an 80 MiB ceiling because their bodies must be buffered for parsing.
+The generated Windows **Send To** batch uses a raw-body upload (`X-Upload-Filename` plus `--data-binary`). Browser, raw-body, and multipart uploads share one decimal **80 MB (80,000,000 bytes)** limit. The Worker buffers the complete body to determine content identity and check the canonical Link before physical storage mutation.
 
 ## Supported File Extensions
 

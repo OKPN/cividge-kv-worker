@@ -21,6 +21,9 @@ STATIC_RELAY_PUBLIC_HOSTS = "content-relay.pages.dev,testunko.pages.dev,punipuni
 # The custom-zone endpoint behind the static Pages relay.  Its /r/<file> URL is
 # globally purged when CLOUDFLARE_ZONE_ID and CLOUDFLARE_PURGE_TOKEN are set.
 STATIC_RELAY_BACKEND_HOSTS = "relay.k7m.f5.si"
+# Keep false unless FILEBASE_IPFS_API_KEY is scoped to a bucket reserved for
+# Cividge Worker RPC pins only. A shared bucket cannot distinguish pin owners.
+FILEBASE_DEDICATED_BUCKET = "false"
 
 [[r2_buckets]]
 binding = "R2_BUCKET"
@@ -34,6 +37,14 @@ id = "ff45707014424ab3afac57fda8c305de"
 name = "OBJECT_LIFECYCLE"
 class_name = "ObjectLifecycle"
 
+[[durable_objects.bindings]]
+name = "LINK_BINDING"
+class_name = "LinkBinding"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ObjectLifecycle"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["LinkBinding"]

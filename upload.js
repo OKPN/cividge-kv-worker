@@ -2,6 +2,10 @@
 // Cloudflare Worker: 外部スクリプト・Windows「送る」バッチ用 POST アップロード API
 
 import { onRequestPost as registerCanonicalLink } from "./cividge-kv.js";
+import { importer as importUnixFs } from "ipfs-unixfs-importer";
+import { BlackHoleBlockstore } from "blockstore-core";
+import { callLinkBinding } from "./link-binding-api.js";
+import { callLifecycle, isManagedRpcCidPinned } from "./lifecycle-api.js";
 
 export async function onRequestOptions() {
   return new Response(null, {
@@ -46,11 +50,9 @@ const MIME_MAP = {
   zip: "application/zip", "7z": "application/x-7z-compressed", pdf: "application/pdf"
 };
 
-// Cloudflare Free/Pro の 100 MB request-body 上限を超えないよう、十進 99 MB とする。
-const MAX_UPLOAD_BYTES = 99 * 1000 * 1000;
-const MAX_UPLOAD_LABEL = "99 MB";
-const MAX_BUFFERED_UPLOAD_BYTES = 80 * 1024 * 1024;
-const MAX_BUFFERED_UPLOAD_LABEL = "80 MiB";
+// One decimal 80 MB limit across browser, multipart and raw-body uploads.
+export const MAX_UPLOAD_BYTES = 80 * 1000 * 1000;
+const MAX_UPLOAD_LABEL = "80 MB";
 
 class UploadTooLargeError extends Error {
   constructor() {
@@ -84,10 +86,11 @@ function createSizeLimitedStream(source, maxBytes) {
   return { body, getByteLength: () => byteLength };
 }
 
-export async function putR2Upload(bucket, key, fileStream, fileBuffer, declaredLength, contentType) {
+export async function putR2Upload(bucket, key, fileStream, fileBuffer, declaredLength, contentType, contentCid = "") {
   const metadata = {
     httpMetadata: { contentType },
-    customMetadata: { size: String(declaredLength || fileBuffer?.byteLength || 0) },
+    customMetadata: { size: String(declaredLength || fileBuffer?.byteLength || 0),
+      ...(contentCid ? { contentCid } : {}) },
   };
   if (fileBuffer) {
     await bucket.put(key, fileBuffer, metadata);
@@ -110,12 +113,12 @@ export async function putR2Upload(bucket, key, fileStream, fileBuffer, declaredL
   // The input stream is already guarded by MAX_UPLOAD_BYTES; buffer only this
   // exceptional path and retain the stricter buffered ceiling.
   const buffered = await new Response(fileStream).arrayBuffer();
-  if (buffered.byteLength > MAX_BUFFERED_UPLOAD_BYTES) {
-    throw new Error(`Chunked R2 upload too large (Max: ${MAX_BUFFERED_UPLOAD_LABEL})`);
+  if (buffered.byteLength > MAX_UPLOAD_BYTES) {
+    throw new UploadTooLargeError();
   }
   await bucket.put(key, buffered, {
     ...metadata,
-    customMetadata: { size: String(buffered.byteLength) },
+    customMetadata: { size: String(buffered.byteLength), ...(contentCid ? { contentCid } : {}) },
   });
   return buffered.byteLength;
 }
@@ -164,6 +167,149 @@ function createFilebaseMultipartStream(fileStream, filename, contentType) {
 
 function isIpfsCid(value) {
   return typeof value === "string" && /^(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,})$/.test(value);
+}
+
+export async function calculateUploadCid(bytes) {
+  if (!bytes?.byteLength) throw new Error("Upload bytes are required");
+  let cid = "";
+  for await (const entry of importUnixFs(
+    [{ path: "file", content: new Uint8Array(bytes) }], new BlackHoleBlockstore(),
+    { onlyHash: true, cidVersion: 0, rawLeaves: false, wrapWithDirectory: false },
+  )) cid = entry.cid?.toString() || "";
+  if (!isIpfsCid(cid)) throw new Error("Could not determine content identity before upload");
+  return cid;
+}
+
+function streamBufferedBytes(bytes) {
+  const view = new Uint8Array(bytes);
+  let offset = 0;
+  return new ReadableStream({ pull(controller) {
+    if (offset >= view.byteLength) return controller.close();
+    const end = Math.min(offset + 256 * 1024, view.byteLength);
+    controller.enqueue(view.subarray(offset, end));
+    offset = end;
+  } });
+}
+
+// The five upload meanings are decided without physical capability. A caller
+// must reserve the canonical Link before acting on this classification.
+export function classifyUpload(binding, lifecycle, placementKind, hasProjection, objectRef) {
+  if (binding?.objectRef && binding.objectRef !== objectRef) return "conflict";
+  if (binding?.status === "RETIRING" || binding?.attempt) return "busy";
+  const sameLink = binding?.status === "BOUND";
+  const target = lifecycle?.placements?.[placementKind];
+  const anyPresent = Object.values(lifecycle?.placements || {}).some(p => p.state === "PRESENT");
+  if (sameLink && target?.state === "PRESENT" && hasProjection) return "noop";
+  if (sameLink && target?.state !== "PRESENT") return "reacquire";
+  if (anyPresent) return "peer";
+  return "create";
+}
+
+export async function reserveUploadLink(env, { linkKey, objectRef, placement, classification, attemptId }) {
+  if (classification === "conflict") {
+    const error = new Error("This Link is already bound to different content");
+    error.code = "LINK_OBJECT_CONFLICT";
+    error.status = 409;
+    throw error;
+  }
+  if (classification === "noop") return { binding: null, recovered: false };
+  const acquirePlacement = classification === "create" || classification === "reacquire";
+  try {
+    const result = await callLinkBinding(env, { action: "reserve", linkKey, objectRef,
+      attemptId, acquirePlacement, placement: acquirePlacement ? placement : null });
+    if (result.binding?.attempt?.unexpectedCid ||
+        (result.binding?.attempt?.cid && placement?.locator?.cid &&
+         result.binding.attempt.cid !== placement.locator.cid)) {
+      throw new Error("Provider CID mismatch is recorded for manual inspection; automatic retry is disabled");
+    }
+    return { binding: result.binding, recovered: false };
+  } catch (error) {
+    if (error.code !== "RESERVATION_CONFLICT" || !error.attempt ||
+        Date.now() < Number(error.attempt.expiresAt)) throw error;
+    if (error.attempt.unexpectedCid ||
+        (error.attempt.cid && placement?.locator?.cid && error.attempt.cid !== placement.locator.cid)) {
+      throw new Error("Provider CID mismatch is recorded for manual inspection; automatic retry is disabled");
+    }
+    const result = await callLinkBinding(env, { action: "takeover", linkKey, objectRef,
+      previousAttemptId: error.attempt.id, attemptId });
+    return { binding: result.binding, recovered: true };
+  }
+}
+
+export async function claimUploadPlacement(env, objectRef, placement) {
+  const requested = await callLifecycle(env, { action: "requestPlacementAcquire", objectRef, placement });
+  const current = requested.lifecycle?.placements?.[placement.kind];
+  if (current?.state === "PRESENT") return null;
+  if (current?.state !== "PIN_REQUESTED") {
+    const error = new Error("Placement acquisition is already in progress");
+    error.code = "LIFECYCLE_CONFLICT";
+    error.status = 409;
+    throw error;
+  }
+  return (await callLifecycle(env, { action: "claimPlacement", objectRef,
+    placement: placement.kind, operation: "acquire" })).claim;
+}
+
+export async function executeR2Acquisition(env, { objectRef, linkKey, attemptId, attemptGeneration,
+  claim, contentCid, key, bytes, contentType }) {
+  if (!claim) return false;
+  try {
+    const head = await env.R2_BUCKET.head(key);
+    if (head && head.customMetadata?.contentCid !== contentCid) {
+      const error = new Error("Existing R2 object has an unverified content identity");
+      error.code = "OBJECT_REF_CONFLICT";
+      error.status = 409;
+      throw error;
+    }
+    if (!head) await putR2Upload(env.R2_BUCKET, key, null, bytes, bytes.byteLength, contentType, contentCid);
+    await callLinkBinding(env, { action: "markPhysical", linkKey, attemptId,
+      generation: attemptGeneration, cid: contentCid });
+    await callLifecycle(env, { action: "reportPlacement", objectRef,
+      placement: "r2", claimId: claim.claimId, generation: claim.generation,
+      operation: "acquire", outcome: "present" });
+    return !head;
+  } catch (error) {
+    // Never delete a content-addressed Object on an uncertain response: a peer
+    // may use it. The binding retains its planned locator and attempt; after
+    // the claim lease, a retry verifies HEAD and adopts the exact same bytes.
+    await callLifecycle(env, { action: "reportPlacement", objectRef,
+      placement: "r2", claimId: claim.claimId, generation: claim.generation,
+      operation: "acquire", outcome: "retryable", error: error.message }).catch(() => {});
+    error.retryable = true;
+    throw error;
+  }
+}
+
+export async function executeFilebaseRpcAcquisition(env, { objectRef, linkKey, attemptId,
+  attemptGeneration, claim, contentCid, bytes, filename, contentType }) {
+  if (!claim) return false;
+  try {
+    // pin/ls is a read-only retry check. The RPC token must address a bucket
+    // reserved exclusively for Cividge Worker-managed RPC pins.
+    const pinned = await isManagedRpcCidPinned(env, contentCid);
+    const observedCid = pinned ? contentCid :
+      await uploadToFilebase(bytes, filename, contentType, env);
+    if (observedCid !== contentCid) {
+      await callLinkBinding(env, { action: "recordUnexpectedCid", linkKey, attemptId,
+        generation: attemptGeneration, cid: observedCid });
+      const mismatch = new Error(`Filebase returned unexpected CID ${observedCid}; manual bucket inspection required`);
+      mismatch.code = "FILEBASE_CID_MISMATCH";
+      mismatch.status = 502;
+      throw mismatch;
+    }
+    await callLinkBinding(env, { action: "markPhysical", linkKey, attemptId,
+      generation: attemptGeneration, cid: contentCid });
+    await callLifecycle(env, { action: "reportPlacement", objectRef,
+      placement: "filebase_rpc", claimId: claim.claimId, generation: claim.generation,
+      operation: "acquire", outcome: "present" });
+    return !pinned;
+  } catch (error) {
+    await callLifecycle(env, { action: "reportPlacement", objectRef,
+      placement: "filebase_rpc", claimId: claim.claimId, generation: claim.generation,
+      operation: "acquire", outcome: "retryable", error: error.message }).catch(() => {});
+    error.retryable = true;
+    throw error;
+  }
 }
 
 // ファイル名を最大100文字に制限し、超過時は安全に切り詰めてハッシュを付与
@@ -308,10 +454,10 @@ export async function onRequestPost(context) {
     const contentTypeHeader = request.headers.get("Content-Type") || "";
     const isMultipart = contentTypeHeader.includes("multipart/form-data");
     const declaredLength = Number(request.headers.get("content-length") || 0);
-    const declaredLimit = isMultipart ? MAX_BUFFERED_UPLOAD_BYTES : MAX_UPLOAD_BYTES;
-    const declaredLimitLabel = isMultipart ? MAX_BUFFERED_UPLOAD_LABEL : MAX_UPLOAD_LABEL;
-    if (declaredLength > declaredLimit) {
-      return new Response(JSON.stringify({ success: false, error: `File too large (Max: ${declaredLimitLabel})` }), {
+    // Multipart framing is not file content; validate its extracted file bytes
+    // below so an exactly-80 MB file is still accepted.
+    if (!isMultipart && declaredLength > MAX_UPLOAD_BYTES) {
+      return new Response(JSON.stringify({ success: false, error: `File too large (Max: ${MAX_UPLOAD_LABEL})` }), {
         status: 413,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
@@ -344,8 +490,7 @@ export async function onRequestPost(context) {
         });
       }
       const limited = createSizeLimitedStream(request.body, MAX_UPLOAD_BYTES);
-      fileStream = limited.body;
-      streamByteLength = limited.getByteLength;
+      fileBuffer = await new Response(limited.body).arrayBuffer();
       contentType = contentTypeHeader.split(";")[0].trim();
     }
 
@@ -361,8 +506,8 @@ export async function onRequestPost(context) {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
     }
-    if (fileBuffer && fileBuffer.byteLength > MAX_BUFFERED_UPLOAD_BYTES) {
-      return new Response(JSON.stringify({ success: false, error: `File too large (Max: ${MAX_BUFFERED_UPLOAD_LABEL})` }), {
+    if (fileBuffer && fileBuffer.byteLength > MAX_UPLOAD_BYTES) {
+      return new Response(JSON.stringify({ success: false, error: `File too large (Max: ${MAX_UPLOAD_LABEL})` }), {
         status: 413,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
@@ -451,18 +596,79 @@ export async function onRequestPost(context) {
       publicOrigin = url.origin;
     }
 
-    // 6. ストレージへの保存
+    // 6. Resolve canonical content and Link identity before touching storage.
+    const contentCid = await calculateUploadCid(fileBuffer);
     let targetCid = null;
     const storageBackend = (url.searchParams.get("storage") || request.headers.get("X-Storage-Backend") || "").trim().toLowerCase();
+    if (!["filebase", "r2"].includes(storageBackend)) throw new Error("storage=filebase or storage=r2 is required");
+    if (storageBackend === "r2" && !env.R2_BUCKET) {
+      throw new Error("R2_BUCKET binding is required before upload reservation");
+    }
+    if (storageBackend === "filebase" &&
+        (env.FILEBASE_DEDICATED_BUCKET !== "true" || !String(env.FILEBASE_IPFS_API_KEY || "").trim())) {
+      throw new Error("A Cividge Worker-RPC-exclusive Filebase bucket and FILEBASE_IPFS_API_KEY are required before upload reservation");
+    }
+    const physicalKey = `objects/${contentCid}`;
+    const objectRef = storageBackend === "r2" ? `r2:${physicalKey}` : `ipfs:${contentCid.toLowerCase()}`;
+    const linkKey = `${cleanHostname}:${shortKey}`;
+    const existingBinding = (await callLinkBinding(env, { action: "inspect", linkKey })).binding;
+    if (existingBinding?.objectRef && existingBinding.objectRef !== objectRef) {
+      const conflict = new Error("This Link is already bound to different content");
+      conflict.status = 409;
+      conflict.code = "LINK_OBJECT_CONFLICT";
+      throw conflict;
+    }
+    const currentLifecycle = (await callLifecycle(env, { action: "inspect", objectRef })).lifecycle;
+    const placementKind = storageBackend === "r2" ? "r2" : "filebase_rpc";
+    const currentProjection = existingBinding?.status === "BOUND"
+      ? await env.CIVIDGE_KV.getWithMetadata(linkKey) : null;
+    const uploadMeaning = classifyUpload(existingBinding, currentLifecycle, placementKind,
+      Boolean(currentProjection?.metadata), objectRef);
+    if (uploadMeaning === "noop") {
+      return new Response(JSON.stringify({ success: true, noOp: true,
+        url: `${publicOrigin}/${encodeURIComponent(shortKey)}`, key: shortKey, filename: shortKey,
+        size: fileBuffer.byteLength, domain: cleanHostname, storage: storageBackend,
+        cid: storageBackend === "filebase" ? contentCid : null, hasPassword: Boolean(password) }), {
+        status: 200, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store" },
+      });
+    }
+    let r2Plan = null;
+    if (storageBackend === "r2") {
+      const placement = { kind: "r2", executor: "worker", locator: { key: physicalKey } };
+      const attemptId = request.headers.get("X-Upload-Attempt-Id") || crypto.randomUUID();
+      const reservation = await reserveUploadLink(env, { linkKey, objectRef, placement,
+        classification: uploadMeaning, attemptId });
+      const needsPhysical = uploadMeaning !== "peer" &&
+        currentLifecycle?.placements?.r2?.state !== "PRESENT";
+      const claim = needsPhysical ? await claimUploadPlacement(env, objectRef, placement) : null;
+      r2Plan = { attemptId, generation: reservation.binding?.attempt?.generation, claim };
+    }
+    let filebasePlan = null;
+    if (storageBackend === "filebase") {
+      const placement = { kind: "filebase_rpc", executor: "worker",
+        provenance: "cividge_worker_rpc", locator: { cid: contentCid } };
+      const attemptId = request.headers.get("X-Upload-Attempt-Id") || crypto.randomUUID();
+      const reservation = await reserveUploadLink(env, { linkKey, objectRef, placement,
+        classification: uploadMeaning, attemptId });
+      const needsPhysical = uploadMeaning !== "peer" &&
+        currentLifecycle?.placements?.filebase_rpc?.state !== "PRESENT";
+      const claim = needsPhysical ? await claimUploadPlacement(env, objectRef, placement) : null;
+      filebasePlan = { attemptId, generation: reservation.binding?.attempt?.generation, claim };
+    }
 
     let uploadedSize = 0;
     if (storageBackend === "filebase") {
-      targetCid = fileStream
-        ? await uploadStreamToFilebase(fileStream, originalFilename || shortKey, contentType, env)
-        : await uploadToFilebase(fileBuffer, originalFilename || shortKey, contentType, env);
-      uploadedSize = fileBuffer ? fileBuffer.byteLength : streamByteLength();
+      await executeFilebaseRpcAcquisition(env, { objectRef, linkKey,
+        attemptId: filebasePlan.attemptId, attemptGeneration: filebasePlan.generation,
+        claim: filebasePlan.claim, contentCid, bytes: fileBuffer,
+        filename: originalFilename || shortKey, contentType });
+      targetCid = contentCid;
+      uploadedSize = fileBuffer.byteLength;
     } else if (storageBackend === "r2" && env.R2_BUCKET) {
-      uploadedSize = await putR2Upload(env.R2_BUCKET, shortKey, fileStream, fileBuffer, declaredLength, contentType);
+      await executeR2Acquisition(env, { objectRef, linkKey,
+        attemptId: r2Plan.attemptId, attemptGeneration: r2Plan.generation,
+        claim: r2Plan.claim, contentCid, key: physicalKey, bytes: fileBuffer, contentType });
+      uploadedSize = fileBuffer.byteLength;
     } else if (storageBackend === "r2") {
       throw new Error("R2 投稿は未設定です。Worker に R2_BUCKET binding を設定してください。");
     } else if (fileBuffer) {
@@ -488,10 +694,13 @@ export async function onRequestPost(context) {
         cid: storageBackend === "r2" ? "r2" : targetCid,
         size: uploadedSize,
         mime: contentType,
-        s3Key: shortKey,
+        s3Key: storageBackend === "r2" ? physicalKey : shortKey,
+        contentCid,
+        uploadAttemptId: r2Plan?.attemptId,
         password,
-        backend: storageBackend,
+        backend: storageBackend === "filebase" ? "filebase_rpc" : storageBackend,
         createOnly: true,
+        ...(filebasePlan ? { uploadAttemptId: filebasePlan.attemptId } : {}),
       }),
     });
     // Do not fetch the Worker's own public URL. Besides adding a second
@@ -530,8 +739,8 @@ export async function onRequestPost(context) {
     });
   } catch (err) {
     console.error("Upload error:", err);
-    return new Response(JSON.stringify({ success: false, error: err.message }), {
-      status: err instanceof UploadTooLargeError ? 413 : 500,
+    return new Response(JSON.stringify({ success: false, error: err.message, ...(err.code ? { code: err.code } : {}) }), {
+      status: err instanceof UploadTooLargeError ? 413 : (err.status || 500),
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
   }

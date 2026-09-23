@@ -33,14 +33,20 @@ export function parseCanonicalLinkKey(value) {
 function canonicalPlacement(placement, initialState = "PRESENT") {
   const kind = String(placement?.kind || "").trim().toLowerCase();
   const executor = String(placement?.executor || "").trim().toLowerCase();
-  if (!["r2", "filebase", "kubo"].includes(kind)) throw new Error("Invalid placement kind");
+  if (!["r2", "filebase", "filebase_rpc", "kubo"].includes(kind)) throw new Error("Invalid placement kind");
   if (!["worker", "browser"].includes(executor)) throw new Error("Invalid placement executor");
-  if ((kind === "r2") !== (executor === "worker")) throw new Error("Placement executor does not match capability holder");
+  if (["r2", "filebase_rpc"].includes(kind) !== (executor === "worker")) throw new Error("Placement executor does not match capability holder");
   if (!placement?.locator || typeof placement.locator !== "object") throw new Error("Placement locator is required");
+  if (kind === "filebase_rpc" &&
+      (placement.provenance !== "cividge_worker_rpc" ||
+       !/^Qm[1-9A-HJ-NP-Za-km-z]{44}$|^b[a-z2-7]{20,}$/.test(String(placement.locator.cid || "")))) {
+    throw new Error("Worker-managed Filebase RPC provenance and CID are required");
+  }
   return {
     kind,
     executor,
     locator: structuredClone(placement.locator),
+    ...(kind === "filebase_rpc" ? { provenance: "cividge_worker_rpc" } : {}),
     state: initialState,
     generation: 0,
     claim: null,
@@ -50,7 +56,8 @@ function canonicalPlacement(placement, initialState = "PRESENT") {
 }
 
 function samePlacement(left, right) {
-  return left.executor === right.executor && JSON.stringify(left.locator) === JSON.stringify(right.locator);
+  return left.executor === right.executor && left.provenance === right.provenance &&
+    JSON.stringify(left.locator) === JSON.stringify(right.locator);
 }
 
 export function newLifecycle(objectRef, placements = []) {
@@ -88,12 +95,14 @@ export function addLink(current, linkKey, placements = []) {
   if (current.state === "RELEASED" || current.state === "RELEASING") throw new Error("Object is not linkable");
   if (current.state === "RELEASE_PENDING") {
     const placements = Object.values(current.placements);
-    if (placements.some(p => p.state === "RELEASING") || placements.every(p => p.state === "RELEASED")) {
+    // RETRYABLE means physical release may already have succeeded despite a
+    // lost response. Never turn that uncertain state back into PRESENT.
+    if (placements.some(p => ["RELEASING", "RETRYABLE", "RELEASED"].includes(p.state))) {
       throw new Error("Object release has already started");
     }
     current.state = "ACTIVE";
     for (const placement of Object.values(current.placements)) {
-      if (placement.state === "RELEASE_PENDING" || placement.state === "RETRYABLE") {
+      if (placement.state === "RELEASE_PENDING") {
         placement.state = "PRESENT";
         placement.claim = null;
         placement.error = null;
@@ -172,6 +181,7 @@ export function requestPlacementRelease(current, kind) {
 }
 
 export function requestPlacementAcquire(current, rawPlacement) {
+  if (current.state === "RELEASING") throw new Error("Object release is in progress");
   const requested = canonicalPlacement(rawPlacement, "PIN_REQUESTED");
   const existing = current.placements[requested.kind];
   if (existing && ["PRESENT", "PIN_REQUESTED", "PINNING"].includes(existing.state)) return current;
@@ -179,12 +189,17 @@ export function requestPlacementAcquire(current, rawPlacement) {
   if (existing && ["RELEASE_PENDING", "RELEASING"].includes(existing.state)) {
     throw new Error("Placement release is in progress");
   }
+  if (existing?.state === "RETRYABLE" &&
+      (current.state === "RELEASE_PENDING" || existing.lastCompletedClaim?.operation === "release")) {
+    throw new Error("Placement release is retryable and must settle before reacquisition");
+  }
   if (!existing) current.placements[requested.kind] = requested;
   else {
     existing.state = "PIN_REQUESTED";
     existing.claim = null;
     existing.error = null;
   }
+  if (current.state === "RELEASED" || current.state === "RELEASE_PENDING") current.state = "ACTIVE";
   return current;
 }
 
@@ -253,6 +268,7 @@ function taskForPlacement(placement) {
     kind: placement.kind,
     executor: placement.executor,
     locator: structuredClone(placement.locator),
+    ...(placement.provenance ? { provenance: placement.provenance } : {}),
     claimId: placement.claim.claimId,
     generation: placement.claim.generation,
     operation: placement.claim.operation,

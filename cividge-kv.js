@@ -2,6 +2,7 @@
 // Cividge delivery projection API.  Link/Object lifecycle authority lives in
 // ObjectLifecycle; this module only projects canonical Links into delivery KV.
 import { callLifecycle } from "./lifecycle-api.js";
+import { callLinkBinding } from "./link-binding-api.js";
 
 export async function onRequestOptions() {
   return new Response(null, {
@@ -42,6 +43,12 @@ function objectRefForRegistration({ backend, cid, contentCid, s3Key, thumbnailKe
   }
   const ipfsCid = String(contentCid || cid || "").trim();
   if (!isRealIpfsCid(ipfsCid)) throw new Error("IPFS ObjectRef requires a CID");
+  if (normalizedBackend === "filebase_rpc") {
+    return { objectRef: `ipfs:${ipfsCid.toLowerCase()}`, placements: [{
+      kind: "filebase_rpc", executor: "worker", provenance: "cividge_worker_rpc",
+      locator: { cid: ipfsCid },
+    }] };
+  }
   const placements = [{
     kind: "filebase",
     executor: "browser",
@@ -176,7 +183,7 @@ export async function onRequestGet(context) {
       } while (cursor);
 
       const items = allRawKeys
-        .filter(k => !k.name.startsWith("blob_"))
+        .filter(k => !k.name.startsWith("blob_") && !k.name.startsWith("config:"))
         .map(k => ({
           name: k.name,
           metadata: unpackMetadata(k.name, "", k.metadata),
@@ -243,8 +250,8 @@ export async function onRequestPost(context) {
 
   // サーバー側サイズガード: クライアント側チェックのすり抜け防止
   const contentLength = request.headers.get("content-length");
-  if (contentLength && parseInt(contentLength, 10) > 80 * 1024 * 1024) {
-    return new Response(JSON.stringify({ error: "File too large (Max: 80MB)" }), {
+  if (contentLength && parseInt(contentLength, 10) > 80_000_000) {
+    return new Response(JSON.stringify({ error: "File too large (Max: 80 MB)" }), {
       status: 413,
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
@@ -253,6 +260,13 @@ export async function onRequestPost(context) {
   try {
     const body = await request.json();
     let { key, cid, size, mime, lastModified, password, dataBase64, ttl, expiresAt, thumbnailKey, width, height, contentCid, backend } = body;
+    if ((Number.isFinite(Number(size)) && Number(size) > 80_000_000) ||
+        (typeof dataBase64 === "string" && Math.floor(dataBase64.length * 3 / 4) > 80_000_000)) {
+      return new Response(JSON.stringify({ error: "File too large (Max: 80 MB)" }), {
+        status: 413,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
 
     const link = parseCanonicalLinkKey(key);
     if (!link) {
@@ -275,13 +289,6 @@ export async function onRequestPost(context) {
     } catch (e) {}
 
     const existingCid = existingValue || (existingMetadata && (existingMetadata.c || existingMetadata.cid)) || "";
-    if (existingMetadata && body.createOnly) {
-      return new Response(JSON.stringify({ error: "Conflict: Link already exists.", code: "LINK_CONFLICT" }), {
-        status: 409,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-      });
-    }
-
     // 🛡️ CID衝突ガード:
     // 同一ファイル名が既に存在し、かつ中身（実体CID）が異なる場合は上書き破壊を防ぐため409 Conflictで弾く。
     // ※ "r2" というマーカー値は IPFS CID ではないため、R2 のメタデータ更新や CID 同期時には衝突とみなさない。
@@ -388,7 +395,8 @@ export async function onRequestPost(context) {
     // 圧縮メタデータオブジェクト（1レコード数十バイトに極小化）
     // c: cid, s: size, t: lastModified(秒), f: flags(ビット), e: expiresAt(秒), k: lastKuboPinAttempt(秒), d: allowedHost, w/h: image dimensions
     const inheritedSize = Number(size) || (existingMetadata && (existingMetadata.s || existingMetadata.size)) || 0;
-    const inheritedS3Key = body.s3Key || (existingMetadata && (existingMetadata.k_s3 || existingMetadata.s3Key)) || key;
+    const inheritedS3Key = body.backend === "filebase_rpc" ? "" :
+      (body.s3Key || (existingMetadata && (existingMetadata.k_s3 || existingMetadata.s3Key)) || key);
     const inheritedThumbnailKey = thumbnailKey || (existingMetadata && (existingMetadata.th || existingMetadata.thumbnailKey)) || "";
     const inheritedWidth = Math.floor(Number(width)) || (existingMetadata && Math.floor(Number(existingMetadata.w ?? existingMetadata.width))) || 0;
     const inheritedHeight = Math.floor(Number(height)) || (existingMetadata && Math.floor(Number(existingMetadata.h ?? existingMetadata.height))) || 0;
@@ -408,7 +416,7 @@ export async function onRequestPost(context) {
     if (existingMetadata) {
       const existingObject = objectRefForExisting(existingValue, existingMetadata);
       if (existingObject.objectRef !== lifecycle.objectRef) {
-        return new Response(JSON.stringify({ error: "A Link cannot be reassigned to a different ObjectRef; remove it and create a new Link instead." }), {
+        return new Response(JSON.stringify({ error: "A Link cannot be reassigned to a different ObjectRef; remove it and create a new Link instead.", code: "OBJECT_REF_CONFLICT" }), {
           status: 409,
           headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
         });
@@ -431,6 +439,45 @@ export async function onRequestPost(context) {
       ...passwordMeta,
     };
 
+    if (!existingMetadata) {
+      const knownObject = (await callLifecycle(env, { action: "inspect", objectRef: lifecycle.objectRef })).lifecycle;
+      if (!knownObject || !Object.values(knownObject.placements || {}).some(p => p.state === "PRESENT")) {
+        return new Response(JSON.stringify({ error: "Object has no confirmed Placement", code: "PLACEMENT_NOT_PRESENT" }), {
+          status: 409,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+        });
+      }
+      if (inheritedBackend === "filebase_rpc" &&
+          (knownObject.placements?.filebase_rpc?.state !== "PRESENT" ||
+           knownObject.placements.filebase_rpc.provenance !== "cividge_worker_rpc")) {
+        return new Response(JSON.stringify({ error: "Worker RPC Placement has no confirmed provenance", code: "PLACEMENT_NOT_PRESENT" }), {
+          status: 409, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+        });
+      }
+    }
+
+    // The canonical Link key has its own uniqueness authority. KV is a
+    // projection and cannot serialize two different ObjectRefs racing for it.
+    const bindingAttemptId = body.uploadAttemptId || `peer:${lifecycle.objectRef}`;
+    let binding;
+    try {
+      binding = (await callLinkBinding(env, {
+        action: "reserve", linkKey: key, objectRef: lifecycle.objectRef,
+        attemptId: bindingAttemptId,
+      })).binding;
+    } catch (error) {
+      return new Response(JSON.stringify({ error: error.message, code: error.code || "RESERVATION_CONFLICT" }), {
+        status: error.status || 409,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+    if (existingMetadata && body.createOnly && binding.status === "BOUND" && !binding.attempt) {
+      return new Response(JSON.stringify({ success: true, noOp: true, key, objectRef: lifecycle.objectRef }), {
+        status: 200,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+
     // Authorize the Link relation before publishing the delivery projection.
     // If KV publication fails afterwards, a harmless orphan membership remains;
     // the reverse ordering could make a live URL invisible to lifecycle authority.
@@ -446,11 +493,13 @@ export async function onRequestPost(context) {
         action: "createLink",
         objectRef: lifecycle.objectRef,
         linkKey: key,
-        placements: lifecycle.placements,
+        // A Link publication cannot assert physical provenance. Acquisition
+        // must already have been confirmed by the lifecycle authority.
+        placements: [],
         // Only an explicit storage upload / verified duplicate may attest that
         // a physical Placement is PRESENT again. Alias-only createLink calls
         // intentionally cannot resurrect a released Object.
-        confirmedPlacements: body.confirmPlacementPresent ? lifecycle.placements : [],
+        confirmedPlacements: [],
       })).lifecycle;
     }
     finalKuboStatus = lifecycleState?.placements?.kubo?.state === "PRESENT" ? "pinned" : "not_pinned";
@@ -462,6 +511,8 @@ export async function onRequestPost(context) {
     // canonical keyで一回だけ読み、DOやstorageを参照しない。
     const putOptions = { metadata: compressedMeta };
     await env.CIVIDGE_KV.put(key, safeCid, putOptions);
+    await callLinkBinding(env, { action: "commit", linkKey: key, attemptId: bindingAttemptId,
+      generation: binding.attempt?.generation });
 
     // クライアント側へは旧形式互換のオブジェクトも含めて返却
     const returnedMeta = {
@@ -533,15 +584,18 @@ export async function onRequestDelete(context) {
     }
     const existing = await env.CIVIDGE_KV.getWithMetadata(key);
     if (!existing?.metadata) {
-      const retryObjectRef = url.searchParams.get("objectRef");
-      if (retryObjectRef) {
-        await callLifecycle(env, { action: "completeRemoveLink", objectRef: retryObjectRef, linkKey: canonical.key });
+      const binding = (await callLinkBinding(env, { action: "inspect", linkKey: canonical.key })).binding;
+      if (binding?.status === "RETIRING") {
+        await callLifecycle(env, { action: "completeRemoveLink", objectRef: binding.objectRef, linkKey: canonical.key });
+        await callLinkBinding(env, { action: "completeRemove", linkKey: canonical.key });
       }
       return new Response(JSON.stringify({ success: true, deletedKey: canonical.key, alreadyAbsent: true }), {
         status: 200, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
     }
     const lifecycle = objectRefForExisting(existing.value || "", existing.metadata);
+
+    await callLinkBinding(env, { action: "beginRemove", linkKey: canonical.key });
 
     // The authority first marks the Link as retiring. It still counts as a
     // reference until KV deletion succeeds, so a partial failure cannot make
@@ -578,6 +632,7 @@ export async function onRequestDelete(context) {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
     }
+    await callLinkBinding(env, { action: "completeRemove", linkKey: canonical.key });
 
     // 🚀 リンク抹消: エッジに残っている画像キャッシュを即座に消滅させる
     context.waitUntil?.(purgeHybridCache(request, env, canonical.key)) || purgeHybridCache(request, env, canonical.key);
