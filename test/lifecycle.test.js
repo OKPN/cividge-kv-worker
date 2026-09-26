@@ -379,6 +379,45 @@ test("a retryable release converges after exact read-only placement observation"
   assert.deepEqual(state.links, ["public.example:new.webp"]);
 });
 
+test("a released v1 Filebase Object can reacquire its owned locator without losing identity", async () => {
+  const cid = "Qm" + "a".repeat(44);
+  const objectRef = `ipfs:${cid.toLowerCase()}`;
+  const placement = { kind: "filebase", executor: "browser", locator: { key: "old-name.webp", cid } };
+  const released = newLifecycle(objectRef, [placement]);
+  released.version = 1;
+  delete released.pendingLinkRemovals;
+  released.state = "RELEASED";
+  released.placements.filebase.state = "RELEASED";
+  const values = new Map([["lifecycle", released]]);
+  const lifecycle = new ObjectLifecycle({ storage: {
+    get: async key => structuredClone(values.get(key)),
+    put: async (key, value) => values.set(key, structuredClone(value)),
+    setAlarm: async () => {}, deleteAlarm: async () => {},
+  } }, {});
+  const action = async (name, extra = {}) => {
+    const response = await lifecycle.fetch(new Request("https://object-lifecycle.internal/", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: name, objectRef, ...extra }),
+    }));
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+
+  const inspected = await action("inspect");
+  assert.deepEqual(inspected.lifecycle.pendingLinkRemovals, []);
+  assert.equal(values.get("lifecycle").version, 1, "inspection does not mutate storage");
+  await action("reconcilePlacementForAcquire", { placement, observation: "absent" });
+  await action("requestPlacementAcquire", { placement });
+  const claimed = await action("claimPlacement", { placement: "filebase", operation: "acquire" });
+  await action("reportPlacement", { placement: "filebase", claimId: claimed.claim.claimId,
+    generation: claimed.claim.generation, operation: "acquire", outcome: "present" });
+  const linked = await action("createLink", { linkKey: "public.example:new-name.webp", placements: [placement] });
+  assert.equal(linked.lifecycle.version, 2);
+  assert.deepEqual(linked.lifecycle.links, ["public.example:new-name.webp"]);
+  assert.equal(linked.lifecycle.placements.filebase.locator.key, "old-name.webp");
+  assert.equal(linked.lifecycle.placements.filebase.state, "PRESENT");
+});
+
 test("present inspection can adopt a retryable release but never an active claim", () => {
   const placement = { kind: "r2", executor: "worker", locator: { key: "objects/cid" } };
   const state = newLifecycle("r2:objects/cid", [placement]);

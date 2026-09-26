@@ -32,6 +32,13 @@ export class ObjectLifecycle {
 
     let state = await this.ctx.storage.get(STATE_KEY);
     if (state && state.objectRef !== object.objectRef) return json({ error: "Durable Object identity mismatch" }, 409);
+    // Persisted v1 lifecycles had no pending-removal set. At the authority
+    // boundary, represent that absence as the empty set before any transition.
+    // An inspect remains read-only; the next mutation persists the v2 shape.
+    if (state && !Array.isArray(state.pendingLinkRemovals)) {
+      state.pendingLinkRemovals = [];
+      state.version = 2;
+    }
     if (state && recoverExpiredPlacementClaims(state)) await this.persist(state);
     const action = body.action;
     try {
