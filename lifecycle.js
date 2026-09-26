@@ -6,6 +6,7 @@ import {
   newLifecycle,
   parseObjectRef,
   recoverExpiredPlacementClaims,
+  reconcilePlacementForAcquire,
   reportPlacement,
   requestPlacementAcquire,
   requestPlacementRelease,
@@ -68,6 +69,9 @@ export class ObjectLifecycle {
         // Placement begins as PIN_REQUESTED, never falsely PRESENT.
         state = state || newLifecycle(object.objectRef, []);
         requestPlacementAcquire(state, body.placement);
+      } else if (action === "reconcilePlacementForAcquire") {
+        if (!state) return json({ error: "Object lifecycle not found" }, 404);
+        reconcilePlacementForAcquire(state, body.placement, body.observation);
       } else if (action === "claimPlacement") {
         if (!state) return json({ error: "Object lifecycle not found" }, 404);
         const claim = claimPlacement(state, body.placement, body.operation, crypto.randomUUID());

@@ -237,6 +237,23 @@ export async function reserveUploadLink(env, { linkKey, objectRef, placement, cl
 }
 
 export async function claimUploadPlacement(env, objectRef, placement) {
+  const inspected = (await callLifecycle(env, { action: "inspect", objectRef })).lifecycle;
+  const previous = inspected?.placements?.[placement.kind];
+  if (previous && ["RELEASE_PENDING", "RETRYABLE", "RELEASED"].includes(previous.state)) {
+    let present;
+    if (placement.kind === "r2") {
+      const head = await env.R2_BUCKET.head(placement.locator.key);
+      if (head && ![head.customMetadata?.cid, head.customMetadata?.hash, head.customMetadata?.contentCid]
+        .includes(placement.locator.key.replace(/^objects\//, ""))) {
+        throw new Error("Existing R2 object has an unverified content identity");
+      }
+      present = Boolean(head);
+    } else if (placement.kind === "filebase_rpc") {
+      present = await isManagedRpcCidPinned(env, placement.locator.cid);
+    } else throw new Error("Unsupported Worker placement");
+    await callLifecycle(env, { action: "reconcilePlacementForAcquire", objectRef, placement,
+      observation: present ? "present" : "absent" });
+  }
   const requested = await callLifecycle(env, { action: "requestPlacementAcquire", objectRef, placement });
   const current = requested.lifecycle?.placements?.[placement.kind];
   if (current?.state === "PRESENT") return null;

@@ -45,6 +45,29 @@ miss must never authorize release or trigger storage discovery.
   a `RELEASED` Placement through a new generation and then recreate the Link.
   `RELEASING` always remains non-linkable until its claim completes or expires.
 
+### [INV-RETRYABLE-RELEASE-CONVERGES]
+
+A failed release is not a permanent ban on a canonical ObjectRef. An explicit
+upload may inspect the same physical locator before PUT and reconcile an
+unclaimed RELEASE_PENDING / RETRYABLE Placement to PRESENT when verified, or
+RELEASED when absent. Active claims, mismatched locators, and unverified
+content identity cannot be overridden. This does not authorize physical
+deletion or erase release history.
+
+### [INV-CANONICAL-404-SELF-CONTAINED]
+
+Human navigation 404 HTML embeds its character image. Rendering needs no
+second HTTP request, and a stale cached SVG or older dependent HTML 404 must
+not replace the complete page. The separate character endpoint remains only
+for the relay compatibility probe.
+
+### [INV-READ-YOUR-WRITES]
+
+An acknowledged Link expiry policy has a monotonic revision in LinkBinding.
+Admin list/lookup overlays this authority onto eventually consistent KV
+metadata so an older observation cannot roll back the displayed TTL. Public
+delivery remains a single KV lookup and may reflect the policy later.
+
 ---
 
 ## 0. アーキテクチャの根本原則と倫理憲章 (Core Architecture Principles)

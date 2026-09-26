@@ -36,8 +36,23 @@ export async function onRequestPost({ request, env }) {
     const rpcReport = body.action === "reportPlacement" && body.placement === "filebase_rpc" && body.operation === "acquire";
     const rpcCreate = body.action === "createLink" &&
       [...(body.placements || []), ...(body.confirmedPlacements || [])].some(p => p.kind === "filebase_rpc");
-    if (rpcAcquire || rpcClaim || rpcReport || rpcCreate) {
+    const workerReconcile = body.action === "reconcilePlacementForAcquire" && body.placement?.kind === "filebase_rpc";
+    if (rpcAcquire || rpcClaim || rpcReport || rpcCreate || workerReconcile) {
       return json({ error: "Worker-managed RPC provenance cannot be asserted by an admin client" }, 403);
+    }
+    if (body.action === "reconcilePlacementForAcquire") {
+      const kind = body.placement?.kind;
+      if (kind === "r2") {
+        const key = body.placement?.locator?.key;
+        if (!key || body.objectRef !== `r2:${key}` || !env.R2_BUCKET) throw new Error("R2 ObjectRef and binding are required");
+        const head = await env.R2_BUCKET.head(key);
+        if (head && ![head.customMetadata?.cid, head.customMetadata?.hash, head.customMetadata?.contentCid]
+          .includes(key.replace(/^objects\//, ""))) throw new Error("R2 content identity cannot be verified");
+        body.observation = head ? "present" : "absent";
+      } else if (kind === "filebase") {
+        if (body.observation === "present" &&
+            body.observedCid !== body.placement?.locator?.cid) throw new Error("Filebase CID cannot be verified");
+      } else throw new Error("Unsupported placement reconciliation");
     }
     const payload = await callLifecycle(env, body);
     if (body.action === "requestRelease" || body.action === "requestPlacementRelease") {

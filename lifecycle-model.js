@@ -203,6 +203,28 @@ export function requestPlacementAcquire(current, rawPlacement) {
   return current;
 }
 
+// A release retry is not a permanent ban on this ObjectRef. An explicit
+// re-upload may inspect the *same* physical locator before any PUT and settle
+// an uncertain release. This never infers presence from a failed cleanup.
+export function reconcilePlacementForAcquire(current, rawPlacement, observation) {
+  if (current.links.length || current.pendingLinkRemovals.length || current.state === "RELEASING") {
+    throw new Error("Object cannot be reconciled during link or release mutation");
+  }
+  const requested = canonicalPlacement(rawPlacement, "ABSENT");
+  const existing = current.placements[requested.kind];
+  if (!existing || !samePlacement(existing, requested)) throw new Error("Placement locator mismatch");
+  if (!["RELEASE_PENDING", "RETRYABLE", "RELEASED"].includes(existing.state) || existing.claim) {
+    throw new Error("Placement does not need release reconciliation");
+  }
+  if (observation !== "present" && observation !== "absent") throw new Error("Verified placement observation is required");
+  existing.state = observation === "present" ? "PRESENT" : "RELEASED";
+  existing.error = null;
+  current.state = Object.values(current.placements).every(p => p.state === "RELEASED")
+    ? "RELEASED" : Object.values(current.placements).some(p => p.state === "PRESENT")
+      ? "ACTIVE" : "RELEASE_PENDING";
+  return current;
+}
+
 export function claimPlacement(current, kind, operation, claimId, now = Date.now()) {
   const placement = current.placements[String(kind || "").toLowerCase()];
   if (!placement) throw new Error("Unknown placement");

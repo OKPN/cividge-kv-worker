@@ -18,6 +18,7 @@ import {
   requestPlacementRelease,
   requestRelease,
   recoverExpiredPlacementClaims,
+  reconcilePlacementForAcquire,
   PLACEMENT_CLAIM_LEASE_MS,
   removeLink,
 } from "../lifecycle-model.js";
@@ -100,6 +101,51 @@ test("unknown media uses exactly one canonical host-qualified KV lookup", async 
   assert.deepEqual(kv.calls.get, ["public.example:missing.webp"]);
 });
 
+test("human HTML 404 embeds its character without a second request", async () => {
+  const kv = memoryKv();
+  const response = await deliver({ ...context("https://public.example/missing.webp", { CIVIDGE_KV: kv }),
+    request: new Request("https://public.example/missing.webp", {
+      headers: { "Sec-Fetch-Mode": "navigate", Accept: "image/webp" },
+    }) });
+  const html = await response.text();
+  assert.equal(response.status, 404);
+  assert.match(html, /src="data:image\/webp;base64,[A-Za-z0-9+/=]+"/);
+  assert.doesNotMatch(html, /src="\/404-character\.webp"|onerror=/);
+});
+
+test("a cached SVG 404 cannot replace a human navigation", async () => {
+  const prior = globalThis.caches;
+  const kv = memoryKv();
+  globalThis.caches = { default: {
+    match: async () => new Response("<svg/>", { status: 404, headers: { "Content-Type": "image/svg+xml" } }),
+    put: async () => {},
+  } };
+  try {
+    const response = await deliver({ ...context("https://public.example/missing.webp", { CIVIDGE_KV: kv }),
+      request: new Request("https://public.example/missing.webp", {
+        headers: { "Sec-Fetch-Mode": "navigate", Accept: "image/webp" },
+      }) });
+    assert.equal(response.headers.get("content-type"), "text/html; charset=utf-8");
+    assert.match(await response.text(), /src="data:image\/webp;base64,/);
+    assert.deepEqual(kv.calls.get, []);
+  } finally { globalThis.caches = prior; }
+});
+
+test("an older cached HTML 404 with a dependent image is replaced", async () => {
+  const prior = globalThis.caches;
+  globalThis.caches = { default: {
+    match: async () => new Response('<img src="/404-character.webp">', {
+      status: 404, headers: { "Content-Type": "text/html" },
+    }),
+    put: async () => {},
+  } };
+  try {
+    const response = await deliver({ ...context("https://public.example/missing.webp", { CIVIDGE_KV: memoryKv() }),
+      request: new Request("https://public.example/missing.webp", { headers: { Accept: "text/html" } }) });
+    assert.match(await response.text(), /src="data:image\/webp;base64,/);
+  } finally { globalThis.caches = prior; }
+});
+
 test("relay probe identifies only the uniquely allowed canonical public host", async () => {
   const env = { STATIC_RELAY_PUBLIC_HOSTS: "content-relay.pages.dev,content-cache.pages.dev" };
   const correct = await deliver(context("https://relay.example/r/content-cache/404-character.webp", env));
@@ -111,6 +157,21 @@ test("relay probe identifies only the uniquely allowed canonical public host", a
     STATIC_RELAY_PUBLIC_HOSTS: "content-cache.pages.dev,content-cache.example",
   }));
   assert.equal(ambiguous.status, 404);
+});
+
+test("relay identity probe bypasses a stale cached character 404", async () => {
+  const prior = globalThis.caches;
+  globalThis.caches = { default: {
+    match: async () => new Response("<svg/>", { status: 404, headers: { "Content-Type": "image/svg+xml" } }),
+    put: async () => {},
+  } };
+  try {
+    const response = await deliver(context("https://relay.example/r/content-cache/404-character.webp", {
+      STATIC_RELAY_PUBLIC_HOSTS: "content-cache.pages.dev",
+    }));
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-cividge-relay-host"), "content-cache.pages.dev");
+  } finally { globalThis.caches = prior; }
 });
 
 test("retired Link generation hides stale KV and explicit rebind creates a newer generation", async () => {
@@ -146,6 +207,34 @@ test("retired Link generation hides stale KV and explicit rebind creates a newer
   assert.deepEqual((await (await list()).json()).files, []); // old KV projection is still stale
   records.set(key, { value: "r2", metadata: { b: "r2", k_s3: "new", g: reserved.generation } });
   assert.equal((await (await list()).json()).files.length, 1);
+});
+
+test("admin list and lookup never regress behind acknowledged Link expiry policy", async () => {
+  const key = "public.example:ttl.webp";
+  const env = { ADMIN_API_TOKEN: "secret", LINK_BINDING: memoryBindingNamespace() };
+  await bindExisting(env, key, "r2:objects/ttl");
+  const binding = (await callLinkBinding(env, { action: "inspect", linkKey: key })).binding;
+  const oldExpiry = Date.now() + 3 * 86400000;
+  const newExpiry = Date.now() + 7 * 86400000;
+  const records = new Map([[key, { value: "r2", metadata: { b: "r2", k_s3: "objects/ttl",
+    g: binding.generation, e: Math.floor(oldExpiry / 1000) } }]]);
+  env.CIVIDGE_KV = {
+    getWithMetadata: async name => records.get(name) || { value: null, metadata: null },
+    list: async () => ({ keys: [...records].map(([name, entry]) => ({ name, metadata: entry.metadata })), list_complete: true }),
+  };
+  await callLinkBinding(env, { action: "acknowledgePolicy", linkKey: key,
+    generation: binding.generation, expiresAt: newExpiry });
+  const headers = { Authorization: "Bearer secret" };
+  const list = await onRequestGet({ request: new Request("https://worker.example/api/cividge-kv", { headers }), env });
+  const listed = (await list.json()).files[0].metadata;
+  assert.equal(listed.expiresAt, Math.floor(newExpiry / 1000) * 1000);
+  assert.equal(listed.policyRevision, 1);
+  const lookup = await onRequestGet({ request: new Request(`https://worker.example/api/cividge-kv?key=${encodeURIComponent(key)}`, { headers }), env });
+  assert.equal((await lookup.json()).metadata.policyRevision, 1);
+  await callLinkBinding(env, { action: "acknowledgePolicy", linkKey: key,
+    generation: binding.generation, expiresAt: null });
+  const cleared = await onRequestGet({ request: new Request("https://worker.example/api/cividge-kv", { headers }), env });
+  assert.equal((await cleared.json()).files[0].metadata.expiresAt, null);
 });
 
 test("Placement reacquisition does not change a live Link generation", async () => {
@@ -269,6 +358,39 @@ test("release is persisted before external execution and can retry safely", () =
   const second = claimPlacement(state, "filebase", "release", "claim-2").task;
   reportPlacement(state, "filebase", { ...second, outcome: "released" });
   assert.equal(state.state, "RELEASED");
+});
+
+test("a retryable release converges after exact read-only placement observation", () => {
+  const placement = { kind: "filebase", executor: "browser", locator: { key: "objects/cid", cid: "cid" } };
+  const state = newLifecycle("ipfs:cid", [placement]);
+  addLink(state, "public.example:old.webp");
+  removeLink(state, "public.example:old.webp");
+  requestRelease(state);
+  const claim = claimPlacement(state, "filebase", "release", "release-1").task;
+  reportPlacement(state, "filebase", { ...claim, outcome: "retryable" });
+  assert.throws(() => requestPlacementAcquire(state, placement), /must settle/);
+  reconcilePlacementForAcquire(state, placement, "absent");
+  assert.equal(state.state, "RELEASED");
+  requestPlacementAcquire(state, placement);
+  const acquire = claimPlacement(state, "filebase", "acquire", "acquire-1").task;
+  reportPlacement(state, "filebase", { ...acquire, outcome: "present" });
+  addLink(state, "public.example:new.webp");
+  assert.equal(state.placements.filebase.state, "PRESENT");
+  assert.deepEqual(state.links, ["public.example:new.webp"]);
+});
+
+test("present inspection can adopt a retryable release but never an active claim", () => {
+  const placement = { kind: "r2", executor: "worker", locator: { key: "objects/cid" } };
+  const state = newLifecycle("r2:objects/cid", [placement]);
+  requestRelease(state);
+  const claim = claimPlacement(state, "r2", "release", "release-1").task;
+  assert.throws(() => reconcilePlacementForAcquire(state, placement, "present"), /cannot be reconciled/);
+  reportPlacement(state, "r2", { ...claim, outcome: "retryable" });
+  assert.throws(() => reconcilePlacementForAcquire(state,
+    { ...placement, locator: { key: "other" } }, "present"), /locator mismatch/);
+  reconcilePlacementForAcquire(state, placement, "present");
+  addLink(state, "public.example:again.webp");
+  assert.equal(state.state, "ACTIVE");
 });
 
 test("a Link can cancel pending release but never resurrect releasing content", () => {

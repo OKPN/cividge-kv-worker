@@ -141,7 +141,14 @@ async function isCurrentLinkProjection(env, key, metadata) {
   if (!parseCanonicalLinkKey(key)) return false;
   const { binding } = await callLinkBinding(env, { action: "inspect", linkKey: key });
   return binding?.status === "BOUND" && Number.isSafeInteger(Number(metadata?.g)) &&
-    Number(metadata.g) === binding.generation;
+    Number(metadata.g) === binding.generation ? binding : null;
+}
+
+function withCurrentPolicy(metadata, binding) {
+  if (!binding?.policy) return metadata;
+  const expiresAt = binding.policy.expiresAt;
+  return { ...metadata, e: expiresAt ? Math.floor(expiresAt / 1000) : 0,
+    expiresAt: expiresAt || null, policyRevision: binding.policy.revision };
 }
 
 // GET: 単一キーの照会、または全キーの一覧取得
@@ -199,7 +206,7 @@ export async function onRequestGet(context) {
         const current = await Promise.all(batch.map(k => isCurrentLinkProjection(env, k.name, k.metadata)));
         for (let index = 0; index < batch.length; index++) {
           if (current[index]) items.push({ name: batch[index].name,
-            metadata: unpackMetadata(batch[index].name, "", batch[index].metadata) });
+            metadata: unpackMetadata(batch[index].name, "", withCurrentPolicy(batch[index].metadata, current[index])) });
         }
       }
 
@@ -219,8 +226,8 @@ export async function onRequestGet(context) {
   // 2. key パラメータがある場合は単一照会
   try {
     const value = await env.CIVIDGE_KV.getWithMetadata(key);
-    if (!value || value.value === null || value.value === undefined ||
-        !(await isCurrentLinkProjection(env, key, value.metadata))) {
+    const binding = value && await isCurrentLinkProjection(env, key, value.metadata);
+    if (!value || value.value === null || value.value === undefined || !binding) {
       return new Response(JSON.stringify({ found: false, key }), {
         status: 404,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
@@ -230,7 +237,7 @@ export async function onRequestGet(context) {
       found: true,
       key,
       cid: value.value,
-      metadata: unpackMetadata(key, value.value, value.metadata),
+      metadata: unpackMetadata(key, value.value, withCurrentPolicy(value.metadata, binding)),
     }), {
       status: 200,
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
@@ -385,6 +392,11 @@ export async function onRequestPost(context) {
     } else if (existingMetadata && (existingMetadata.e || existingMetadata.expiresAt)) {
       calculatedExpiresAt = existingMetadata.e ? existingMetadata.e * 1000 : existingMetadata.expiresAt;
     }
+    // LinkBinding owns the last acknowledged admin policy. A stale KV read
+    // cannot silently turn an unrelated metadata write into an expiry rollback.
+    if (bindingAtStart?.policy && body.policyChange !== true) {
+      calculatedExpiresAt = bindingAtStart.policy.expiresAt;
+    }
 
     // 既存の kuboStatus を引き継ぐ、または body から取得
     let existingKuboStatus = body.kuboStatus;
@@ -530,6 +542,10 @@ export async function onRequestPost(context) {
     await env.CIVIDGE_KV.put(key, safeCid, putOptions);
     await callLinkBinding(env, { action: "commit", linkKey: key, attemptId: bindingAttemptId,
       generation: binding.attempt?.generation });
+    const acknowledgedPolicy = body.policyChange === true || !bindingAtStart?.policy
+      ? (await callLinkBinding(env, { action: "acknowledgePolicy", linkKey: key,
+        generation: binding.generation, expiresAt: calculatedExpiresAt || null })).binding.policy
+      : bindingAtStart.policy;
 
     // クライアント側へは旧形式互換のオブジェクトも含めて返却
     const returnedMeta = {
@@ -545,6 +561,7 @@ export async function onRequestPost(context) {
       backend: inheritedBackend || null,
       ...(compressedMeta.w && compressedMeta.h ? { width: compressedMeta.w, height: compressedMeta.h } : {}),
       ...(calculatedExpiresAt ? { expiresAt: calculatedExpiresAt } : {}),
+      policyRevision: acknowledgedPolicy.revision,
       ...(civitaiTemporary ? { civitaiTemporary: true, ct: 1 } : {}),
       ...compressedMeta,
     };

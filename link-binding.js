@@ -86,6 +86,14 @@ export class LinkBinding {
         requireAttempt(state, body.attemptId, body.generation);
         state.status = "BOUND";
         state.attempt = null;
+      } else if (action === "acknowledgePolicy") {
+        if (state.status !== "BOUND" || state.attempt ||
+            Number(body.generation) !== state.generation) throw new Error("Link policy generation is stale");
+        const expiresAt = body.expiresAt === null ? null : Number(body.expiresAt);
+        if (expiresAt !== null && (!Number.isFinite(expiresAt) || expiresAt <= 0)) {
+          throw new Error("Invalid Link expiry policy");
+        }
+        state.policy = { expiresAt, revision: (state.policy?.revision || 0) + 1 };
       } else if (action === "beginRemove") {
         if (state.status === "RETIRING") return json({ binding: state });
         if (state.status !== "BOUND" || state.attempt) throw new Error("Link is not removable");
@@ -96,6 +104,7 @@ export class LinkBinding {
         // a future explicit rebind of the same canonical Link key.
         state.status = "RETIRED";
         state.attempt = null;
+        state.policy = null;
       } else if (action === "abort") {
         requireAttempt(state, body.attemptId, body.generation);
         // The actuator must first attest that the planned physical key is

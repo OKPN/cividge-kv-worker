@@ -101,7 +101,7 @@ const CATBOX_404_HTML = `<!DOCTYPE html>
   <div class="container">
     <div class="error-code">404</div>
     <div class="question-mark">?</div>
-    <img class="character-img" src="/404-character.webp" alt="404 Not Found" onerror="this.onerror=null; this.src='data:image/webp;base64,${CHARACTER_WEBP_BASE64}';">
+    <img class="character-img" src="data:image/webp;base64,${CHARACTER_WEBP_BASE64}" alt="404 Not Found">
     <div class="message">The file you're looking for doesn't exist<br>or has been removed.</div>
     <a href="/" class="home-link">Click me to go home</a>
   </div>
@@ -385,15 +385,20 @@ function renderOgpHtml(filename, rawUrl, ext, isVideo, origin, thumbnailKey = nu
 </html>`;
 }
 
+function wantsHumanNotFound(request) {
+  return request.headers.get("sec-fetch-mode") === "navigate" ||
+    request.headers.get("sec-fetch-dest") === "document" ||
+    (request.headers.get("accept") || "").includes("text/html");
+}
+
 function renderNotFoundResponse(request, cdnCacheSeconds = 300, context = null) {
-  const accept = request.headers.get("accept") || "";
   const headers = {
     // 公開メディアの miss は短時間負のキャッシュに載せる（DoS・枠枯渇防止）
     "Cache-Control": cdnCacheSeconds > 0 ? `public, max-age=${cdnCacheSeconds}` : "no-store",
     ...(cdnCacheSeconds > 0 ? { "Cloudflare-CDN-Cache-Control": `public, max-age=${cdnCacheSeconds}` } : {}),
   };
 
-  const isHtml = accept.includes("text/html");
+  const isHtml = wantsHumanNotFound(request);
   const res = new Response(isHtml ? CATBOX_404_HTML : CATBOX_404_SVG, {
     status: 404,
     headers: {
@@ -487,10 +492,26 @@ export async function onRequest(context) {
   // ⚡ エッジキャッシュ（Cache API）最前線ガード:
   // 過去にアクセスされた正常メディアまたは 404 レスポンスは、KV を叩かず即座に返却（KV消費 0回）
   const edgeCache = typeof caches !== "undefined" ? caches.default : null;
-  if (edgeCache && (request.method === "GET" || request.method === "HEAD")) {
+  // The compatibility probe must reach the current relay-id resolution. An
+  // old cached SVG 404 is not proof that this Pages host is registered.
+  const characterProbe = /(?:^|\/)404-character\.webp$/.test(new URL(request.url).pathname);
+  if (!characterProbe && edgeCache && (request.method === "GET" || request.method === "HEAD")) {
     try {
       const cached = await edgeCache.match(request);
-      if (cached) return cached;
+      if (cached) {
+        if (cached.status === 404) {
+          const cachedIsHtml = (cached.headers.get("content-type") || "").includes("text/html");
+          const human = wantsHumanNotFound(request);
+          const oldDependentHtml = human && cachedIsHtml &&
+            !(await cached.clone().text()).includes('src="data:image/webp;base64,');
+          if (cachedIsHtml !== human || oldDependentHtml) {
+            // Cache API keys do not distinguish navigation from image fetches.
+            // A stale SVG 404 must not replace the complete human-facing page.
+            return renderNotFoundResponse(request, 60, context);
+          }
+        }
+        return cached;
+      }
     } catch (_) {}
   }
 
