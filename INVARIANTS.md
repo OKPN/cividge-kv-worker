@@ -26,6 +26,7 @@ cutover when old projection data are disposable; legacy KV records require no
 compatibility path. Discarding KV does not delete ObjectLifecycle or
 LinkBinding Durable Object state, nor physical R2/Filebase/Kubo content. A KV
 miss must never authorize release or trigger storage discovery.
+
 - A Link mutation is authoritative only through `createLink` / `removeLink`.
   `requestRelease` may start whole-Object cleanup only when the authoritative
   Link set is empty.
@@ -44,6 +45,17 @@ miss must never authorize release or trigger storage discovery.
   `RELEASED`; an explicit, successfully confirmed storage upload may re-acquire
   a `RELEASED` Placement through a new generation and then recreate the Link.
   `RELEASING` always remains non-linkable until its claim completes or expires.
+
+### [INV-FRESH-AUTHORITY-CUTOVER]
+
+When historical lifecycle records are discarded, ObjectLifecycle and
+LinkBinding must both use new, empty namespaces; changing only KV or renaming
+a DO class does not create a fresh authority. The same canonical ObjectRef or
+Link key remains valid in the new namespaces, including a CID used before.
+No CID blacklist, old-record fallback, or implicit physical deletion is part
+of the cutover. Existing physical storage is a separate observation, never a
+Link or release authorization. An old delivery Cache API response must not be
+adopted as a current Link projection.
 
 ### [INV-RETRYABLE-RELEASE-CONVERGES]
 

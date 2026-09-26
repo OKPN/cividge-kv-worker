@@ -121,6 +121,28 @@ Existing Durable Object Link bindings can still affect reuse or later
 reprojection of the same identity. Edge-cached responses can also remain
 visible until their cache lifetime ends; neither is erased by a KV reset.
 
+### Fresh lifecycle authority cutover
+
+When all existing Links and managed Objects are disposable, a clean cutover
+also requires **new SQLite-backed namespaces for both ObjectLifecycle and
+LinkBinding**. Keep the canonical ObjectRef and `host:filename` derivation;
+point their existing binding names at newly created classes, not at renamed
+classes (a class rename carries the old data). Pair this with an empty
+`CIVIDGE_KV` namespace and a new browser managed-list cache generation.
+Do not copy old DO or KV records. The current lifecycle schema starts at
+version 2 and has `pendingLinkRemovals: []`; no version-1 repair path is used.
+
+This discards old public Link authority and projection, so old URLs are not
+preserved. It does **not** delete R2 objects, Filebase pins, Kubo pins, or
+browser credentials. Physical files left in the same bucket can still appear
+as local/unmanaged storage observations; they are not restored as Links.
+GatewayConfig in the discarded KV returns to built-in defaults until saved
+again. The delivery Cache API key is epoch-scoped so cached responses from the
+previous authority are not reused; independent CDN/browser caches may have
+their own lifetime. Verify the new read/write path before retiring the old
+namespaces. The old physical files need separate, explicit maintenance if
+their storage space should be reclaimed.
+
 ### 3. Deploy to Production
 
 Set the secret on Cloudflare:

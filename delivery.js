@@ -391,6 +391,15 @@ function wantsHumanNotFound(request) {
     (request.headers.get("accept") || "").includes("text/html");
 }
 
+// Internal Cache API keys are versioned at a clean KV/DO authority cutover.
+// The public URL and canonical Link key do not change.
+const DELIVERY_CACHE_EPOCH = "2";
+function deliveryCacheRequest(request) {
+  const url = new URL(request.url);
+  url.searchParams.set("__cividge_cache_epoch", DELIVERY_CACHE_EPOCH);
+  return new Request(url.toString(), request);
+}
+
 function renderNotFoundResponse(request, cdnCacheSeconds = 300, context = null) {
   const headers = {
     // 公開メディアの miss は短時間負のキャッシュに載せる（DoS・枠枯渇防止）
@@ -411,7 +420,8 @@ function renderNotFoundResponse(request, cdnCacheSeconds = 300, context = null) 
   // ⚡ エッジキャッシュ（Cache API）に404を書き込み、同一パスの反復 DoS 攻撃での KV 消費を完全ゼロ化
   if (cdnCacheSeconds > 0 && typeof caches !== "undefined" && caches.default && request.method === "GET") {
     try {
-      context?.waitUntil?.(caches.default.put(request, res.clone())) || caches.default.put(request, res.clone()).catch(() => {});
+      context?.waitUntil?.(caches.default.put(deliveryCacheRequest(request), res.clone())) ||
+        caches.default.put(deliveryCacheRequest(request), res.clone()).catch(() => {});
     } catch (_) {}
   }
 
@@ -430,7 +440,8 @@ function saveResponseToEdgeCache(request, res, context, hasPassword = false) {
     caches.default
   ) {
     try {
-      context?.waitUntil?.(caches.default.put(request, res.clone())) || caches.default.put(request, res.clone()).catch(() => {});
+      context?.waitUntil?.(caches.default.put(deliveryCacheRequest(request), res.clone())) ||
+        caches.default.put(deliveryCacheRequest(request), res.clone()).catch(() => {});
     } catch (_) {}
   }
 }
@@ -497,7 +508,7 @@ export async function onRequest(context) {
   const characterProbe = /(?:^|\/)404-character\.webp$/.test(new URL(request.url).pathname);
   if (!characterProbe && edgeCache && (request.method === "GET" || request.method === "HEAD")) {
     try {
-      const cached = await edgeCache.match(request);
+      const cached = await edgeCache.match(deliveryCacheRequest(request));
       if (cached) {
         if (cached.status === 404) {
           const cachedIsHtml = (cached.headers.get("content-type") || "").includes("text/html");

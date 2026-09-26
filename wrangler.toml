@@ -31,15 +31,15 @@ bucket_name = "cividge"
 
 [[kv_namespaces]]
 binding = "CIVIDGE_KV"
-id = "5559ef420113489ab6f88aa0632817c9"
+id = "e427d94815ce491cb908489ef76251c7"
 
 [[durable_objects.bindings]]
 name = "OBJECT_LIFECYCLE"
-class_name = "ObjectLifecycle"
+class_name = "ObjectLifecycleV2"
 
 [[durable_objects.bindings]]
 name = "LINK_BINDING"
-class_name = "LinkBinding"
+class_name = "LinkBindingV2"
 
 [[migrations]]
 tag = "v1"
@@ -48,3 +48,7 @@ new_sqlite_classes = ["ObjectLifecycle"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["LinkBinding"]
+
+[[migrations]]
+tag = "v3-clean-authority-cutover"
+new_sqlite_classes = ["ObjectLifecycleV2", "LinkBindingV2"]

@@ -32,13 +32,6 @@ export class ObjectLifecycle {
 
     let state = await this.ctx.storage.get(STATE_KEY);
     if (state && state.objectRef !== object.objectRef) return json({ error: "Durable Object identity mismatch" }, 409);
-    // Persisted v1 lifecycles had no pending-removal set. At the authority
-    // boundary, represent that absence as the empty set before any transition.
-    // An inspect remains read-only; the next mutation persists the v2 shape.
-    if (state && !Array.isArray(state.pendingLinkRemovals)) {
-      state.pendingLinkRemovals = [];
-      state.version = 2;
-    }
     if (state && recoverExpiredPlacementClaims(state)) await this.persist(state);
     const action = body.action;
     try {
@@ -123,6 +116,10 @@ export class ObjectLifecycle {
     else await this.ctx.storage.deleteAlarm();
   }
 }
+
+// A new namespace, not a rename: prior lifecycle records are intentionally
+// outside the current authority. The domain transition code stays identical.
+export class ObjectLifecycleV2 extends ObjectLifecycle {}
 
 function json(value, status = 200) {
   return new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } });

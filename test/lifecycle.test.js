@@ -4,8 +4,8 @@ import test from "node:test";
 import { onRequest as deliver } from "../delivery.js";
 import { onRequestDelete, onRequestPost, onRequestGet } from "../cividge-kv.js";
 import { onRequestPost as onLifecyclePost, syncLifecycleProjection, isManagedRpcReleaseEnabled } from "../lifecycle-api.js";
-import { ObjectLifecycle } from "../lifecycle.js";
-import { LinkBinding } from "../link-binding.js";
+import { ObjectLifecycle, ObjectLifecycleV2 } from "../lifecycle.js";
+import { LinkBinding, LinkBindingV2 } from "../link-binding.js";
 import { callLinkBinding } from "../link-binding-api.js";
 import {
   addLink,
@@ -99,6 +99,26 @@ test("unknown media uses exactly one canonical host-qualified KV lookup", async 
 
   assert.equal(response.status, 404);
   assert.deepEqual(kv.calls.get, ["public.example:missing.webp"]);
+});
+
+test("a clean authority ignores responses cached under the previous delivery epoch", async () => {
+  const prior = globalThis.caches;
+  const seen = [];
+  const kv = memoryKv();
+  globalThis.caches = { default: {
+    match: async request => {
+      seen.push(new URL(request.url).searchParams.get("__cividge_cache_epoch"));
+      return new URL(request.url).searchParams.has("__cividge_cache_epoch") ? undefined :
+        new Response("old object", { status: 200 });
+    },
+    put: async () => {},
+  } };
+  try {
+    const response = await deliver(context("https://public.example/old.webp", { CIVIDGE_KV: kv }));
+    assert.equal(response.status, 404);
+    assert.deepEqual(seen, ["2"]);
+    assert.deepEqual(kv.calls.get, ["public.example:old.webp"]);
+  } finally { globalThis.caches = prior; }
 });
 
 test("human HTML 404 embeds its character without a second request", async () => {
@@ -379,43 +399,10 @@ test("a retryable release converges after exact read-only placement observation"
   assert.deepEqual(state.links, ["public.example:new.webp"]);
 });
 
-test("a released v1 Filebase Object can reacquire its owned locator without losing identity", async () => {
-  const cid = "Qm" + "a".repeat(44);
-  const objectRef = `ipfs:${cid.toLowerCase()}`;
-  const placement = { kind: "filebase", executor: "browser", locator: { key: "old-name.webp", cid } };
-  const released = newLifecycle(objectRef, [placement]);
-  released.version = 1;
-  delete released.pendingLinkRemovals;
-  released.state = "RELEASED";
-  released.placements.filebase.state = "RELEASED";
-  const values = new Map([["lifecycle", released]]);
-  const lifecycle = new ObjectLifecycle({ storage: {
-    get: async key => structuredClone(values.get(key)),
-    put: async (key, value) => values.set(key, structuredClone(value)),
-    setAlarm: async () => {}, deleteAlarm: async () => {},
-  } }, {});
-  const action = async (name, extra = {}) => {
-    const response = await lifecycle.fetch(new Request("https://object-lifecycle.internal/", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: name, objectRef, ...extra }),
-    }));
-    assert.equal(response.status, 200);
-    return response.json();
-  };
-
-  const inspected = await action("inspect");
-  assert.deepEqual(inspected.lifecycle.pendingLinkRemovals, []);
-  assert.equal(values.get("lifecycle").version, 1, "inspection does not mutate storage");
-  await action("reconcilePlacementForAcquire", { placement, observation: "absent" });
-  await action("requestPlacementAcquire", { placement });
-  const claimed = await action("claimPlacement", { placement: "filebase", operation: "acquire" });
-  await action("reportPlacement", { placement: "filebase", claimId: claimed.claim.claimId,
-    generation: claimed.claim.generation, operation: "acquire", outcome: "present" });
-  const linked = await action("createLink", { linkKey: "public.example:new-name.webp", placements: [placement] });
-  assert.equal(linked.lifecycle.version, 2);
-  assert.deepEqual(linked.lifecycle.links, ["public.example:new-name.webp"]);
-  assert.equal(linked.lifecycle.placements.filebase.locator.key, "old-name.webp");
-  assert.equal(linked.lifecycle.placements.filebase.state, "PRESENT");
+test("fresh authority classes use the same Link and Object transitions", () => {
+  assert.equal(ObjectLifecycleV2.prototype instanceof ObjectLifecycle, true);
+  assert.equal(LinkBindingV2.prototype instanceof LinkBinding, true);
+  assert.deepEqual(newLifecycle("ipfs:bafy-fresh").pendingLinkRemovals, []);
 });
 
 test("present inspection can adopt a retryable release but never an active claim", () => {

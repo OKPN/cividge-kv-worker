@@ -33,3 +33,16 @@ bucket_name = "your-bucket-name"
 [[kv_namespaces]]
 binding = "CIVIDGE_KV"
 id = "your_kv_namespace_id"
+
+# A fresh installation creates only the current SQLite-backed authority.
+[[durable_objects.bindings]]
+name = "OBJECT_LIFECYCLE"
+class_name = "ObjectLifecycleV2"
+
+[[durable_objects.bindings]]
+name = "LINK_BINDING"
+class_name = "LinkBindingV2"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ObjectLifecycleV2", "LinkBindingV2"]

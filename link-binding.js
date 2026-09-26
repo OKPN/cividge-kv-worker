@@ -123,6 +123,9 @@ export class LinkBinding {
   }
 }
 
+// Fresh Link identity namespace for the same canonical host:filename model.
+export class LinkBindingV2 extends LinkBinding {}
+
 function requireAttempt(state, attemptId, generation) {
   if (!state.attempt || state.attempt.id !== attemptId || state.attempt.generation !== generation) {
     throw new Error("Stale upload attempt");
