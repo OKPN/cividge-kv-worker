@@ -19,7 +19,7 @@ const STATE_KEY = "lifecycle";
 // One Durable Object is named by one canonical ObjectRef. Its SQLite-backed
 // storage is the authority for the Object <-> Link relation; delivery KV is
 // only a projection and is intentionally never read here.
-export class ObjectLifecycle {
+export class ObjectLifecycleV2 {
   constructor(ctx, env) {
     this.ctx = ctx;
     this.env = env;
@@ -116,10 +116,6 @@ export class ObjectLifecycle {
     else await this.ctx.storage.deleteAlarm();
   }
 }
-
-// A new namespace, not a rename: prior lifecycle records are intentionally
-// outside the current authority. The domain transition code stays identical.
-export class ObjectLifecycleV2 extends ObjectLifecycle {}
 
 function json(value, status = 200) {
   return new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } });

@@ -4,8 +4,8 @@ import test from "node:test";
 import { onRequest as deliver } from "../delivery.js";
 import { onRequestDelete, onRequestPost, onRequestGet } from "../cividge-kv.js";
 import { onRequestPost as onLifecyclePost, syncLifecycleProjection, isManagedRpcReleaseEnabled } from "../lifecycle-api.js";
-import { ObjectLifecycle, ObjectLifecycleV2 } from "../lifecycle.js";
-import { LinkBinding, LinkBindingV2 } from "../link-binding.js";
+import { ObjectLifecycleV2 as ObjectLifecycle } from "../lifecycle.js";
+import { LinkBindingV2 as LinkBinding } from "../link-binding.js";
 import { callLinkBinding } from "../link-binding-api.js";
 import {
   addLink,
@@ -400,8 +400,8 @@ test("a retryable release converges after exact read-only placement observation"
 });
 
 test("fresh authority classes use the same Link and Object transitions", () => {
-  assert.equal(ObjectLifecycleV2.prototype instanceof ObjectLifecycle, true);
-  assert.equal(LinkBindingV2.prototype instanceof LinkBinding, true);
+  assert.equal(ObjectLifecycle.name, "ObjectLifecycleV2");
+  assert.equal(LinkBinding.name, "LinkBindingV2");
   assert.deepEqual(newLifecycle("ipfs:bafy-fresh").pendingLinkRemovals, []);
 });
 

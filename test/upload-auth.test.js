@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { onRequestPost, putR2Upload, verifyUploadAuth, calculateUploadCid, classifyUpload, reserveUploadLink, claimUploadPlacement, executeR2Acquisition, executeFilebaseRpcAcquisition, MAX_UPLOAD_BYTES } from "../upload.js";
-import { ObjectLifecycle } from "../lifecycle.js";
-import { LinkBinding } from "../link-binding.js";
+import { ObjectLifecycleV2 as ObjectLifecycle } from "../lifecycle.js";
+import { LinkBindingV2 as LinkBinding } from "../link-binding.js";
 import { callLifecycle } from "../lifecycle-api.js";
 import { callLinkBinding } from "../link-binding-api.js";
 

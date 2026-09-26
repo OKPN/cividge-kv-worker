@@ -52,3 +52,7 @@ new_sqlite_classes = ["LinkBinding"]
 [[migrations]]
 tag = "v3-clean-authority-cutover"
 new_sqlite_classes = ["ObjectLifecycleV2", "LinkBindingV2"]
+
+[[migrations]]
+tag = "v4-retire-old-authority"
+deleted_classes = ["ObjectLifecycle", "LinkBinding"]

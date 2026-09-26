@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { onRequestPost, callLifecycle } from "../lifecycle-api.js";
-import { ObjectLifecycle } from "../lifecycle.js";
+import { ObjectLifecycleV2 as ObjectLifecycle } from "../lifecycle.js";
 
 const cid = "Qm" + "a".repeat(44);
 const objectRef = `ipfs:${cid.toLowerCase()}`;

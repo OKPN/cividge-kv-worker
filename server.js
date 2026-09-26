@@ -4,8 +4,6 @@ import * as uploadApi from "./upload.js";
 import { onRequest as onDelivery } from "./delivery.js";
 import { handleGatewayConfig } from "./gateway-config-api.js";
 import * as linkBindingApi from "./link-binding-api.js";
-export { ObjectLifecycle } from "./lifecycle.js";
-export { LinkBinding } from "./link-binding.js";
 export { ObjectLifecycleV2 } from "./lifecycle.js";
 export { LinkBindingV2 } from "./link-binding.js";
 

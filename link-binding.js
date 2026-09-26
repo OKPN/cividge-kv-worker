@@ -5,7 +5,7 @@ const ATTEMPT_LEASE_MS = 5 * 60_000;
 
 // One Durable Object is named by one canonical Link key. It owns the unique
 // Link -> ObjectRef binding, not Object/Placement lifecycle or delivery reads.
-export class LinkBinding {
+export class LinkBindingV2 {
   constructor(ctx) { this.ctx = ctx; }
 
   async fetch(request) {
@@ -122,9 +122,6 @@ export class LinkBinding {
     }
   }
 }
-
-// Fresh Link identity namespace for the same canonical host:filename model.
-export class LinkBindingV2 extends LinkBinding {}
 
 function requireAttempt(state, attemptId, generation) {
   if (!state.attempt || state.attempt.id !== attemptId || state.attempt.generation !== generation) {

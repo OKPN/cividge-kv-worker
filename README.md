@@ -143,6 +143,12 @@ their own lifetime. Verify the new read/write path before retiring the old
 namespaces. The old physical files need separate, explicit maintenance if
 their storage space should be reclaimed.
 
+The 2026-09-27 clean cutover used new `ObjectLifecycleV2` and `LinkBindingV2`
+SQLite namespaces and an empty delivery KV. After the new Worker and Pages
+were live and the new KV was checked, the unused `ObjectLifecycle` and
+`LinkBinding` classes were retired with a delete migration and the previous
+KV namespace was removed. This did not act on provider storage.
+
 ### 3. Deploy to Production
 
 Set the secret on Cloudflare:
