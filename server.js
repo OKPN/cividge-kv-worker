@@ -18,7 +18,7 @@ export default {
         headers: {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization, Range, If-Range, X-Upload-Password, X-Upload-Filename, X-Custom-Domain, X-Delivery-Domain, X-Storage-Backend",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization, Range, If-Range, X-Upload-Password, X-Upload-Filename, X-Cache-Policy, X-Custom-Domain, X-Delivery-Domain, X-Storage-Backend",
           "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges, X-Image-Width, X-Image-Height",
         },
       });

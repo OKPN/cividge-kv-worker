@@ -148,7 +148,8 @@ function withCurrentPolicy(metadata, binding) {
   if (!binding?.policy) return metadata;
   const expiresAt = binding.policy.expiresAt;
   return { ...metadata, e: expiresAt ? Math.floor(expiresAt / 1000) : 0,
-    expiresAt: expiresAt || null, policyRevision: binding.policy.revision };
+    expiresAt: expiresAt || null, cp: binding.policy.cachePolicy || "BOARD",
+    cachePolicy: binding.policy.cachePolicy || "BOARD", policyRevision: binding.policy.revision };
 }
 
 // GET: 単一キーの照会、または全キーの一覧取得
@@ -397,6 +398,20 @@ export async function onRequestPost(context) {
     if (bindingAtStart?.policy && body.policyChange !== true) {
       calculatedExpiresAt = bindingAtStart.policy.expiresAt;
     }
+    const cachePolicy = body.cachePolicy === undefined || (body.createOnly && bindingAtStart?.policy)
+      ? (bindingAtStart?.policy?.cachePolicy || existingMetadata?.cp || "BOARD")
+      : body.cachePolicy;
+    if (cachePolicy !== "BOARD" && cachePolicy !== "PUBLISHED") {
+      return new Response(JSON.stringify({ error: "Invalid Cache Policy", code: "INVALID_CACHE_POLICY" }), {
+        status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+    if (bindingAtStart?.policy && body.policyChange !== true &&
+        cachePolicy !== (bindingAtStart.policy.cachePolicy || "BOARD")) {
+      return new Response(JSON.stringify({ error: "Cache Policy change requires explicit policyChange", code: "POLICY_CONFLICT" }), {
+        status: 409, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
 
     // 既存の kuboStatus を引き継ぐ、または body から取得
     let existingKuboStatus = body.kuboStatus;
@@ -463,6 +478,7 @@ export async function onRequestPost(context) {
       ...(existingLastKuboPinAttempt ? { k: Math.floor(Number(existingLastKuboPinAttempt) / 1000) } : {}),
       ...(inheritedContentCid ? { c_cid: inheritedContentCid } : {}),
       ...(inheritedBackend ? { b: inheritedBackend } : {}),
+      cp: cachePolicy,
       ...(civitaiTemporary ? { ct: 1 } : {}),
       ...passwordMeta,
     };
@@ -532,6 +548,9 @@ export async function onRequestPost(context) {
     }
     finalKuboStatus = lifecycleState?.placements?.kubo?.state === "PRESENT" ? "pinned" : "not_pinned";
     flags = finalKuboStatus === "pinned" ? ((flags | 2) & ~4) : ((flags | 4) & ~2);
+    const filebasePreserved = [lifecycleState?.placements?.filebase, lifecycleState?.placements?.filebase_rpc]
+      .some(placement => placement?.state === "PRESENT");
+    flags = filebasePreserved ? (flags & ~1) : (flags | 1);
     compressedMeta.f = flags;
     compressedMeta.kuboStatus = finalKuboStatus;
     compressedMeta.g = binding.generation;
@@ -544,7 +563,7 @@ export async function onRequestPost(context) {
       generation: binding.attempt?.generation });
     const acknowledgedPolicy = body.policyChange === true || !bindingAtStart?.policy
       ? (await callLinkBinding(env, { action: "acknowledgePolicy", linkKey: key,
-        generation: binding.generation, expiresAt: calculatedExpiresAt || null })).binding.policy
+        generation: binding.generation, expiresAt: calculatedExpiresAt || null, cachePolicy })).binding.policy
       : bindingAtStart.policy;
 
     // クライアント側へは旧形式互換のオブジェクトも含めて返却
@@ -562,6 +581,7 @@ export async function onRequestPost(context) {
       ...(compressedMeta.w && compressedMeta.h ? { width: compressedMeta.w, height: compressedMeta.h } : {}),
       ...(calculatedExpiresAt ? { expiresAt: calculatedExpiresAt } : {}),
       policyRevision: acknowledgedPolicy.revision,
+      cachePolicy: acknowledgedPolicy.cachePolicy || "BOARD",
       ...(civitaiTemporary ? { civitaiTemporary: true, ct: 1 } : {}),
       ...compressedMeta,
     };

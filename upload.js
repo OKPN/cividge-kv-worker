@@ -13,7 +13,7 @@ export async function onRequestOptions() {
     headers: {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Upload-Password, X-Upload-Filename, X-Custom-Domain, X-Delivery-Domain, X-Storage-Backend",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Upload-Password, X-Upload-Filename, X-Cache-Policy, X-Custom-Domain, X-Delivery-Domain, X-Storage-Backend",
     },
   });
 }
@@ -486,6 +486,7 @@ export async function onRequestPost(context) {
     let originalFilename = url.searchParams.get("filename") || request.headers.get("X-Upload-Filename") || "";
     // パスワードを URL に入れると履歴・ログへ残り得るため、ヘッダーか multipart のみ許可。
     let password = (request.headers.get("X-Upload-Password") || "").trim();
+    let cachePolicy = request.headers.get("X-Cache-Policy") || "BOARD";
     let contentType = "";
 
     if (isMultipart) {
@@ -499,6 +500,7 @@ export async function onRequestPost(context) {
       if (formData.get("password")) {
         password = String(formData.get("password")).trim();
       }
+      if (formData.get("cachePolicy")) cachePolicy = String(formData.get("cachePolicy"));
     } else {
       if (!request.body) {
         return new Response(JSON.stringify({ success: false, error: "No file content uploaded" }), {
@@ -521,6 +523,11 @@ export async function onRequestPost(context) {
       return new Response(JSON.stringify({ success: false, error: "No file content uploaded" }), {
         status: 400,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+    if (cachePolicy !== "BOARD" && cachePolicy !== "PUBLISHED") {
+      return new Response(JSON.stringify({ success: false, error: "Invalid Cache Policy" }), {
+        status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
     }
     if (fileBuffer && fileBuffer.byteLength > MAX_UPLOAD_BYTES) {
@@ -715,6 +722,7 @@ export async function onRequestPost(context) {
         contentCid,
         uploadAttemptId: r2Plan?.attemptId,
         password,
+        cachePolicy,
         backend: storageBackend === "filebase" ? "filebase_rpc" : storageBackend,
         createOnly: true,
         ...(filebasePlan ? { uploadAttemptId: filebasePlan.attemptId } : {}),

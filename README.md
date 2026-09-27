@@ -9,9 +9,9 @@ cividge-kv-worker serves as the decentralized backend routing and caching layer 
 ## Key Features
 
 - ⚡ **3-Tier Edge Caching Strategy**:
-  - Browser/Edge response caching (1 hour for images/documents, 4 hours for audio/video).
-  - Unpinned / drifting IPFS asset auto-keepalive (7-day cache with automated upstream pinging).
-  - Long-term upstream immutable caching (up to 1 year).
+  - `BOARD` keeps short public browser/edge freshness: 1 hour for images/documents or 4 hours for audio/video; with zone purge configured, up to 1 day.
+  - `PUBLISHED` explicitly allows up to 7 days at the public edge when a managed origin is present. Browser freshness remains at the short baseline. Without Filebase or Kubo preservation, public edge freshness is capped at 1 day.
+  - Worker-to-IPFS-gateway fetch caching is separate: up to 1 year normally, 7 days for records marked unpinned, always capped by the Link's remaining lifetime when assigned. An existing cached upstream copy is not proof of a current Placement or protection against IPFS GC.
 - 🤖 **Optimized Social Crawler & OGP Engine**:
   - Automatically intercepts crawlers from Misskey (SummalyBot), Twitter/X, Discord, Slack, Mastodon, and Bluesky.
   - Generates lightweight, instant OGP HTML cards with first-frame thumbnails (.thumb.webp) to completely bypass crawler timeouts and 10MB payload limitations.

@@ -187,8 +187,9 @@ export async function syncLifecycleProjection(env, lifecycle) {
     metadata.kuboPlacementState = kubo?.state || "ABSENT";
     if (kubo?.claim?.expiresAt) metadata.kuboClaimExpiresAt = Number(kubo.claim.expiresAt);
     else delete metadata.kuboClaimExpiresAt;
-    if ((filebase || filebaseRpc) &&
-        [filebase, filebaseRpc].filter(Boolean).every(p => p.state === "RELEASED")) flags |= 1;
+    // Absence and in-progress acquisition are not confirmed preservation.
+    // Delivery uses this projection conservatively for its origin safety cap.
+    if (![filebase, filebaseRpc].some(p => p?.state === "PRESENT")) flags |= 1;
     else flags &= ~1;
     if (kubo?.state === "PRESENT") {
       flags = (flags | 2) & ~4;

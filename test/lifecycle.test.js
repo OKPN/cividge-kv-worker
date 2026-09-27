@@ -116,7 +116,7 @@ test("a clean authority ignores responses cached under the previous delivery epo
   try {
     const response = await deliver(context("https://public.example/old.webp", { CIVIDGE_KV: kv }));
     assert.equal(response.status, 404);
-    assert.deepEqual(seen, ["2"]);
+    assert.deepEqual(seen, ["3"]);
     assert.deepEqual(kv.calls.get, ["public.example:old.webp"]);
   } finally { globalThis.caches = prior; }
 });
@@ -770,4 +770,20 @@ test("DO placement state is projected to every peer Link", async () => {
     assert.equal(projected.metadata.kuboStatus, "pinned");
     assert.equal(projected.metadata.c_cid, "bafy-projected");
   }
+});
+
+test("delivery projection marks Filebase absence even without a RELEASED row", async () => {
+  const key = "a.example:x.webp";
+  const records = new Map([[key, { value: "Qm" + "a".repeat(44),
+    metadata: { b: "filebase", f: 0 } }]]);
+  const kv = memoryKv(records);
+  await syncLifecycleProjection({ CIVIDGE_KV: kv }, {
+    links: [key], placements: { kubo: { state: "PINNING" } },
+  });
+  assert.equal(records.get(key).metadata.f & 1, 1);
+  assert.equal(records.get(key).metadata.f & 2, 0);
+  await syncLifecycleProjection({ CIVIDGE_KV: kv }, {
+    links: [key], placements: { filebase: { state: "PRESENT" } },
+  });
+  assert.equal(records.get(key).metadata.f & 1, 0);
 });

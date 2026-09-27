@@ -93,7 +93,12 @@ export class LinkBindingV2 {
         if (expiresAt !== null && (!Number.isFinite(expiresAt) || expiresAt <= 0)) {
           throw new Error("Invalid Link expiry policy");
         }
-        state.policy = { expiresAt, revision: (state.policy?.revision || 0) + 1 };
+        const cachePolicy = body.cachePolicy === undefined
+          ? (state.policy?.cachePolicy || "BOARD") : body.cachePolicy;
+        if (cachePolicy !== "BOARD" && cachePolicy !== "PUBLISHED") {
+          throw new Error("Invalid Cache Policy");
+        }
+        state.policy = { expiresAt, cachePolicy, revision: (state.policy?.revision || 0) + 1 };
       } else if (action === "beginRemove") {
         if (state.status === "RETIRING") return json({ binding: state });
         if (state.status !== "BOUND" || state.attempt) throw new Error("Link is not removable");

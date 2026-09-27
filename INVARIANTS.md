@@ -18,6 +18,19 @@
 - Public delivery performs one canonical KV lookup and never calls the Durable
   Object, lists Links, repairs state, or probes storage on a KV miss.
 
+### Cache Policy invariants
+
+- **[INV-CACHE-POLICY-IS-USER-INTENT]** The Link's closed `BOARD | PUBLISHED`
+  policy is acknowledged by LinkBinding and projected to KV. Placement state
+  alone cannot promote `BOARD` to a longer public lifetime.
+- **[INV-CACHE-NEVER-OUTLIVES-LINK]** Browser, public-edge, and newly assigned
+  upstream freshness are capped by the Link's remaining validity. Public-edge
+  freshness is additionally capped at one day when neither Filebase nor Kubo
+  has a confirmed PRESENT Placement. This is not an IPFS GC guarantee.
+- Public response cache and Worker-to-gateway upstream fetch cache are separate
+  policies. An upstream cache hit is not Placement evidence; public delivery
+  still requires the canonical Link lookup after a public-edge miss.
+
 ### [INV-KV-DISPOSABLE-PROJECTION]
 
 KV holds delivery Link projections and runtime configuration, not Object or

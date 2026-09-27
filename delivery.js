@@ -393,7 +393,7 @@ function wantsHumanNotFound(request) {
 
 // Internal Cache API keys are versioned at a clean KV/DO authority cutover.
 // The public URL and canonical Link key do not change.
-const DELIVERY_CACHE_EPOCH = "2";
+const DELIVERY_CACHE_EPOCH = "3";
 function deliveryCacheRequest(request) {
   const url = new URL(request.url);
   url.searchParams.set("__cividge_cache_epoch", DELIVERY_CACHE_EPOCH);
@@ -448,8 +448,33 @@ function saveResponseToEdgeCache(request, res, context, hasPassword = false) {
 
 function capCacheToExpiry(defaultSeconds, expiresAt) {
   if (!expiresAt) return defaultSeconds;
-  const remainingSeconds = Math.ceil((Number(expiresAt) - Date.now()) / 1000);
+  const remainingSeconds = Math.floor((Number(expiresAt) - Date.now()) / 1000);
   return Math.max(0, Math.min(defaultSeconds, remainingSeconds));
+}
+
+export function publicMediaCacheLifetimes(env, { cachePolicy = "BOARD", isVideoOrAudio = false,
+  hasManagedOrigin = true, expiresAt = null } = {}) {
+  const boardSeconds = hasGlobalPurgeConfiguration(env)
+    ? 86400 : (isVideoOrAudio ? 14400 : 3600);
+  const originSafetyCap = hasManagedOrigin ? Infinity : 86400;
+  const edgeSeconds = Math.min(cachePolicy === "PUBLISHED" ? 7 * 86400 : boardSeconds, originSafetyCap);
+  return {
+    browserSeconds: capCacheToExpiry(Math.min(boardSeconds, edgeSeconds), expiresAt),
+    edgeSeconds: capCacheToExpiry(edgeSeconds, expiresAt),
+  };
+}
+
+function setPublicMediaCacheHeaders(headers, lifetimes, hasPassword) {
+  if (hasPassword) {
+    headers.set("Cache-Control", `private, max-age=${lifetimes.browserSeconds}`);
+    headers.set("Cloudflare-CDN-Cache-Control", "private, no-store");
+    headers.set("Vary", "Cookie, Accept-Encoding");
+  } else {
+    // Cache API uses s-maxage for the edge; browsers use max-age.
+    headers.set("Cache-Control", `public, max-age=${lifetimes.browserSeconds}, s-maxage=${lifetimes.edgeSeconds}`);
+    headers.set("Cloudflare-CDN-Cache-Control", `public, max-age=${lifetimes.edgeSeconds}`);
+    headers.set("Vary", "Accept-Encoding");
+  }
 }
 
 // Cloudflare のゾーン単位パージを設定した運用だけ、公開メディアの CDN TTL を延ばす。
@@ -459,18 +484,6 @@ function hasGlobalPurgeConfiguration(env) {
     env?.CLOUDFLARE_ZONE_ID &&
     (env?.CLOUDFLARE_PURGE_TOKEN || env?.CLOUDFLARE_API_TOKEN)
   );
-}
-
-function publicMediaCacheSeconds(env, { isVideoOrAudio = false, isUnpinned = false, expiresAt = null } = {}) {
-  // FIFO 等で pin が外れた CID は、IPFS 上での実体を延命する既存の 7 日戦略を維持する。
-  if (isUnpinned) return capCacheToExpiry(7 * 86400, expiresAt);
-
-  // Zone purge を利用できる場合だけ 24 時間へ延長。未設定時は従来どおり、
-  // 画像・通常ファイルは 1 時間、動画・音声は 4 時間。
-  const defaultSeconds = hasGlobalPurgeConfiguration(env)
-    ? 86400
-    : (isVideoOrAudio ? 14400 : 3600);
-  return capCacheToExpiry(defaultSeconds, expiresAt);
 }
 
 // アップロード時に台帳へ保存した実寸を、直リンクを事前解析するクライアントへ渡す。
@@ -779,19 +792,12 @@ export async function onRequest(context) {
         const extLower = extMatch[1].toLowerCase();
         const isVideo = ["mp4", "webm", "mov", "m4v", "avi", "ogv"].includes(extLower);
         const isAudio = ["mp3", "wav", "ogg", "m4a", "flac", "aac"].includes(extLower);
-        const CACHE_SECONDS = publicMediaCacheSeconds(env, {
+        const cacheLifetimes = publicMediaCacheLifetimes(env, {
+          cachePolicy: meta.cp || "BOARD",
           isVideoOrAudio: isVideo || isAudio,
           expiresAt: expiresTimestamp,
         });
-        if (hasPassword) {
-          headers.set("Cache-Control", `private, max-age=${CACHE_SECONDS}`);
-          headers.set("Cloudflare-CDN-Cache-Control", "private, no-store");
-          headers.set("Vary", "Cookie, Accept-Encoding");
-        } else {
-          headers.set("Cache-Control", `public, max-age=${CACHE_SECONDS}`);
-          headers.set("Cloudflare-CDN-Cache-Control", `public, max-age=${CACHE_SECONDS}`);
-          headers.set("Vary", "Accept-Encoding");
-        }
+        setPublicMediaCacheHeaders(headers, cacheLifetimes, hasPassword);
         headers.set("Content-Length", String(directData.byteLength));
         const mimeMap = {
           webp: "image/webp", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
@@ -837,20 +843,13 @@ export async function onRequest(context) {
           const extLower = extMatch[1].toLowerCase();
           const isVideo = ["mp4", "webm", "mov", "m4v", "avi", "ogv"].includes(extLower);
           const isAudio = ["mp3", "wav", "ogg", "m4a", "flac", "aac"].includes(extLower);
-          const CACHE_SECONDS = publicMediaCacheSeconds(env, {
+          const cacheLifetimes = publicMediaCacheLifetimes(env, {
+            cachePolicy: meta.cp || "BOARD",
             isVideoOrAudio: isVideo || isAudio,
             expiresAt: expiresTimestamp,
           });
-          if (hasPassword) {
-            headers.set("Cache-Control", `private, max-age=${CACHE_SECONDS}`);
-            headers.set("Cloudflare-CDN-Cache-Control", "private, no-store");
-            headers.set("Vary", "Cookie, Accept-Encoding");
-          } else {
-            headers.set("Cache-Control", `public, max-age=${CACHE_SECONDS}`);
-            headers.set("Cloudflare-CDN-Cache-Control", `public, max-age=${CACHE_SECONDS}`);
-            headers.set("Vary", "Accept-Encoding");
-          }
           r2Obj.writeHttpMetadata(headers);
+          setPublicMediaCacheHeaders(headers, cacheLifetimes, hasPassword);
           const res = new Response(isHead ? null : r2Obj.body, { status: 200, headers });
           saveResponseToEdgeCache(request, res, context, hasPassword);
           return res;
@@ -914,7 +913,7 @@ export async function onRequest(context) {
     // 🟢 Filebase ピン留め中 または 🌊 アンピン漂流中:
     // 最もデータ実体・エッジキャッシュが最後まで残存している Filebase を最優先で叩いて即座に救出。
     // Filebase で見つからない（完全にGC消去された）場合は、フォールバックとして公共GWを探索する。
-    // ※アンピン漂流中ファイルは Cloudflare エッジに 7日間（604,800秒）キャッシュされるため、Filebase 帯域消費も週1回で極小。
+    // Public cache policy is independent of this upstream candidate order.
     orderedGateways.push(filebaseGateway, ...publicGateways);
   }
 
@@ -923,9 +922,8 @@ export async function onRequest(context) {
   const registeredTime = meta.registeredAt || (meta.t ? meta.t * 1000 : 0) || meta.lastModified || 0;
   const isWithinGracePeriod = registeredTime > 0 && (Date.now() - registeredTime < 30000);
 
-  // アンピン状態の判定: FIFO等でアンピンされたファイルは 7日間（604,800秒）キャッシュ
-  // （週1回の上流アクセスでIPFSノードのGC消去を回避・延命し、Filebase転送枠も死守）
-  // 通常ピン留め中は 1年間（31,536,000秒）キャッシュ
+  // Origin-protection cache is independent of the public Cache Policy.
+  // Cached bytes do not attest a live Filebase/Kubo Placement or prevent GC.
   const UPSTREAM_CACHE_SECONDS = capCacheToExpiry(isUnpinned ? (7 * 86400) : 31536000, expiresTimestamp);
 
   let upstreamResponse = null;
@@ -990,24 +988,16 @@ export async function onRequest(context) {
   headers.set("Accept-Ranges", "bytes");  // 常に宣言（iOS Safari等がシーク非対応と誤判定するのを防止）
   setImageDimensionHeaders(headers, meta);
 
-  // 3層キャッシュ戦略: ブラウザ=CDNレスポンス(画像1時間/動画・音声4時間、アンピン漂流中は7日間) / 上流フェッチ(通常1年/アンピン7日)
+  // Public browser/edge cache is independent of the upstream gateway fetch cache.
   const isVideo = ["mp4", "webm", "mov", "m4v", "avi", "ogv"].includes(extMatch[1].toLowerCase());
   const isAudio = ["mp3", "wav", "ogg", "m4a", "flac", "aac"].includes(extMatch[1].toLowerCase());
-  // 🌊 アンピン（IPFS漂流中）ファイルは、7日間に1回アクセスがあれば上流をつついて延命し、アクセスが無ければ自然消滅するよう7日間に設定
-  const CACHE_SECONDS = publicMediaCacheSeconds(env, {
+  const cacheLifetimes = publicMediaCacheLifetimes(env, {
+    cachePolicy: meta.cp || "BOARD",
     isVideoOrAudio: isVideo || isAudio,
-    isUnpinned,
+    hasManagedOrigin: isKuboPinned || (!isOriginR2 && !isUnpinned),
     expiresAt: expiresTimestamp,
   });
-  if (hasPassword) {
-    headers.set("Cache-Control", `private, max-age=${CACHE_SECONDS}`);
-    headers.set("Cloudflare-CDN-Cache-Control", "private, no-store");
-    headers.set("Vary", "Cookie, Accept-Encoding");
-  } else {
-    headers.set("Cache-Control", `public, max-age=${CACHE_SECONDS}`);
-    headers.set("Cloudflare-CDN-Cache-Control", `public, max-age=${CACHE_SECONDS}`);
-    headers.set("Vary", "Accept-Encoding");
-  }
+  setPublicMediaCacheHeaders(headers, cacheLifetimes, hasPassword);
 
   const contentLength = upstreamResponse.headers.get("content-length");
   if (contentLength) {
