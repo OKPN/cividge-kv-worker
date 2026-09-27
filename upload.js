@@ -6,6 +6,7 @@ import { importer as importUnixFs } from "ipfs-unixfs-importer";
 import { BlackHoleBlockstore } from "blockstore-core";
 import { callLinkBinding } from "./link-binding-api.js";
 import { callLifecycle, isManagedRpcCidPinned } from "./lifecycle-api.js";
+import { objectIdFromBytes } from "./object-id.js";
 
 export async function onRequestOptions() {
   return new Response(null, {
@@ -86,11 +87,11 @@ function createSizeLimitedStream(source, maxBytes) {
   return { body, getByteLength: () => byteLength };
 }
 
-export async function putR2Upload(bucket, key, fileStream, fileBuffer, declaredLength, contentType, contentCid = "") {
+export async function putR2Upload(bucket, key, fileStream, fileBuffer, declaredLength, contentType, contentCid = "", objectId = "") {
   const metadata = {
     httpMetadata: { contentType },
     customMetadata: { size: String(declaredLength || fileBuffer?.byteLength || 0),
-      ...(contentCid ? { contentCid } : {}) },
+      ...(contentCid ? { cid: contentCid } : {}), ...(objectId ? { "object-id": objectId } : {}) },
   };
   if (fileBuffer) {
     await bucket.put(key, fileBuffer, metadata);
@@ -198,10 +199,9 @@ export function classifyUpload(binding, lifecycle, placementKind, hasProjection,
   if (binding?.status === "RETIRING" || binding?.attempt) return "busy";
   const sameLink = binding?.status === "BOUND";
   const target = lifecycle?.placements?.[placementKind];
-  const anyPresent = Object.values(lifecycle?.placements || {}).some(p => p.state === "PRESENT");
   if (sameLink && target?.state === "PRESENT" && hasProjection) return "noop";
   if (sameLink && target?.state !== "PRESENT") return "reacquire";
-  if (anyPresent) return "peer";
+  if (target?.state === "PRESENT") return "peer";
   return "create";
 }
 
@@ -237,14 +237,17 @@ export async function reserveUploadLink(env, { linkKey, objectRef, placement, cl
 }
 
 export async function claimUploadPlacement(env, objectRef, placement) {
+  if (placement.kind === "r2" &&
+      (!env.R2_BUCKET_NAME || placement.locator?.bucket !== env.R2_BUCKET_NAME)) {
+    throw new Error("R2 Placement bucket does not match the Worker binding");
+  }
   const inspected = (await callLifecycle(env, { action: "inspect", objectRef })).lifecycle;
   const previous = inspected?.placements?.[placement.kind];
   if (previous && ["RELEASE_PENDING", "RETRYABLE", "RELEASED"].includes(previous.state)) {
     let present;
     if (placement.kind === "r2") {
       const head = await env.R2_BUCKET.head(placement.locator.key);
-      if (head && ![head.customMetadata?.cid, head.customMetadata?.hash, head.customMetadata?.contentCid]
-        .includes(placement.locator.key.replace(/^objects\//, ""))) {
+      if (head && head.customMetadata?.["object-id"] !== objectRef) {
         throw new Error("Existing R2 object has an unverified content identity");
       }
       present = Boolean(head);
@@ -271,14 +274,17 @@ export async function executeR2Acquisition(env, { objectRef, linkKey, attemptId,
   claim, contentCid, key, bytes, contentType }) {
   if (!claim) return false;
   try {
+    if (!env.R2_BUCKET_NAME || claim.locator.bucket !== env.R2_BUCKET_NAME) {
+      throw new Error("R2 acquisition bucket does not match the Worker binding");
+    }
     const head = await env.R2_BUCKET.head(key);
-    if (head && head.customMetadata?.contentCid !== contentCid) {
+    if (head && (head.customMetadata?.cid !== contentCid || head.customMetadata?.["object-id"] !== objectRef)) {
       const error = new Error("Existing R2 object has an unverified content identity");
       error.code = "OBJECT_REF_CONFLICT";
       error.status = 409;
       throw error;
     }
-    if (!head) await putR2Upload(env.R2_BUCKET, key, null, bytes, bytes.byteLength, contentType, contentCid);
+    if (!head) await putR2Upload(env.R2_BUCKET, key, null, bytes, bytes.byteLength, contentType, contentCid, objectRef);
     await callLinkBinding(env, { action: "markPhysical", linkKey, attemptId,
       generation: attemptGeneration, cid: contentCid });
     await callLifecycle(env, { action: "reportPlacement", objectRef,
@@ -622,18 +628,21 @@ export async function onRequestPost(context) {
 
     // 6. Resolve canonical content and Link identity before touching storage.
     const contentCid = await calculateUploadCid(fileBuffer);
+    const objectRef = await objectIdFromBytes(fileBuffer);
     let targetCid = null;
     const storageBackend = (url.searchParams.get("storage") || request.headers.get("X-Storage-Backend") || "").trim().toLowerCase();
     if (!["filebase", "r2"].includes(storageBackend)) throw new Error("storage=filebase or storage=r2 is required");
     if (storageBackend === "r2" && !env.R2_BUCKET) {
       throw new Error("R2_BUCKET binding is required before upload reservation");
     }
+    if (storageBackend === "r2" && !String(env.R2_BUCKET_NAME || "").trim()) {
+      throw new Error("R2_BUCKET_NAME is required before upload reservation");
+    }
     if (storageBackend === "filebase" &&
         (env.FILEBASE_DEDICATED_BUCKET !== "true" || !String(env.FILEBASE_IPFS_API_KEY || "").trim())) {
       throw new Error("A Cividge Worker-RPC-exclusive Filebase bucket and FILEBASE_IPFS_API_KEY are required before upload reservation");
     }
     const physicalKey = `objects/${contentCid}`;
-    const objectRef = storageBackend === "r2" ? `r2:${physicalKey}` : `ipfs:${contentCid.toLowerCase()}`;
     const linkKey = `${cleanHostname}:${shortKey}`;
     const existingBinding = (await callLinkBinding(env, { action: "inspect", linkKey })).binding;
     if (existingBinding?.objectRef && existingBinding.objectRef !== objectRef) {
@@ -643,6 +652,10 @@ export async function onRequestPost(context) {
       throw conflict;
     }
     const currentLifecycle = (await callLifecycle(env, { action: "inspect", objectRef })).lifecycle;
+    if (storageBackend === "r2" && currentLifecycle?.placements?.r2?.locator?.bucket &&
+        currentLifecycle.placements.r2.locator.bucket !== env.R2_BUCKET_NAME) {
+      throw new Error("Existing R2 Placement belongs to a different bucket");
+    }
     const placementKind = storageBackend === "r2" ? "r2" : "filebase_rpc";
     const currentProjection = existingBinding?.status === "BOUND"
       ? await env.CIVIDGE_KV.getWithMetadata(linkKey) : null;
@@ -658,7 +671,9 @@ export async function onRequestPost(context) {
     }
     let r2Plan = null;
     if (storageBackend === "r2") {
-      const placement = { kind: "r2", executor: "worker", locator: { key: physicalKey } };
+      const previousLocator = currentLifecycle?.placements?.r2?.locator;
+      if (previousLocator && previousLocator.key !== physicalKey) throw new Error("R2 Placement locator conflicts with the final bytes");
+      const placement = { kind: "r2", executor: "worker", locator: previousLocator || { bucket: env.R2_BUCKET_NAME, key: physicalKey } };
       const attemptId = request.headers.get("X-Upload-Attempt-Id") || crypto.randomUUID();
       const reservation = await reserveUploadLink(env, { linkKey, objectRef, placement,
         classification: uploadMeaning, attemptId });
@@ -715,10 +730,12 @@ export async function onRequestPost(context) {
       },
       body: JSON.stringify({
         key: `${cleanHostname}:${shortKey}`,
-        cid: storageBackend === "r2" ? "r2" : targetCid,
+        cid: contentCid,
+        objectId: objectRef,
         size: uploadedSize,
         mime: contentType,
         s3Key: storageBackend === "r2" ? physicalKey : shortKey,
+        bucket: storageBackend === "r2" ? env.R2_BUCKET_NAME : undefined,
         contentCid,
         uploadAttemptId: r2Plan?.attemptId,
         password,

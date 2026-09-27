@@ -1,6 +1,7 @@
 import * as cividgeKv from "./cividge-kv.js";
 import * as lifecycleApi from "./lifecycle-api.js";
 import * as uploadApi from "./upload.js";
+import * as thumbnailApi from "./thumbnail-api.js";
 import { onRequest as onDelivery } from "./delivery.js";
 import { handleGatewayConfig } from "./gateway-config-api.js";
 import * as linkBindingApi from "./link-binding-api.js";
@@ -18,7 +19,7 @@ export default {
         headers: {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization, Range, If-Range, X-Upload-Password, X-Upload-Filename, X-Cache-Policy, X-Custom-Domain, X-Delivery-Domain, X-Storage-Backend",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization, Range, If-Range, X-Upload-Password, X-Upload-Filename, X-Cache-Policy, X-Custom-Domain, X-Delivery-Domain, X-Storage-Backend, X-Object-Id",
           "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges, X-Image-Width, X-Image-Height",
         },
       });
@@ -41,6 +42,16 @@ export default {
     }
 
     if (pathname === "/api/gateway-config") return handleGatewayConfig(request, env);
+
+    if (pathname === "/api/thumbnail") {
+      const res = request.method === "POST"
+        ? await thumbnailApi.onRequestPost({ request, env })
+        : new Response("Method Not Allowed", { status: 405 });
+      const headers = new Headers(res.headers);
+      headers.set("Access-Control-Allow-Origin", "*");
+      headers.set("Cache-Control", "no-store");
+      return new Response(res.body, { status: res.status, headers });
+    }
 
     if (pathname === "/api/link-binding" && request.method === "POST") {
       return linkBindingApi.onRequestPost({ request, env });

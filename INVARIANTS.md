@@ -9,10 +9,29 @@
 ## Lifecycle authority (supersedes earlier tombstone/local-reference text)
 
 - A **Link** is only the canonical `host:filename` delivery name. An
-  **ObjectRef** is only `r2:<s3Key>` or `ipfs:<cid>`. Neither substitutes for
-  the other.
+  immutable **ObjectId** is only `sha256:<lowercase digest>` of the exact final
+  bytes. R2 keys and Filebase/Kubo CIDs are Placement locators, never Object
+  identity. Equal bytes across providers share one ObjectLifecycle authority.
+- **[INV-OBJECT-IDENTITY-INDEPENDENT-OF-PLACEMENT]** Provider, bucket, key,
+  CID, pin state and delivery path never participate in ObjectId.
+- **[INV-ONE-LIFECYCLE-AUTHORITY-PER-OBJECT]** All managed Links and
+  Placements of one ObjectId are decided by one ObjectLifecycle Durable Object.
+- **[INV-CID-MEANS-CID]** `cid` is a real content identifier or absent, never
+  a backend marker. CIDv0 case is preserved exactly.
+- **[INV-SINGLE-PLACEMENT-AUTHORITY]** A Placement can be destructively
+  released only under a claim from that ObjectId's complete lifecycle state.
+- S3 Placements include the exact bucket and key; actuator configuration must
+  match that bucket before mutation.
+- **[INV-DERIVED-ARTIFACT-NOT-LINK]** A generated video thumbnail is dependent
+  preview bytes, not a video Placement and not an independent public Link.
+  Its parent ObjectLifecycle owns one deterministic R2 key. A real uploaded
+  image named `foo.thumb.webp` is still a normal Link.
+- **[INV-DERIVED-ARTIFACT-FOLLOWS-PARENT]** Removing one peer Link cannot
+  release the thumbnail. The final parent Link release authorizes cleanup;
+  physical deletion has a durable claim and retryable failure state. Preview
+  generation failure cannot undo main video publication.
 - The SQLite-backed `ObjectLifecycle` Durable Object named from the canonical
-  ObjectRef is the only authority for the Object-to-Link relation and release
+  ObjectId is the only authority for the Object-to-Link relation and release
   state. Delivery KV is a read-optimized projection; browser localStorage is
   UI/cache only.
 - The `LinkBinding` Durable Object is the distinct authority for canonical
@@ -263,7 +282,7 @@ delivery remains a single KV lookup and may reflect the policy later.
 
 * **満たすべき性質 (Required Behavior)**:
   1. 台帳に登録されていない未知のファイル名に対するアクセスは、R2 バケットや IPFS ゲートウェイを検索せず、即座に 404 Not Found を返却すること（ランダムパス DoS 攻撃の防護）。
-  2. 台帳レコードが R2（`targetCid === "r2"` 等）の場合、まず R2 バケットを検索し、実体が存在すれば IPFS 上流フェッチは実行せず即時配信すること。
+  2. 台帳レコードの明示的な `backend` が R2 の場合、まず R2 バケットを検索し、実体が存在すれば IPFS 上流フェッチは実行せず即時配信すること。CIDをbackend markerとして使わない。
   3. R2 レコードで R2 バケットに実体が存在せず、台帳に `contentCid` が記録されている場合（Kubo 移行後）、**Filebase ゲートウェイ（`ipfs.filebase.io`）を 100% 完全に除外**し、公共 IPFS ゲートウェイおよび自宅 Kubo ゲートウェイのみを探索すること（無駄打ち・帯域浪費・404待機遅延の完全防止）。
   4. 台帳レコードが IPFS の場合、R2 バケットへの無駄な検索を行わず、IPFS ゲートウェイルーティングへ直行すること。
 

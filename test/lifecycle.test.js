@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createHash } from "node:crypto";
+const oid = label => `sha256:${createHash("sha256").update(label).digest("hex")}`;
 
 import { onRequest as deliver } from "../delivery.js";
 import { onRequestDelete, onRequestPost, onRequestGet } from "../cividge-kv.js";
@@ -31,6 +33,7 @@ function memoryKv(records = new Map()) {
       calls.get.push(key);
       return records.get(key) || { value: null, metadata: null };
     },
+    async get(key) { return records.get(key)?.value ?? null; },
     async put(key, value, options = {}) {
       calls.put.push({ key, value, options });
       records.set(key, { value, metadata: options.metadata || {} });
@@ -77,8 +80,8 @@ test("an expired R2 Link cannot delete its Object or a peer Link during GET", as
   const first = `a.example:${filename}`;
   const second = `b.example:${filename}`;
   const kv = memoryKv(new Map([
-    [first, { value: "r2", metadata: { b: "r2", k_s3: "shared.webp", e: 1 } }],
-    [second, { value: "r2", metadata: { b: "r2", k_s3: "shared.webp" } }],
+    [first, { value: "", metadata: { b: "r2", k_s3: "shared.webp", e: 1 } }],
+    [second, { value: "", metadata: { b: "r2", k_s3: "shared.webp" } }],
   ]));
   const r2Deletes = [];
   const response = await deliver(context(`https://a.example/${filename}`, {
@@ -112,7 +115,7 @@ test("KV read failure is unavailable, never a cached not-found", async () => {
 
 test("known R2 Link with missing origin is unavailable, not 404", async () => {
   const kv = memoryKv(new Map([["public.example:media.webp", {
-    value: "r2", metadata: { b: "r2", k_s3: "media.webp" },
+    value: "", metadata: { b: "r2", k_s3: "media.webp" },
   }]]));
   const response = await deliver(context("https://public.example/media.webp", {
     CIVIDGE_KV: kv, R2_BUCKET: { get: async () => null },
@@ -137,7 +140,7 @@ test("a clean authority ignores responses cached under the previous delivery epo
   try {
     const response = await deliver(context("https://public.example/old.webp", { CIVIDGE_KV: kv }));
     assert.equal(response.status, 404);
-    assert.deepEqual(seen, ["4"]);
+    assert.deepEqual(seen, ["5"]);
     assert.deepEqual(kv.calls.get, ["public.example:old.webp"]);
   } finally { globalThis.caches = prior; }
 });
@@ -218,9 +221,9 @@ test("relay identity probe bypasses a stale cached character 404", async () => {
 test("retired Link generation hides stale KV and explicit rebind creates a newer generation", async () => {
   const key = "public.example:again.webp";
   const env = { ADMIN_API_TOKEN: "secret", LINK_BINDING: memoryBindingNamespace() };
-  await bindExisting(env, key, "r2:old");
+  await bindExisting(env, key, oid("r2:old"));
   const old = (await callLinkBinding(env, { action: "inspect", linkKey: key })).binding;
-  const records = new Map([[key, { value: "r2", metadata: { b: "r2", k_s3: "old", g: old.generation } }]]);
+  const records = new Map([[key, { value: "", metadata: { b: "r2", k_s3: "old", g: old.generation } }]]);
   env.CIVIDGE_KV = {
     getWithMetadata: async name => records.get(name) || { value: null, metadata: null },
     list: async () => ({ keys: [...records].map(([name, entry]) => ({ name, metadata: entry.metadata })), list_complete: true }),
@@ -236,7 +239,7 @@ test("retired Link generation hides stale KV and explicit rebind creates a newer
   assert.equal(retired.status, "RETIRED");
   assert.deepEqual((await (await list()).json()).files, []);
   const reserved = (await callLinkBinding(env, { action: "reserve", linkKey: key,
-    objectRef: "r2:new", attemptId: "new-upload" })).binding;
+    objectRef: oid("r2:new"), attemptId: "new-upload" })).binding;
   await callLinkBinding(env, { action: "commit", linkKey: key,
     attemptId: "new-upload", generation: reserved.attempt.generation });
   assert.ok(reserved.generation > old.generation);
@@ -246,18 +249,18 @@ test("retired Link generation hides stale KV and explicit rebind creates a newer
     }), env, waitUntil() {} });
   assert.equal(staleDelete.status, 409);
   assert.deepEqual((await (await list()).json()).files, []); // old KV projection is still stale
-  records.set(key, { value: "r2", metadata: { b: "r2", k_s3: "new", g: reserved.generation } });
+  records.set(key, { value: "", metadata: { b: "r2", k_s3: "new", g: reserved.generation } });
   assert.equal((await (await list()).json()).files.length, 1);
 });
 
 test("admin list and lookup never regress behind acknowledged Link expiry policy", async () => {
   const key = "public.example:ttl.webp";
   const env = { ADMIN_API_TOKEN: "secret", LINK_BINDING: memoryBindingNamespace() };
-  await bindExisting(env, key, "r2:objects/ttl");
+  await bindExisting(env, key, oid("r2:objects/ttl"));
   const binding = (await callLinkBinding(env, { action: "inspect", linkKey: key })).binding;
   const oldExpiry = Date.now() + 3 * 86400000;
   const newExpiry = Date.now() + 7 * 86400000;
-  const records = new Map([[key, { value: "r2", metadata: { b: "r2", k_s3: "objects/ttl",
+  const records = new Map([[key, { value: "", metadata: { b: "r2", k_s3: "objects/ttl",
     g: binding.generation, e: Math.floor(oldExpiry / 1000) } }]]);
   env.CIVIDGE_KV = {
     getWithMetadata: async name => records.get(name) || { value: null, metadata: null },
@@ -281,13 +284,22 @@ test("admin list and lookup never regress behind acknowledged Link expiry policy
 test("Placement reacquisition does not change a live Link generation", async () => {
   const env = { LINK_BINDING: memoryBindingNamespace() };
   const linkKey = "public.example:same.webp";
-  await bindExisting(env, linkKey, "ipfs:cid");
+  await bindExisting(env, linkKey, oid("ipfs:cid"));
   const before = (await callLinkBinding(env, { action: "inspect", linkKey })).binding;
   const reserved = (await callLinkBinding(env, { action: "reserve", linkKey,
-    objectRef: "ipfs:cid", attemptId: "reacquire", acquirePlacement: true,
+    objectRef: oid("ipfs:cid"), attemptId: "reacquire", acquirePlacement: true,
     placement: { kind: "filebase_rpc", locator: { cid: "cid" } } })).binding;
   assert.equal(reserved.generation, before.generation);
   assert.ok(reserved.attempt.generation > before.attemptGeneration);
+});
+
+test("LinkBinding uses the clean ObjectId routing epoch without changing public Link identity", async () => {
+  const names = [];
+  const namespace = memoryBindingNamespace();
+  const env = { LINK_BINDING: { ...namespace, idFromName(name) { names.push(name); return name; } } };
+  const linkKey = "public.example:clean.webp";
+  await callLinkBinding(env, { action: "inspect", linkKey });
+  assert.deepEqual(names, ["objectid-v1:" + linkKey]);
 });
 
 test("registry rejects bare Link keys and canonicalizes the host in accepted keys", async () => {
@@ -296,13 +308,14 @@ test("registry rejects bare Link keys and canonicalizes the host in accepted key
   const env = {
     CIVIDGE_KV: kv,
     ADMIN_API_TOKEN: "secret",
+    R2_BUCKET_NAME: "cividge",
     LINK_BINDING: memoryBindingNamespace(),
     OBJECT_LIFECYCLE: {
       idFromName: (name) => name,
       get: () => ({ fetch: async (_url, options) => {
         lifecycleCalls.push(JSON.parse(options.body));
         return new Response(JSON.stringify({ lifecycle: {
-          placements: { r2: { state: "PRESENT", kind: "r2", executor: "worker", locator: { key: "ok.webp" } } },
+          placements: { r2: { state: "PRESENT", kind: "r2", executor: "worker", locator: { bucket: "cividge", key: "ok.webp" } } },
         } }), { status: 200 });
       } }),
     },
@@ -310,18 +323,19 @@ test("registry rejects bare Link keys and canonicalizes the host in accepted key
   const headers = { Authorization: "Bearer secret", "Content-Type": "application/json" };
 
   const bare = await onRequestPost({ request: new Request("https://worker.example/api/cividge-kv", {
-    method: "POST", headers, body: JSON.stringify({ key: "bare.webp", cid: "r2", backend: "r2", s3Key: "bare.webp" }),
+    method: "POST", headers, body: JSON.stringify({ key: "bare.webp", cid: "", objectId: oid("bare"), backend: "r2", s3Key: "bare.webp" }),
   }), env, waitUntil() {} });
   assert.equal(bare.status, 400);
 
   const canonical = await onRequestPost({ request: new Request("https://worker.example/api/cividge-kv", {
-    method: "POST", headers, body: JSON.stringify({ key: "PUBLIC.EXAMPLE:ok.webp", cid: "r2", backend: "r2", s3Key: "ok.webp", allowedHost: "other.example" }),
+    method: "POST", headers, body: JSON.stringify({ key: "PUBLIC.EXAMPLE:ok.webp", cid: "", objectId: oid("r2:ok.webp"), backend: "r2", bucket: "cividge", s3Key: "ok.webp", thumbnailKey: "ok.webp.thumb.webp", allowedHost: "other.example" }),
   }), env, waitUntil() {} });
   assert.equal(canonical.status, 200);
   assert.equal(kv.calls.put[0].key, "public.example:ok.webp");
   assert.equal(kv.calls.put[0].options.metadata.d, "public.example");
   assert.equal(kv.calls.put[0].options.metadata.g, 1);
-  assert.equal(lifecycleCalls[0].objectRef, "r2:ok.webp");
+  assert.equal(kv.calls.put[0].options.metadata.th, undefined, "client thumbnail names cannot create derived artifacts");
+  assert.equal(lifecycleCalls[0].objectRef, oid("r2:ok.webp"));
 });
 
 test("failed LinkBinding commit never publishes a KV projection", async () => {
@@ -338,18 +352,18 @@ test("failed LinkBinding commit never publishes a KV projection", async () => {
     } };
   };
   const env = {
-    CIVIDGE_KV: kv, ADMIN_API_TOKEN: "secret", LINK_BINDING: bindings,
+    CIVIDGE_KV: kv, ADMIN_API_TOKEN: "secret", R2_BUCKET_NAME: "cividge", LINK_BINDING: bindings,
     OBJECT_LIFECYCLE: {
       idFromName: value => value,
       get: () => ({ fetch: async () => Response.json({ lifecycle: {
         links: ["public.example:ok.webp"],
-        placements: { r2: { state: "PRESENT", kind: "r2", locator: { key: "ok.webp" } } },
+        placements: { r2: { state: "PRESENT", kind: "r2", locator: { bucket: "cividge", key: "ok.webp" } } },
       } }) }),
     },
   };
   const response = await onRequestPost({ request: new Request("https://worker.example/api/cividge-kv", {
     method: "POST", headers: { Authorization: "Bearer secret", "Content-Type": "application/json" },
-    body: JSON.stringify({ key: "public.example:ok.webp", cid: "r2", backend: "r2", s3Key: "ok.webp" }),
+    body: JSON.stringify({ key: "public.example:ok.webp", cid: "", objectId: oid("ok"), backend: "r2", bucket: "cividge", s3Key: "ok.webp" }),
   }), env, waitUntil() {} });
   assert.notEqual(response.status, 200);
   assert.deepEqual(kv.calls.put, []);
@@ -359,16 +373,17 @@ test("creating an alias projection leaves the source Link and projection intact"
   const source = "test-up.pages.dev:shared.webp";
   const alias = "testunko.pages.dev:shared.webp";
   const records = new Map([
-    [source, { value: "r2", metadata: { b: "r2", d: "test-up.pages.dev", k_s3: "shared.webp", s: 10 } }],
+    [source, { value: "", metadata: { b: "r2", bk: "cividge", d: "test-up.pages.dev", k_s3: "shared.webp", oid: oid("r2:shared.webp"), s: 10 } }],
   ]);
   const kv = memoryKv(records);
-  const state = newLifecycle("r2:shared.webp", [
-    { kind: "r2", executor: "worker", locator: { key: "shared.webp" } },
+  const state = newLifecycle(oid("r2:shared.webp"), [
+    { kind: "r2", executor: "worker", locator: { bucket: "cividge", key: "shared.webp" } },
   ]);
   addLink(state, source);
   const env = {
     CIVIDGE_KV: kv,
     ADMIN_API_TOKEN: "secret",
+    R2_BUCKET_NAME: "cividge",
     LINK_BINDING: memoryBindingNamespace(),
     OBJECT_LIFECYCLE: {
       idFromName: value => value,
@@ -385,8 +400,10 @@ test("creating an alias projection leaves the source Link and projection intact"
       headers: { Authorization: "Bearer secret", "Content-Type": "application/json" },
       body: JSON.stringify({
         key: alias,
-        cid: "r2",
+        cid: "",
+        objectId: state.objectRef,
         backend: "r2",
+        bucket: "cividge",
         s3Key: "shared.webp",
         createOnly: true,
       }),
@@ -401,8 +418,8 @@ test("creating an alias projection leaves the source Link and projection intact"
 });
 
 test("a peer Link prevents release; the final Link alone makes release a candidate", () => {
-  const state = newLifecycle("r2:media/example.webp", [
-    { kind: "r2", executor: "worker", locator: { key: "media/example.webp" } },
+  const state = newLifecycle(oid("r2:media/example.webp"), [
+    { kind: "r2", executor: "worker", locator: { bucket: "cividge", key: "media/example.webp" } },
   ]);
   addLink(state, "public.example:a.webp");
   addLink(state, "mirror.example:b.webp");
@@ -416,8 +433,8 @@ test("a peer Link prevents release; the final Link alone makes release a candida
 });
 
 test("release is persisted before external execution and can retry safely", () => {
-  const state = newLifecycle("ipfs:bafytest", [
-    { kind: "filebase", executor: "browser", locator: { key: "x.webp", cid: "bafytest" } },
+  const state = newLifecycle(oid("ipfs:bafytest"), [
+    { kind: "filebase", executor: "browser", locator: { bucket: "cividge", key: "x.webp", cid: "bafytest" } },
   ]);
   addLink(state, "public.example:x.webp");
   removeLink(state, "public.example:x.webp");
@@ -433,8 +450,8 @@ test("release is persisted before external execution and can retry safely", () =
 });
 
 test("a retryable release converges after exact read-only placement observation", () => {
-  const placement = { kind: "filebase", executor: "browser", locator: { key: "objects/cid", cid: "cid" } };
-  const state = newLifecycle("ipfs:cid", [placement]);
+  const placement = { kind: "filebase", executor: "browser", locator: { bucket: "cividge", key: "objects/cid", cid: "cid" } };
+  const state = newLifecycle(oid("ipfs:cid"), [placement]);
   addLink(state, "public.example:old.webp");
   removeLink(state, "public.example:old.webp");
   requestRelease(state);
@@ -454,30 +471,30 @@ test("a retryable release converges after exact read-only placement observation"
 test("fresh authority classes use the same Link and Object transitions", () => {
   assert.equal(ObjectLifecycle.name, "ObjectLifecycleV2");
   assert.equal(LinkBinding.name, "LinkBindingV2");
-  assert.deepEqual(newLifecycle("ipfs:bafy-fresh").pendingLinkRemovals, []);
+  assert.deepEqual(newLifecycle(oid("ipfs:bafy-fresh")).pendingLinkRemovals, []);
 });
 
 test("present inspection can adopt a retryable release but never an active claim", () => {
-  const placement = { kind: "r2", executor: "worker", locator: { key: "objects/cid" } };
-  const state = newLifecycle("r2:objects/cid", [placement]);
+  const placement = { kind: "r2", executor: "worker", locator: { bucket: "cividge", key: "objects/cid" } };
+  const state = newLifecycle(oid("r2:objects/cid"), [placement]);
   requestRelease(state);
   const claim = claimPlacement(state, "r2", "release", "release-1").task;
   assert.throws(() => reconcilePlacementForAcquire(state, placement, "present"), /cannot be reconciled/);
   reportPlacement(state, "r2", { ...claim, outcome: "retryable" });
   assert.throws(() => reconcilePlacementForAcquire(state,
-    { ...placement, locator: { key: "other" } }, "present"), /locator mismatch/);
+    { ...placement, locator: { bucket: "cividge", key: "other" } }, "present"), /locator mismatch/);
   reconcilePlacementForAcquire(state, placement, "present");
   addLink(state, "public.example:again.webp");
   assert.equal(state.state, "ACTIVE");
 });
 
 test("a Link can cancel pending release but never resurrect releasing content", () => {
-  const pending = newLifecycle("r2:x.webp", [{ kind: "r2", executor: "worker", locator: { key: "x.webp" } }]);
+  const pending = newLifecycle(oid("r2:x.webp"), [{ kind: "r2", executor: "worker", locator: { bucket: "cividge", key: "x.webp" } }]);
   requestRelease(pending);
   addLink(pending, "public.example:x.webp");
   assert.equal(pending.state, "ACTIVE");
 
-  const releasing = newLifecycle("r2:y.webp", [{ kind: "r2", executor: "worker", locator: { key: "y.webp" } }]);
+  const releasing = newLifecycle(oid("r2:y.webp"), [{ kind: "r2", executor: "worker", locator: { bucket: "cividge", key: "y.webp" } }]);
   requestRelease(releasing);
   claimPlacement(releasing, "r2", "release", "claim-r2");
   assert.throws(() => addLink(releasing, "public.example:y.webp"), /not linkable/);
@@ -486,7 +503,7 @@ test("a Link can cancel pending release but never resurrect releasing content", 
 test("uncertain RPC unpin cannot be converted back into a PRESENT Placement", () => {
   const cid = "Qm" + "a".repeat(44);
   const rpc = { kind: "filebase_rpc", executor: "worker", provenance: "cividge_worker_rpc", locator: { cid } };
-  const state = newLifecycle(`ipfs:${cid}`, [rpc]);
+  const state = newLifecycle(oid(cid), [rpc]);
   addLink(state, "public.example:rpc.webp");
   removeLink(state, "public.example:rpc.webp");
   requestRelease(state);
@@ -500,15 +517,15 @@ test("uncertain RPC unpin cannot be converted back into a PRESENT Placement", ()
 test("RPC actuator requires dedicated bucket and durable Worker provenance", () => {
   const cid = "Qm" + "a".repeat(44);
   const rpc = { kind: "filebase_rpc", executor: "worker", provenance: "cividge_worker_rpc", locator: { cid } };
-  assert.throws(() => newLifecycle(`ipfs:${cid}`, [{ ...rpc, provenance: "browser_s3" }]), /provenance/);
+  assert.throws(() => newLifecycle(oid(cid), [{ ...rpc, provenance: "browser_s3" }]), /provenance/);
   assert.equal(isManagedRpcReleaseEnabled({ FILEBASE_DEDICATED_BUCKET: "false", FILEBASE_IPFS_API_KEY: "key" }, rpc), false);
   assert.equal(isManagedRpcReleaseEnabled({ FILEBASE_DEDICATED_BUCKET: "true", FILEBASE_IPFS_API_KEY: "key" },
-    { kind: "filebase", executor: "browser", locator: { key: "x", cid } }), false);
+    { kind: "filebase", executor: "browser", locator: { bucket: "cividge", key: "x", cid } }), false);
   assert.equal(isManagedRpcReleaseEnabled({ FILEBASE_DEDICATED_BUCKET: "true", FILEBASE_IPFS_API_KEY: "key" }, rpc), true);
 });
 
 test("duplicate actuator reports are idempotent and contradictory reports fail", () => {
-  const state = newLifecycle("r2:duplicate.webp", [{ kind: "r2", executor: "worker", locator: { key: "duplicate.webp" } }]);
+  const state = newLifecycle(oid("r2:duplicate.webp"), [{ kind: "r2", executor: "worker", locator: { bucket: "cividge", key: "duplicate.webp" } }]);
   requestRelease(state);
   const task = claimPlacement(state, "r2", "release", "claim-duplicate").task;
   reportPlacement(state, "r2", { ...task, outcome: "released" });
@@ -518,8 +535,8 @@ test("duplicate actuator reports are idempotent and contradictory reports fail",
 });
 
 test("a linked source cannot be released while preservation is only pinning", () => {
-  const state = newLifecycle("ipfs:bafy-preserve", [
-    { kind: "filebase", executor: "browser", locator: { key: "source.webp", cid: "bafy-preserve" } },
+  const state = newLifecycle(oid("ipfs:bafy-preserve"), [
+    { kind: "filebase", executor: "browser", locator: { bucket: "cividge", key: "source.webp", cid: "bafy-preserve" } },
   ]);
   addLink(state, "public.example:source.webp");
   requestPlacementAcquire(state, { kind: "kubo", executor: "browser", locator: { cid: "bafy-preserve" } });
@@ -528,8 +545,8 @@ test("a linked source cannot be released while preservation is only pinning", ()
 });
 
 test("confirmed Kubo placement alone permits source release", () => {
-  const state = newLifecycle("ipfs:bafy-confirmed", [
-    { kind: "filebase", executor: "browser", locator: { key: "source.webp", cid: "bafy-confirmed" } },
+  const state = newLifecycle(oid("ipfs:bafy-confirmed"), [
+    { kind: "filebase", executor: "browser", locator: { bucket: "cividge", key: "source.webp", cid: "bafy-confirmed" } },
   ]);
   addLink(state, "public.example:source.webp");
   requestPlacementAcquire(state, { kind: "kubo", executor: "browser", locator: { cid: "bafy-confirmed" } });
@@ -540,8 +557,8 @@ test("confirmed Kubo placement alone permits source release", () => {
 });
 
 test("createLink adds peer Links without changing an existing peer", () => {
-  const state = newLifecycle("r2:shared.webp", [
-    { kind: "r2", executor: "worker", locator: { key: "shared.webp" } },
+  const state = newLifecycle(oid("r2:shared.webp"), [
+    { kind: "r2", executor: "worker", locator: { bucket: "cividge", key: "shared.webp" } },
   ]);
   addLink(state, "test-up.pages.dev:shared.webp");
   const beforePlacement = structuredClone(state.placements.r2);
@@ -553,8 +570,8 @@ test("createLink adds peer Links without changing an existing peer", () => {
 });
 
 test("a confirmed Filebase re-upload can re-acquire a released ObjectRef and recreate the same Link", () => {
-  const placement = { kind: "filebase", executor: "browser", locator: { key: "same.webp", cid: "bafy-same" } };
-  const state = newLifecycle("ipfs:bafy-same", [placement]);
+  const placement = { kind: "filebase", executor: "browser", locator: { bucket: "cividge", key: "same.webp", cid: "bafy-same" } };
+  const state = newLifecycle(oid("ipfs:bafy-same"), [placement]);
   addLink(state, "public.example:same.webp");
   removeLink(state, "public.example:same.webp");
   requestRelease(state);
@@ -575,8 +592,8 @@ test("a confirmed Filebase re-upload can re-acquire a released ObjectRef and rec
 });
 
 test("createLink atomically re-acquires a confirmed released Placement", async () => {
-  const placement = { kind: "filebase", executor: "browser", locator: { key: "same.webp", cid: "bafy-do-same" } };
-  const released = newLifecycle("ipfs:bafy-do-same", [placement]);
+  const placement = { kind: "filebase", executor: "browser", locator: { bucket: "cividge", key: "same.webp", cid: "bafy-do-same" } };
+  const released = newLifecycle(oid("ipfs:bafy-do-same"), [placement]);
   addLink(released, "public.example:same.webp");
   removeLink(released, "public.example:same.webp");
   requestRelease(released);
@@ -602,7 +619,7 @@ test("createLink atomically re-acquires a confirmed released Placement", async (
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       action: "createLink",
-      objectRef: "ipfs:bafy-do-same",
+      objectRef: oid("ipfs:bafy-do-same"),
       linkKey: "public.example:same.webp",
       placements: [placement],
       confirmedPlacements: [placement],
@@ -618,8 +635,8 @@ test("createLink atomically re-acquires a confirmed released Placement", async (
 });
 
 test("same-host alternate name is a peer Link and preserves the source Link", () => {
-  const state = newLifecycle("r2:source.webp", [
-    { kind: "r2", executor: "worker", locator: { key: "source.webp" } },
+  const state = newLifecycle(oid("r2:source.webp"), [
+    { kind: "r2", executor: "worker", locator: { bucket: "cividge", key: "source.webp" } },
   ]);
   addLink(state, "test-up.pages.dev:source.webp");
   addLink(state, "test-up.pages.dev:alternate.webp");
@@ -628,8 +645,8 @@ test("same-host alternate name is a peer Link and preserves the source Link", ()
 });
 
 test("an abandoned Kubo acquisition claim becomes retryable without inferring PRESENT", () => {
-  const state = newLifecycle("ipfs:bafy-lease", [
-    { kind: "filebase", executor: "browser", locator: { key: "lease.webp", cid: "bafy-lease" } },
+  const state = newLifecycle(oid("ipfs:bafy-lease"), [
+    { kind: "filebase", executor: "browser", locator: { bucket: "cividge", key: "lease.webp", cid: "bafy-lease" } },
   ]);
   addLink(state, "public.example:lease.webp");
   requestPlacementAcquire(state, { kind: "kubo", executor: "browser", locator: { cid: "bafy-lease" } });
@@ -647,8 +664,8 @@ test("an abandoned Kubo acquisition claim becomes retryable without inferring PR
 });
 
 test("pending Link removal remains a reference until projection deletion completes", () => {
-  const state = newLifecycle("r2:retry.webp", [
-    { kind: "r2", executor: "worker", locator: { key: "retry.webp" } },
+  const state = newLifecycle(oid("r2:retry.webp"), [
+    { kind: "r2", executor: "worker", locator: { bucket: "cividge", key: "retry.webp" } },
   ]);
   addLink(state, "public.example:retry.webp");
   beginRemoveLink(state, "public.example:retry.webp");
@@ -662,11 +679,11 @@ test("pending Link removal remains a reference until projection deletion complet
 
 test("removeLink retries safely after projection deletion failure", async () => {
   const linkKey = "public.example:retry-delete.webp";
-  const state = newLifecycle("r2:retry-delete.webp", [
-    { kind: "r2", executor: "worker", locator: { key: "retry-delete.webp" } },
+  const state = newLifecycle(oid("r2:retry-delete.webp"), [
+    { kind: "r2", executor: "worker", locator: { bucket: "cividge", key: "retry-delete.webp" } },
   ]);
   addLink(state, linkKey);
-  const records = new Map([[linkKey, { value: "r2", metadata: { b: "r2", k_s3: "retry-delete.webp" } }]]);
+  const records = new Map([[linkKey, { value: "", metadata: { b: "r2", k_s3: "retry-delete.webp" } }]]);
   const kv = memoryKv(records);
   let failDelete = true;
   kv.delete = async key => {
@@ -691,7 +708,7 @@ test("removeLink retries safely after projection deletion failure", async () => 
       } }),
     },
   };
-  await bindExisting(env, linkKey, "r2:retry-delete.webp");
+  await bindExisting(env, linkKey, oid("r2:retry-delete.webp"));
   const makeContext = () => ({
     request: new Request("https://worker.example/api/cividge-kv?key=" + encodeURIComponent(linkKey), {
       method: "DELETE",
@@ -712,12 +729,12 @@ test("removeLink retries safely after projection deletion failure", async () => 
 
 test("removeLink retries safely when authority completion fails after projection deletion", async () => {
   const linkKey = "public.example:retry-authority.webp";
-  const objectRef = "r2:retry-authority.webp";
+  const objectRef = oid("r2:retry-authority.webp");
   const state = newLifecycle(objectRef, [
-    { kind: "r2", executor: "worker", locator: { key: "retry-authority.webp" } },
+    { kind: "r2", executor: "worker", locator: { bucket: "cividge", key: "retry-authority.webp" } },
   ]);
   addLink(state, linkKey);
-  const records = new Map([[linkKey, { value: "r2", metadata: { b: "r2", k_s3: "retry-authority.webp" } }]]);
+  const records = new Map([[linkKey, { value: "", metadata: { b: "r2", k_s3: "retry-authority.webp" } }]]);
   const kv = memoryKv(records);
   let failCompletion = true;
   const env = {
@@ -765,8 +782,8 @@ test("removeLink retries safely when authority completion fails after projection
 });
 
 test("stale claim reports cannot mutate a newer placement generation", () => {
-  const state = newLifecycle("r2:stale.webp", [
-    { kind: "r2", executor: "worker", locator: { key: "stale.webp" } },
+  const state = newLifecycle(oid("r2:stale.webp"), [
+    { kind: "r2", executor: "worker", locator: { bucket: "cividge", key: "stale.webp" } },
   ]);
   requestRelease(state);
   const first = claimPlacement(state, "r2", "release", "old").task;
@@ -789,7 +806,7 @@ test("lifecycle mutation requires the admin token", async () => {
       } }),
     },
   };
-  const body = JSON.stringify({ action: "inspect", objectRef: "r2:test.webp" });
+  const body = JSON.stringify({ action: "inspect", objectRef: oid("r2:test.webp") });
   const denied = await onLifecyclePost({ request: new Request("https://worker/api/lifecycle", { method: "POST", body }), env });
   assert.equal(denied.status, 401);
   const allowed = await onLifecyclePost({
@@ -806,8 +823,8 @@ test("lifecycle mutation requires the admin token", async () => {
 
 test("DO placement state is projected to every peer Link", async () => {
   const records = new Map([
-    ["a.example:x.webp", { value: "r2", metadata: { b: "r2", k_s3: "x.webp", f: 0 } }],
-    ["b.example:x.webp", { value: "r2", metadata: { b: "r2", k_s3: "x.webp", f: 0 } }],
+    ["a.example:x.webp", { value: "", metadata: { b: "r2", k_s3: "x.webp", f: 0 } }],
+    ["b.example:x.webp", { value: "", metadata: { b: "r2", k_s3: "x.webp", f: 0 } }],
   ]);
   const kv = memoryKv(records);
   await syncLifecycleProjection({ CIVIDGE_KV: kv }, {

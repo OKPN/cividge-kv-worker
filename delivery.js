@@ -3,6 +3,7 @@
 
 import { CHARACTER_WEBP_BASE64 } from "./character_image.js";
 import { orderPublicGateways, readGatewayConfig } from "./gateway-config.js";
+import { thumbnailR2Key } from "./lifecycle-model.js";
 
 let characterWebpBytes = null;
 function getCharacterWebpBytes() {
@@ -334,14 +335,13 @@ function isSocialCrawler(userAgent = "") {
 }
 
 // 🖼️ SNSクローラー向け軽量 OGP HTML レスポンス生成（大容量バイナリ取得によるプレビュー失敗を完全防止）
-function renderOgpHtml(filename, rawUrl, ext, isVideo, origin, thumbnailKey = null) {
+function renderOgpHtml(filename, rawUrl, ext, isVideo, hasThumbnail = false) {
   const title = `${filename}`;
   const siteName = "Cividge Media";
-  // 動画の場合は同名先頭フレームサムネイル（.thumb.webp）を最優先指定
-  // クローラーが og:image を取得しに来た際に OGP HTML ではなく画像実体を返すよう ?raw=1 を付与
+  // The preview is a representation of this Link, not a second public Link.
   const separator = rawUrl.includes("?") ? "&" : "?";
   const rawMediaUrl = `${rawUrl}${separator}raw=1`;
-  const videoThumbUrl = `${origin}/${encodeURIComponent(thumbnailKey || `${filename}.thumb.webp`)}?raw=1`;
+  const videoThumbUrl = `${rawUrl}${separator}preview=1`;
   const mediaUrl = rawUrl;
   const thumbUrl = isVideo ? videoThumbUrl : rawMediaUrl;
   const mimeType = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : (ext === "png" ? "image/png" : (ext === "webp" ? "image/webp" : "application/octet-stream"));
@@ -358,16 +358,16 @@ function renderOgpHtml(filename, rawUrl, ext, isVideo, origin, thumbnailKey = nu
   <meta name="twitter:description" content="${title} - Cividge Media">
   <meta property="og:site_name" content="${siteName}">
   <meta property="og:url" content="${mediaUrl}">
-  <meta property="og:image" content="${thumbUrl}">
+  ${!isVideo || hasThumbnail ? `<meta property="og:image" content="${thumbUrl}">
   <meta property="og:image:secure_url" content="${thumbUrl}">
-  <meta property="og:image:type" content="${mimeType}">
+  <meta property="og:image:type" content="${isVideo ? "image/webp" : mimeType}">` : ""}
   ${isVideo ? `
   <meta property="og:type" content="video.other">
   <meta property="og:video" content="${mediaUrl}">
   <meta property="og:video:secure_url" content="${mediaUrl}">
   <meta property="og:video:type" content="video/${ext === "webm" ? "webm" : "mp4"}">
   <meta name="twitter:card" content="player">
-  <meta name="twitter:image" content="${thumbUrl}">
+  ${hasThumbnail ? `<meta name="twitter:image" content="${thumbUrl}">` : ""}
   <meta name="twitter:player" content="${mediaUrl}">
   ` : `
   <meta property="og:type" content="article">
@@ -377,7 +377,7 @@ function renderOgpHtml(filename, rawUrl, ext, isVideo, origin, thumbnailKey = nu
 </head>
 <body style="margin:0;background:#0f172a;display:flex;align-items:center;justify-content:center;min-height:100vh;">
   ${isVideo ? `
-  <video src="${mediaUrl}" poster="${thumbUrl}" controls autoplay playsinline style="max-width:100%;max-height:100vh;"></video>
+  <video src="${mediaUrl}" ${hasThumbnail ? `poster="${thumbUrl}"` : ""} controls autoplay playsinline style="max-width:100%;max-height:100vh;"></video>
   ` : `
   <img src="${mediaUrl}" alt="${title}" style="max-width:100%;max-height:100vh;object-fit:contain;">
   `}
@@ -393,7 +393,7 @@ function wantsHumanNotFound(request) {
 
 // Internal Cache API keys are versioned at a clean KV/DO authority cutover.
 // The public URL and canonical Link key do not change.
-const DELIVERY_CACHE_EPOCH = "4";
+const DELIVERY_CACHE_EPOCH = "5";
 export function deliveryCacheRequest(request) {
   const url = new URL(request.url);
   url.searchParams.set("__cividge_cache_epoch", DELIVERY_CACHE_EPOCH);
@@ -531,7 +531,8 @@ export async function onRequest(context) {
   // The compatibility probe must reach the current relay-id resolution. An
   // old cached SVG 404 is not proof that this Pages host is registered.
   const characterProbe = /(?:^|\/)404-character\.webp$/.test(new URL(request.url).pathname);
-  if (!characterProbe && edgeCache && (request.method === "GET" || request.method === "HEAD")) {
+  const previewRequested = new URL(request.url).searchParams.has("preview");
+  if (!characterProbe && !previewRequested && edgeCache && (request.method === "GET" || request.method === "HEAD")) {
     try {
       const cached = await edgeCache.match(deliveryCacheRequest(request));
       if (cached) {
@@ -659,17 +660,16 @@ export async function onRequest(context) {
   // 🛡️ 台帳存在チェック（ランダムパス攻撃防御）:
   // 台帳に存在しないファイル名は、R2 / IPFS どちらのストレージも検索しない。
   // 攻撃で上流アクセスを発生させず、エッジ最前線で即座に 404 返却する。
-  let isIpfsRecord = Boolean(
-    (targetCid && targetCid !== "r2") ||
-    (meta.c && meta.c !== "r2") ||
-    (meta.cid && meta.cid !== "r2")
-  );
-  let isR2Record = !isIpfsRecord && Boolean(
-    targetCid === "r2" ||
-    meta.backend === "r2" ||
-    meta.b === "r2" ||
-    (resolvedKvKey && Boolean(env.R2_BUCKET))
-  );
+  // Backend is an explicit delivery projection field. A CID never doubles as
+  // a storage-kind marker, and a present but malformed projection is 503.
+  const projectedBackend = meta.b || meta.backend;
+  const projectedCid = meta.c_cid || meta.contentCid || targetCid || meta.c || meta.cid || "";
+  if (projectedCid && !/^(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,})$/.test(projectedCid)) {
+    return renderOriginUnavailableResponse(request);
+  }
+  let isR2Record = projectedBackend === "r2";
+  let isIpfsRecord = ["filebase", "filebase_rpc"].includes(projectedBackend) &&
+    Boolean(projectedCid);
   let hasValidLedgerRecord = Boolean(isIpfsRecord || isR2Record);
   if (!hasValidLedgerRecord) {
     // Only an authoritative KV miss is 404. A present but unusable projection
@@ -764,6 +764,30 @@ export async function onRequest(context) {
     }
   }
 
+  if (previewRequested) {
+    // Public delivery still performs exactly one canonical Link KV lookup.
+    // This dependent representation inherits Link expiry and password gating.
+    if (!["mp4", "webm", "mov", "m4v", "avi", "ogv"].includes(extMatch[1].toLowerCase())) {
+      return new Response("No video preview", { status: 404, headers: { "Cache-Control": "no-store" } });
+    }
+    let expectedKey;
+    try { expectedKey = thumbnailR2Key(meta.oid); } catch (_) {
+      return renderOriginUnavailableResponse(request);
+    }
+    if (!meta.th) return new Response("Preview unavailable", { status: 404, headers: { "Cache-Control": "no-store" } });
+    if (meta.th !== expectedKey) return renderOriginUnavailableResponse(request);
+    if (!env.R2_BUCKET) return renderOriginUnavailableResponse(request);
+    let thumbnail;
+    try { thumbnail = await env.R2_BUCKET.get(expectedKey); }
+    catch (_) { return renderOriginUnavailableResponse(request); }
+    if (!thumbnail) return renderOriginUnavailableResponse(request);
+    return new Response(request.method === "HEAD" ? null : thumbnail.body, {
+      status: 200,
+      headers: { "Content-Type": "image/webp", "Cache-Control": "no-store",
+        "Access-Control-Allow-Origin": "*", "X-Content-Type-Options": "nosniff" },
+    });
+  }
+
   // 🤖 SNSクローラー（Misskey Summaly, Twitter, Discord等）への OGP HTML 即時応答
   // OGP HTML を即座に返すことで、Misskey/SummalyBot がメタデータとサムネイル画像を確実に取得・カード展開できるようにする
   const userAgent = request.headers.get("user-agent") || "";
@@ -773,8 +797,7 @@ export async function onRequest(context) {
   const crawlerExt = extMatch[1].toLowerCase();
   const isCrawlerVideo = (crawlerExt === "mp4" || crawlerExt === "webm");
   if (!hasPassword && !isRawRequested && !isImageAccept && isSocialCrawler(userAgent)) {
-    const ogpThumbnailKey = meta.th || meta.thumbnailKey || ((meta.k_s3 || meta.s3Key) ? `${meta.k_s3 || meta.s3Key}.thumb.webp` : null);
-    const ogpHtml = renderOgpHtml(filename, request.url, crawlerExt, isCrawlerVideo, url.origin, ogpThumbnailKey);
+    const ogpHtml = renderOgpHtml(filename, request.url, crawlerExt, isCrawlerVideo, Boolean(meta.th));
     return new Response(ogpHtml, {
       status: 200,
       headers: {
@@ -834,11 +857,7 @@ export async function onRequest(context) {
 
   // ⚡ 3.5. R2 ストレージの配信処理（台帳が R2 の場合は R2 バケットを優先検索）
   // See: [INV-DELIVERY-004] (R2 と IPFS の相互排他ルーティング ＆ R2→Kubo フォールバック)
-  const isOriginR2 = Boolean(
-    targetCid === "r2" ||
-    meta.backend === "r2" ||
-    meta.b === "r2"
-  );
+  const isOriginR2 = projectedBackend === "r2";
   const isR2 = !isIpfsRecord && Boolean(isR2Record || isOriginR2);
   if (isR2) {
     if (env && env.R2_BUCKET) {
@@ -875,7 +894,7 @@ export async function onRequest(context) {
 
     // 🪐 R2 実体未検出時の Kubo / IPFS フォールバック判定:
     // contentCid が記録されており、Kubo/IPFS に実体が移行している可能性がある場合は IPFS 探索へ
-    const r2ContentCid = meta.contentCid || meta.c_cid || (meta.cid && meta.cid !== "r2" ? meta.cid : null);
+    const r2ContentCid = projectedCid || null;
     if (!r2ContentCid) {
       return renderOriginUnavailableResponse(request);
     }
@@ -883,11 +902,11 @@ export async function onRequest(context) {
   }
 
   // 候補ターゲット（CID、S3Key、ファイル名）を順次試行
-  const r2ContentCid = meta.contentCid || meta.c_cid || (meta.cid && meta.cid !== "r2" ? meta.cid : null);
+  const r2ContentCid = projectedCid || null;
   const candidates = [];
   if (r2ContentCid) {
     candidates.push(r2ContentCid);
-  } else if (targetCid && targetCid !== "r2") {
+  } else if (targetCid) {
     candidates.push(targetCid);
   }
   const effectiveS3Key = meta.k_s3 || meta.s3Key;

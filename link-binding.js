@@ -74,7 +74,7 @@ export class LinkBindingV2 {
         if (body.cid) state.attempt.cid = String(body.cid);
       } else if (action === "recordUnexpectedCid") {
         requireAttempt(state, body.attemptId, body.generation);
-        if (!body.cid || !parseObjectRef(`ipfs:${String(body.cid).toLowerCase()}`)) {
+        if (!/^Qm[1-9A-HJ-NP-Za-km-z]{44}$|^b[a-z2-7]{20,}$/.test(String(body.cid || ""))) {
           throw new Error("A valid observed CID is required");
         }
         // Observation only: this does not attest Placement ownership or

@@ -6,6 +6,20 @@ High-performance, edge-caching media delivery and metadata registry worker desig
 
 cividge-kv-worker serves as the decentralized backend routing and caching layer for Cividge. It bridges Cloudflare Pages frontend, distributed IPFS storage (via Filebase), and Cloudflare R2 object storage with zero-egress cost and extreme resilience against high-traffic spikes (e.g. social media viral loops and DDoS).
 
+An ObjectId is `sha256:<digest>` of exact final bytes, independent of provider,
+bucket, key and CID. LinkBinding maps canonical `host:filename` to that
+ObjectId; one ObjectLifecycle Durable Object owns all R2/Filebase/Kubo
+Placements and release decisions for it. Public GET still reads one KV
+projection and never calls a Durable Object. This pre-release cutover uses a
+fresh LinkBinding routing epoch; discard old KV projections before deployment,
+without interpreting KV reset as deletion of physical storage or DO state.
+An S3 Placement records its exact `(bucket, key)` and the R2 Worker binding
+must declare `R2_BUCKET_NAME` equal to the `[[r2_buckets]].bucket_name` value.
+The browser's R2/Filebase bucket selection must match the Placement's bucket
+before reacquisition or physical release. A generated video thumbnail is
+dependent R2 preview data owned by the parent ObjectLifecycle, not a public
+Link or a Placement of the video's immutable bytes.
+
 ## Key Features
 
 - ⚡ **3-Tier Edge Caching Strategy**:
@@ -14,7 +28,7 @@ cividge-kv-worker serves as the decentralized backend routing and caching layer 
   - Worker-to-IPFS-gateway fetch caching is separate: up to 1 year normally, 7 days for records marked unpinned, always capped by the Link's remaining lifetime when assigned. An existing cached upstream copy is not proof of a current Placement or protection against IPFS GC.
 - 🤖 **Optimized Social Crawler & OGP Engine**:
   - Automatically intercepts crawlers from Misskey (SummalyBot), Twitter/X, Discord, Slack, Mastodon, and Bluesky.
-  - Generates lightweight, instant OGP HTML cards with first-frame thumbnails (.thumb.webp) to completely bypass crawler timeouts and 10MB payload limitations.
+  - Generates lightweight OGP HTML cards with a parent-Link `?preview=1` first-frame representation, without a separate thumbnail Link.
 - 🎵 **Multi-Media & Range Streaming Support**:
   - Native support for HTTP 206 Partial Content and byte-range requests for audio/video seeking (mp4, webm, mov, mp3, wav, m4a, flac, etc.).
   - Non-media files (PDF, plain text, Markdown, JSON, CSV) served cleanly without corruptive transforms.

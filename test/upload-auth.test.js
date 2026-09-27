@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createHash } from "node:crypto";
+const oid = label => `sha256:${createHash("sha256").update(label).digest("hex")}`;
 import { onRequestPost, putR2Upload, verifyUploadAuth, calculateUploadCid, classifyUpload, reserveUploadLink, claimUploadPlacement, executeR2Acquisition, executeFilebaseRpcAcquisition, MAX_UPLOAD_BYTES } from "../upload.js";
 import { ObjectLifecycleV2 as ObjectLifecycle } from "../lifecycle.js";
 import { LinkBindingV2 as LinkBinding } from "../link-binding.js";
 import { callLifecycle } from "../lifecycle-api.js";
 import { callLinkBinding } from "../link-binding-api.js";
+import { objectIdFromBytes } from "../object-id.js";
 
 function memoryNamespace(Class, env) {
   const objects = new Map();
@@ -99,13 +102,14 @@ test("preflight content identity is deterministic for final bytes", async () => 
 });
 
 test("preflight classifies conflict, no-op, peer, reacquire and new Object without PUT", () => {
-  const ref = "ipfs:cid";
+  const ref = oid("ipfs:cid");
   const rpc = { state: "PRESENT" };
   const browser = { state: "PRESENT" };
-  assert.equal(classifyUpload({ objectRef: "ipfs:other", status: "BOUND" }, null, "filebase_rpc", true, ref), "conflict");
+  assert.equal(classifyUpload({ objectRef: oid("ipfs:other"), status: "BOUND" }, null, "filebase_rpc", true, ref), "conflict");
   assert.equal(classifyUpload({ objectRef: ref, status: "BOUND" },
     { placements: { filebase_rpc: rpc } }, "filebase_rpc", true, ref), "noop");
-  assert.equal(classifyUpload(null, { placements: { filebase: browser } }, "filebase_rpc", false, ref), "peer");
+  assert.equal(classifyUpload(null, { placements: { filebase: browser } }, "filebase_rpc", false, ref), "create");
+  assert.equal(classifyUpload(null, { placements: { filebase_rpc: rpc, r2: browser } }, "filebase_rpc", false, ref), "peer");
   assert.equal(classifyUpload({ objectRef: ref, status: "BOUND" },
     { placements: { filebase: browser } }, "filebase_rpc", true, ref), "reacquire");
   assert.equal(classifyUpload(null, null, "filebase_rpc", false, ref), "create");
@@ -114,8 +118,8 @@ test("preflight classifies conflict, no-op, peer, reacquire and new Object witho
 test("preflight reserves a canonical Link with planned physical locator", async () => {
   const env = {};
   env.LINK_BINDING = memoryNamespace(LinkBinding, env);
-  const args = { linkKey: "public.example:x.webp", objectRef: "r2:objects/cid",
-    placement: { kind: "r2", executor: "worker", locator: { key: "objects/cid" } },
+  const args = { linkKey: "public.example:x.webp", objectRef: oid("r2:objects/cid"),
+    placement: { kind: "r2", executor: "worker", locator: { bucket: "cividge", key: "objects/cid" } },
     classification: "create", attemptId: "attempt-1" };
   const { binding } = await reserveUploadLink(env, args);
   assert.equal(binding.attempt.placement.locator.key, "objects/cid");
@@ -126,19 +130,19 @@ test("preflight reserves a canonical Link with planned physical locator", async 
 });
 
 test("preflight claims acquisition before any R2 PUT", async () => {
-  const env = {};
+  const env = { R2_BUCKET_NAME: "cividge" };
   env.OBJECT_LIFECYCLE = memoryNamespace(ObjectLifecycle, env);
-  const placement = { kind: "r2", executor: "worker", locator: { key: "objects/cid" } };
-  const claim = await claimUploadPlacement(env, "r2:objects/cid", placement);
+  const placement = { kind: "r2", executor: "worker", locator: { bucket: "cividge", key: "objects/cid" } };
+  const claim = await claimUploadPlacement(env, oid("r2:objects/cid"), placement);
   assert.equal(claim.operation, "acquire");
   assert.equal(claim.locator.key, "objects/cid");
-  const state = (await callLifecycle(env, { action: "inspect", objectRef: "r2:objects/cid" })).lifecycle;
+  const state = (await callLifecycle(env, { action: "inspect", objectRef: oid("r2:objects/cid") })).lifecycle;
   assert.equal(state.placements.r2.state, "PINNING");
   assert.deepEqual(state.links, []);
 });
 
 test("post-PUT report failure keeps a durable retry and adopts the same R2 Object", async () => {
-  const env = {};
+  const env = { R2_BUCKET_NAME: "cividge" };
   env.OBJECT_LIFECYCLE = memoryNamespace(ObjectLifecycle, env);
   const rawBinding = memoryNamespace(LinkBinding, env);
   let loseReport = true;
@@ -155,9 +159,9 @@ test("post-PUT report failure keeps a durable retry and adopts the same R2 Objec
   const bytes = new TextEncoder().encode("recoverable-r2");
   const contentCid = await calculateUploadCid(bytes);
   const key = `objects/${contentCid}`;
-  const objectRef = `r2:${key}`;
+  const objectRef = await objectIdFromBytes(bytes);
   const linkKey = "public.example:recover.webp";
-  const placement = { kind: "r2", executor: "worker", locator: { key } };
+  const placement = { kind: "r2", executor: "worker", locator: { bucket: "cividge", key } };
   const reservation = await reserveUploadLink(env, { linkKey, objectRef, placement,
     classification: "create", attemptId: "retry-1" });
   const objects = new Map();
@@ -184,10 +188,10 @@ test("post-PUT report failure keeps a durable retry and adopts the same R2 Objec
 
 test("different content at an occupied Link conflicts before R2 PUT", async () => {
   let puts = 0;
-  const env = { UPLOAD_TOKEN: "upload", CIVIDGE_KV: {}, OBJECT_LIFECYCLE: {},
+  const env = { UPLOAD_TOKEN: "upload", R2_BUCKET_NAME: "cividge", CIVIDGE_KV: {}, OBJECT_LIFECYCLE: {},
     R2_BUCKET: { put: async () => { puts++; } },
     LINK_BINDING: { idFromName: value => value, get: () => ({ fetch: async () =>
-      Response.json({ binding: { objectRef: "r2:objects/other", status: "BOUND" } }) }) },
+      Response.json({ binding: { objectRef: oid("r2:objects/other"), status: "BOUND" } }) }) },
   };
   const response = await onRequestPost({ env, request: new Request(
     "https://worker.example/api/upload?storage=r2&domain=public.example&naming=original", {
@@ -205,6 +209,7 @@ test("R2 upload publishes its canonical Link through the in-process registry", a
   const env = {
     TEST_UPLOAD_TOKEN: "test-upload-token",
     ADMIN_API_TOKEN: "admin-token",
+    R2_BUCKET_NAME: "cividge",
     R2_BUCKET: {
       async put(key, body, options) { objects.set(key, { bytes: await new Response(body).arrayBuffer(), options }); },
       async head(key) { const found = objects.get(key); return found ? { customMetadata: found.options.customMetadata } : null; },
@@ -236,7 +241,7 @@ test("R2 upload publishes its canonical Link through the in-process registry", a
   assert.equal(payload.url, "https://test-up.pages.dev/fresh.webp");
   assert.equal(records.has("test-up.pages.dev:fresh.webp"), true);
   const cid = await calculateUploadCid(bytes);
-  const objectRef = `r2:objects/${cid}`;
+  const objectRef = await objectIdFromBytes(bytes);
   const lifecycle = (await callLifecycle(env, { action: "inspect", objectRef })).lifecycle;
   assert.deepEqual(lifecycle.links, ["test-up.pages.dev:fresh.webp"]);
   assert.equal(lifecycle.placements.r2.state, "PRESENT");
@@ -250,7 +255,7 @@ test("Filebase CID mismatch records observation but never publishes or unpins", 
   const bytes = new TextEncoder().encode("expected-content");
   const contentCid = await calculateUploadCid(bytes);
   const otherCid = await calculateUploadCid(new TextEncoder().encode("other-content"));
-  const objectRef = `ipfs:${contentCid.toLowerCase()}`;
+  const objectRef = await objectIdFromBytes(bytes);
   const linkKey = "public.example:mismatch.webp";
   const placement = { kind: "filebase_rpc", executor: "worker",
     provenance: "cividge_worker_rpc", locator: { cid: contentCid } };
@@ -284,7 +289,7 @@ test("Filebase RPC acquisition confirms Placement before Link publication", asyn
   env.LINK_BINDING = memoryNamespace(LinkBinding, env);
   const bytes = new TextEncoder().encode("new-filebase-rpc-content");
   const contentCid = await calculateUploadCid(bytes);
-  const objectRef = `ipfs:${contentCid.toLowerCase()}`;
+  const objectRef = await objectIdFromBytes(bytes);
   const linkKey = "public.example:rpc.webp";
   const placement = { kind: "filebase_rpc", executor: "worker",
     provenance: "cividge_worker_rpc", locator: { cid: contentCid } };
@@ -341,7 +346,7 @@ test("Filebase upload publishes only after confirmed managed RPC Placement", asy
   assert.equal(response.status, 200, await response.text());
   assert.equal(adds, 1);
   assert.equal(records.has("public.example:rpc.webp"), true);
-  const state = (await callLifecycle(env, { action: "inspect", objectRef: `ipfs:${cid.toLowerCase()}` })).lifecycle;
+  const state = (await callLifecycle(env, { action: "inspect", objectRef: await objectIdFromBytes(bytes) })).lifecycle;
   assert.equal(state.placements.filebase_rpc.state, "PRESENT");
   assert.deepEqual(state.links, ["public.example:rpc.webp"]);
   const oldFetchAgain = globalThis.fetch;
@@ -356,4 +361,56 @@ test("Filebase upload publishes only after confirmed managed RPC Placement", asy
     assert.equal((await repeat.json()).noOp, true);
   } finally { globalThis.fetch = oldFetchAgain; }
   assert.equal(adds, 1);
+});
+
+test("same final bytes uploaded to R2 and Filebase converge on one ObjectLifecycle", async () => {
+  const records = new Map();
+  const physicalR2 = new Map();
+  const env = {
+    UPLOAD_TOKEN: "upload", ADMIN_API_TOKEN: "admin", R2_BUCKET_NAME: "cividge",
+    FILEBASE_DEDICATED_BUCKET: "true", FILEBASE_IPFS_API_KEY: "bucket-token",
+    R2_BUCKET: {
+      async put(key, body, options) { physicalR2.set(key, { bytes: await new Response(body).arrayBuffer(), customMetadata: options.customMetadata }); },
+      async head(key) { return physicalR2.get(key) || null; },
+    },
+    CIVIDGE_KV: {
+      async getWithMetadata(key) { return records.get(key) || { value: null, metadata: null }; },
+      async put(key, value, options) { records.set(key, { value, metadata: options.metadata }); },
+    },
+  };
+  env.OBJECT_LIFECYCLE = memoryNamespace(ObjectLifecycle, env);
+  env.LINK_BINDING = memoryNamespace(LinkBinding, env);
+  const content = new TextEncoder().encode("one object, two storage providers");
+  const objectId = await objectIdFromBytes(content);
+  const cid = await calculateUploadCid(content);
+  const request = (storage, filename) => new Request(
+    `https://worker.example/api/upload?storage=${storage}&domain=public.example&naming=original`, {
+      method: "POST", headers: { Authorization: "Bearer upload", "X-Upload-Filename": filename,
+        "Content-Type": "image/webp" }, body: content,
+    });
+  const r2 = await onRequestPost({ env, request: request("r2", "r2.webp"), waitUntil() {} });
+  assert.equal(r2.status, 200, await r2.text());
+  const priorFetch = globalThis.fetch;
+  let rpcAdds = 0;
+  globalThis.fetch = async url => {
+    if (String(url).endsWith("/pin/ls")) return Response.json({ Keys: {} });
+    if (String(url).includes("/add?")) { rpcAdds++; return Response.json({ Hash: cid }); }
+    throw new Error("Unexpected Filebase RPC request");
+  };
+  try {
+    const sameLink = await onRequestPost({ env, request: request("filebase", "r2.webp"), waitUntil() {} });
+    assert.equal(sameLink.status, 200, await sameLink.text());
+    assert.equal(records.get("public.example:r2.webp").metadata.b, "r2");
+    const filebase = await onRequestPost({ env, request: request("filebase", "filebase.webp"), waitUntil() {} });
+    assert.equal(filebase.status, 200, await filebase.text());
+  } finally { globalThis.fetch = priorFetch; }
+  const lifecycle = (await callLifecycle(env, { action: "inspect", objectRef: objectId })).lifecycle;
+  assert.deepEqual(lifecycle.links, ["public.example:filebase.webp", "public.example:r2.webp"]);
+  assert.equal(lifecycle.placements.r2.state, "PRESENT");
+  assert.equal(lifecycle.placements.filebase_rpc.state, "PRESENT");
+  assert.equal(lifecycle.placements.filebase_rpc.locator.cid, cid);
+  assert.equal(rpcAdds, 1);
+  assert.equal(physicalR2.size, 1);
+  assert.equal(records.get("public.example:r2.webp").metadata.oid, objectId);
+  assert.equal(records.get("public.example:filebase.webp").metadata.oid, objectId);
 });

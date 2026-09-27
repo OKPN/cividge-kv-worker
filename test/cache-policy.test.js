@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createHash } from "node:crypto";
+const oid = label => `sha256:${createHash("sha256").update(label).digest("hex")}`;
 
 import { onRequest as deliver, publicMediaCacheLifetimes } from "../delivery.js";
 import { LinkBindingV2 } from "../link-binding.js";
@@ -33,7 +35,7 @@ test("R2 delivery applies Link policy after object HTTP metadata", async () => {
     env: {
       CIVIDGE_KV: { getWithMetadata: async key => {
         assert.equal(key, "public.example:photo.webp");
-        return { value: "r2", metadata: { b: "r2", k_s3: "photo.webp", cp: cachePolicy } };
+        return { value: "", metadata: { b: "r2", k_s3: "photo.webp", cp: cachePolicy } };
       } },
       R2_BUCKET: { get: async () => ({
         body: new Blob(["image"]).stream(),
@@ -63,7 +65,7 @@ test("LinkBinding keeps Cache Policy closed and preserves it on expiry-only chan
   const send = async body => binding.fetch(new Request("https://test.invalid/", {
     method: "POST", body: JSON.stringify({ linkKey: "test-up.pages.dev:file.webp", ...body }),
   }));
-  const reserved = await (await send({ action: "reserve", objectRef: "ipfs:Qm" + "a".repeat(44),
+  const reserved = await (await send({ action: "reserve", objectRef: oid("cache-policy"),
     attemptId: "test" })).json();
   await send({ action: "commit", attemptId: "test", generation: reserved.binding.attempt.generation });
   const published = await (await send({ action: "acknowledgePolicy", generation: 1,

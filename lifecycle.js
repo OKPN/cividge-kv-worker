@@ -1,18 +1,23 @@
 import {
   addLink,
+  beginThumbnailUpload,
   beginRemoveLink,
+  claimThumbnailRelease,
   claimPlacement,
   completeRemoveLink,
   newLifecycle,
   parseObjectRef,
+  reconcileMissingThumbnail,
   recoverExpiredPlacementClaims,
   reconcilePlacementForAcquire,
   reportPlacement,
+  reportThumbnailRelease,
+  reportThumbnailUpload,
   requestPlacementAcquire,
   requestPlacementRelease,
   requestRelease,
 } from "./lifecycle-model.js";
-import { syncLifecycleProjection } from "./lifecycle-api.js";
+import { executeWorkerPlacements, syncLifecycleProjection } from "./lifecycle-api.js";
 
 const STATE_KEY = "lifecycle";
 
@@ -86,6 +91,25 @@ export class ObjectLifecycleV2 {
           outcome: body.outcome,
           error: body.error,
         });
+      } else if (action === "beginThumbnailUpload") {
+        if (!state) return json({ error: "Object lifecycle not found" }, 404);
+        const result = beginThumbnailUpload(state);
+        await this.persist(state);
+        return json(result);
+      } else if (action === "reconcileMissingThumbnail") {
+        if (!state) return json({ error: "Object lifecycle not found" }, 404);
+        reconcileMissingThumbnail(state);
+      } else if (action === "reportThumbnailUpload") {
+        if (!state) return json({ error: "Object lifecycle not found" }, 404);
+        reportThumbnailUpload(state, body);
+      } else if (action === "claimThumbnailRelease") {
+        if (!state) return json({ error: "Object lifecycle not found" }, 404);
+        const result = claimThumbnailRelease(state);
+        await this.persist(state);
+        return json(result);
+      } else if (action === "reportThumbnailRelease") {
+        if (!state) return json({ error: "Object lifecycle not found" }, 404);
+        reportThumbnailRelease(state, body);
       } else if (action === "inspect") {
         return json({ lifecycle: state || null });
       } else {
@@ -103,13 +127,19 @@ export class ObjectLifecycleV2 {
     if (!state) return;
     const recovered = recoverExpiredPlacementClaims(state);
     await this.persist(state);
-    if (recovered) await syncLifecycleProjection(this.env, state);
+    if (recovered) {
+      if (!state.links.length && state.state === "RELEASE_PENDING") {
+        const settled = await executeWorkerPlacements(this.env, state.objectRef, state);
+        await syncLifecycleProjection(this.env, settled);
+      } else await syncLifecycleProjection(this.env, state);
+    }
   }
 
   async persist(state) {
     await this.ctx.storage.put(STATE_KEY, state);
-    const nextExpiry = Object.values(state?.placements || {})
-      .map(placement => Number(placement.claim?.expiresAt))
+    const nextExpiry = [...Object.values(state?.placements || {}), state?.thumbnail]
+      .filter(Boolean)
+      .map(item => Number(item.claim?.expiresAt))
       .filter(Number.isFinite)
       .sort((left, right) => left - right)[0];
     if (nextExpiry) await this.ctx.storage.setAlarm(nextExpiry);

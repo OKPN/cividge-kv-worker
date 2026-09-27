@@ -40,14 +40,21 @@ export async function onRequestPost({ request, env }) {
     if (rpcAcquire || rpcClaim || rpcReport || rpcCreate || workerReconcile) {
       return json({ error: "Worker-managed RPC provenance cannot be asserted by an admin client" }, 403);
     }
+    if (["beginThumbnailUpload", "reconcileMissingThumbnail", "reportThumbnailUpload", "claimThumbnailRelease", "reportThumbnailRelease"].includes(body.action)) {
+      return json({ error: "Thumbnail actuator state is Worker-owned" }, 403);
+    }
+    if ((body.action === "requestPlacementAcquire" || body.action === "reconcilePlacementForAcquire") &&
+        body.placement?.kind === "r2" &&
+        (!env.R2_BUCKET_NAME || body.placement.locator?.bucket !== env.R2_BUCKET_NAME)) {
+      return json({ error: "R2 Placement bucket does not match the Worker binding" }, 409);
+    }
     if (body.action === "reconcilePlacementForAcquire") {
       const kind = body.placement?.kind;
       if (kind === "r2") {
         const key = body.placement?.locator?.key;
-        if (!key || body.objectRef !== `r2:${key}` || !env.R2_BUCKET) throw new Error("R2 ObjectRef and binding are required");
+        if (!key || !env.R2_BUCKET || body.placement.locator.bucket !== env.R2_BUCKET_NAME) throw new Error("R2 Placement locator and binding are required");
         const head = await env.R2_BUCKET.head(key);
-        if (head && ![head.customMetadata?.cid, head.customMetadata?.hash, head.customMetadata?.contentCid]
-          .includes(key.replace(/^objects\//, ""))) throw new Error("R2 content identity cannot be verified");
+        if (head && head.customMetadata?.["object-id"] !== body.objectRef) throw new Error("R2 content identity cannot be verified");
         body.observation = head ? "present" : "absent";
       } else if (kind === "filebase") {
         if (body.observation === "present" &&
@@ -80,7 +87,26 @@ export async function executeWorkerPlacements(env, objectRef, lifecycle) {
     if (kind === "filebase_rpc" && !isManagedRpcReleaseEnabled(env, placement)) continue;
     lifecycle = await executeWorkerPlacement(env, objectRef, kind);
   }
+  if (lifecycle?.thumbnail && ["RELEASE_PENDING", "RETRYABLE", "UNCERTAIN"].includes(lifecycle.thumbnail.state)) {
+    lifecycle = await executeWorkerThumbnailRelease(env, objectRef);
+  }
   return lifecycle;
+}
+
+async function executeWorkerThumbnailRelease(env, objectRef) {
+  const claimed = await callLifecycle(env, { action: "claimThumbnailRelease", objectRef });
+  try {
+    if (!env.R2_BUCKET || claimed.claim.key !== claimed.lifecycle.thumbnail.key) {
+      throw new Error("Thumbnail R2 release capability is unavailable");
+    }
+    await env.R2_BUCKET.delete(claimed.claim.key);
+    return (await callLifecycle(env, { action: "reportThumbnailRelease", objectRef,
+      claimId: claimed.claim.claimId, generation: claimed.claim.generation, outcome: "released" })).lifecycle;
+  } catch (error) {
+    return (await callLifecycle(env, { action: "reportThumbnailRelease", objectRef,
+      claimId: claimed.claim.claimId, generation: claimed.claim.generation,
+      outcome: "retryable", error: error.message })).lifecycle;
+  }
 }
 
 export function isManagedRpcReleaseEnabled(env, placement) {
@@ -96,8 +122,10 @@ async function executeWorkerPlacement(env, objectRef, kind) {
   const claimed = await callLifecycle(env, { action: "claimPlacement", objectRef, placement: kind, operation: "release" });
   try {
     if (kind === "r2") {
-      const keys = [claimed.claim.locator.key, claimed.claim.locator.thumbnailKey].filter(Boolean);
-      for (const key of keys) await env.R2_BUCKET.delete(key);
+      if (!env.R2_BUCKET_NAME || claimed.claim.locator.bucket !== env.R2_BUCKET_NAME) {
+        throw new Error("R2 release bucket does not match the Worker binding");
+      }
+      await env.R2_BUCKET.delete(claimed.claim.locator.key);
     } else {
       if (!isManagedRpcReleaseEnabled(env, claimed.lifecycle.placements.filebase_rpc)) {
         throw new Error("Filebase RPC release capability is not enabled for this Placement");
@@ -203,6 +231,8 @@ export async function syncLifecycleProjection(env, lifecycle) {
       metadata.kuboStatus = "not_pinned";
     }
     metadata.f = flags;
+    if (lifecycle.thumbnail?.state === "PRESENT") metadata.th = lifecycle.thumbnail.key;
+    else delete metadata.th;
     await env.CIVIDGE_KV.put(linkKey, existing.value, { metadata });
   }
 }

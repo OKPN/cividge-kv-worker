@@ -4,6 +4,7 @@
 import { callLifecycle } from "./lifecycle-api.js";
 import { callLinkBinding } from "./link-binding-api.js";
 import { deliveryCacheRequest } from "./delivery.js";
+import { parseObjectId } from "./object-id.js";
 
 export async function onRequestOptions() {
   return new Response(null, {
@@ -16,9 +17,9 @@ export async function onRequestOptions() {
   });
 }
 
-// 🛡️ IPFS CID 判定ヘルパー（"r2" などの特殊マーカー値や無効値を除外）
+// A CID is retrieval identity, not an ObjectId or a backend marker.
 function isRealIpfsCid(c) {
-  return typeof c === "string" && c !== "r2" && (c.startsWith("Qm") || c.startsWith("baf") || c.length > 20);
+  return typeof c === "string" && /^(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,})$/.test(c);
 }
 
 function parseCanonicalLinkKey(value) {
@@ -31,45 +32,46 @@ function parseCanonicalLinkKey(value) {
   return { key: `${host}:${filename}`, host, filename };
 }
 
-function objectRefForRegistration({ backend, cid, contentCid, s3Key, thumbnailKey, kuboStatus }) {
+function objectRefForRegistration({ objectId, backend, cid, contentCid, s3Key, bucket }) {
+  const object = parseObjectId(objectId);
+  if (!object) throw new Error("Canonical ObjectId is required");
   const normalizedBackend = String(backend || "").toLowerCase();
-  if (normalizedBackend === "r2" || cid === "r2") {
+  if (normalizedBackend === "r2") {
     const key = String(s3Key || "").trim();
-    if (!key) throw new Error("R2 ObjectRef requires s3Key");
-    const placements = [{ kind: "r2", executor: "worker", locator: { key, ...(thumbnailKey ? { thumbnailKey } : {}) } }];
-    return {
-      objectRef: `r2:${key}`,
-      placements,
-    };
+    if (!key || !bucket) throw new Error("R2 Placement requires bucket and s3Key");
+    const placements = [{ kind: "r2", executor: "worker", locator: { bucket, key } }];
+    return { objectRef: object.objectRef, placements };
   }
   const ipfsCid = String(contentCid || cid || "").trim();
-  if (!isRealIpfsCid(ipfsCid)) throw new Error("IPFS ObjectRef requires a CID");
+  if (!isRealIpfsCid(ipfsCid)) throw new Error("Filebase Placement requires a CID");
   if (normalizedBackend === "filebase_rpc") {
-    return { objectRef: `ipfs:${ipfsCid.toLowerCase()}`, placements: [{
+    return { objectRef: object.objectRef, placements: [{
       kind: "filebase_rpc", executor: "worker", provenance: "cividge_worker_rpc",
       locator: { cid: ipfsCid },
     }] };
   }
+  if (normalizedBackend !== "filebase") throw new Error("Explicit Placement backend is required");
+  const key = String(s3Key || "").trim();
+  if (!key || !bucket) throw new Error("Filebase Placement requires bucket and s3Key");
   const placements = [{
     kind: "filebase",
     executor: "browser",
     locator: {
-      key: String(s3Key || "").trim(),
+      bucket, key,
       cid: ipfsCid,
-      ...(thumbnailKey ? { thumbnailKey } : {}),
     },
   }];
-  return { objectRef: `ipfs:${ipfsCid.toLowerCase()}`, placements };
+  return { objectRef: object.objectRef, placements };
 }
 
 function objectRefForExisting(value, metadata = {}) {
   return objectRefForRegistration({
-    backend: metadata.b || metadata.backend || (value === "r2" ? "r2" : "filebase"),
+    objectId: metadata.oid,
+    backend: metadata.b || metadata.backend,
     cid: value,
     contentCid: metadata.c_cid || metadata.contentCid,
     s3Key: metadata.k_s3 || metadata.s3Key,
-    thumbnailKey: metadata.th || metadata.thumbnailKey,
-    kuboStatus: metadata.kuboStatus,
+    bucket: metadata.bk || metadata.bucket,
   });
 }
 
@@ -91,7 +93,6 @@ function unpackMetadata(name, cid, meta = {}) {
   }
 
   const s3Key = meta.k_s3 || meta.s3Key || displayName;
-  const thumbnailKey = meta.th || meta.thumbnailKey || null;
   const width = Number(meta.w ?? meta.width) || null;
   const height = Number(meta.h ?? meta.height) || null;
   const lastKuboPinAttempt = meta.k !== undefined ? meta.k * 1000 : (meta.lastKuboPinAttempt || null);
@@ -114,9 +115,11 @@ function unpackMetadata(name, cid, meta = {}) {
     unpinned: isUnpinned,
     kuboStatus,
     s3Key,
+    bucket: meta.bk || meta.bucket || null,
+    objectId: meta.oid || null,
     contentCid,
     backend,
-    ...(thumbnailKey ? { thumbnailKey, th: thumbnailKey } : {}),
+    ...(meta.th ? { th: meta.th } : {}),
     ...(width && height ? { width, height, w: width, h: height } : {}),
     ...(allowedHost ? { allowedHost, d: allowedHost } : {}),
     ...(expiresAt ? { expiresAt, e: Math.floor(expiresAt / 1000) } : {}),
@@ -282,7 +285,7 @@ export async function onRequestPost(context) {
 
   try {
     const body = await request.json();
-    let { key, cid, size, mime, lastModified, password, dataBase64, ttl, expiresAt, thumbnailKey, width, height, contentCid, backend } = body;
+    let { key, cid, size, mime, lastModified, password, dataBase64, ttl, expiresAt, width, height, contentCid, backend } = body;
     if ((Number.isFinite(Number(size)) && Number(size) > 80_000_000) ||
         (typeof dataBase64 === "string" && Math.floor(dataBase64.length * 3 / 4) > 80_000_000)) {
       return new Response(JSON.stringify({ error: "File too large (Max: 80 MB)" }), {
@@ -314,20 +317,31 @@ export async function onRequestPost(context) {
     } catch (e) {}
 
     const existingCid = existingValue || (existingMetadata && (existingMetadata.c || existingMetadata.cid)) || "";
-    // 🛡️ CID衝突ガード:
-    // 同一ファイル名が既に存在し、かつ中身（実体CID）が異なる場合は上書き破壊を防ぐため409 Conflictで弾く。
-    // ※ "r2" というマーカー値は IPFS CID ではないため、R2 のメタデータ更新や CID 同期時には衝突とみなさない。
-    const existingRealCid = isRealIpfsCid(existingMetadata?.contentCid || existingMetadata?.c_cid)
-      ? (existingMetadata?.contentCid || existingMetadata?.c_cid)
-      : (isRealIpfsCid(existingCid) ? existingCid : "");
-    const newRealCid = isRealIpfsCid(contentCid) ? contentCid : (isRealIpfsCid(cid) ? cid : "");
-
-    if (existingRealCid && newRealCid && existingRealCid !== newRealCid) {
+    if (existingCid && !isRealIpfsCid(existingCid)) {
+      return new Response(JSON.stringify({ error: "Existing delivery projection has a non-CID value", code: "INVALID_PROJECTION" }), {
+        status: 409, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+    if (cid !== undefined && cid !== null && cid !== "" && !isRealIpfsCid(cid)) {
+      return new Response(JSON.stringify({ error: "CID must be a real IPFS content identifier", code: "INVALID_CID" }), {
+        status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+    if (contentCid && !isRealIpfsCid(contentCid)) {
+      return new Response(JSON.stringify({ error: "contentCid must be a real IPFS content identifier", code: "INVALID_CID" }), {
+        status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+    const objectId = body.objectId || bindingAtStart?.objectRef;
+    if (!parseObjectId(objectId)) {
+      return new Response(JSON.stringify({ error: "Canonical ObjectId is required", code: "INVALID_OBJECT_ID" }), {
+        status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+    if ((bindingAtStart?.status !== "RETIRED" && bindingAtStart?.objectRef && bindingAtStart.objectRef !== objectId) ||
+        (existingMetadata?.oid && existingMetadata.oid !== objectId)) {
       return new Response(JSON.stringify({
-        error: "Conflict: A different file with the same name already exists.",
-        code: "CID_CONFLICT",
-        existingCid: existingRealCid,
-        newCid: newRealCid,
+        error: "Conflict: this Link is bound to different bytes.", code: "OBJECT_REF_CONFLICT",
       }), {
         status: 409,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
@@ -441,22 +455,44 @@ export async function onRequestPost(context) {
     const inheritedSize = Number(size) || (existingMetadata && (existingMetadata.s || existingMetadata.size)) || 0;
     const inheritedS3Key = body.backend === "filebase_rpc" ? "" :
       (body.s3Key || (existingMetadata && (existingMetadata.k_s3 || existingMetadata.s3Key)) || key);
-    const inheritedThumbnailKey = thumbnailKey || (existingMetadata && (existingMetadata.th || existingMetadata.thumbnailKey)) || "";
     const inheritedWidth = Math.floor(Number(width)) || (existingMetadata && Math.floor(Number(existingMetadata.w ?? existingMetadata.width))) || 0;
     const inheritedHeight = Math.floor(Number(height)) || (existingMetadata && Math.floor(Number(existingMetadata.h ?? existingMetadata.height))) || 0;
     const inheritedContentCid = body.contentCid || body.c_cid || (existingMetadata && (existingMetadata.c_cid || existingMetadata.contentCid)) || "";
     const inheritedBackend = body.backend || body.b || (existingMetadata && (existingMetadata.b || existingMetadata.backend)) || "";
+    if (inheritedBackend === "r2" && inheritedS3Key.startsWith("derived/thumbnails/")) {
+      return new Response(JSON.stringify({ error: "Derived R2 storage namespace cannot be a public Link", code: "INVALID_STORAGE_ROLE" }), {
+        status: 409, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+    const inheritedBucket = body.bucket || (existingMetadata && (existingMetadata.bk || existingMetadata.bucket)) || "";
+    if (inheritedBackend === "r2" && (!env.R2_BUCKET_NAME || inheritedBucket !== env.R2_BUCKET_NAME)) {
+      return new Response(JSON.stringify({ error: "R2 Placement bucket does not match the Worker binding", code: "PLACEMENT_LOCATOR_CONFLICT" }), {
+        status: 409, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
     const civitaiTemporary = body.civitaiTemporary === undefined
       ? Boolean(existingMetadata?.ct || existingMetadata?.civitaiTemporary)
       : Boolean(body.civitaiTemporary);
     const lifecycle = objectRefForRegistration({
+      objectId,
       backend: inheritedBackend,
       cid: safeCid,
       contentCid: inheritedContentCid,
       s3Key: inheritedS3Key,
-      thumbnailKey: inheritedThumbnailKey,
+      bucket: inheritedBucket,
       kuboStatus: finalKuboStatus,
     });
+    if (existingMetadata && !body.createOnly) {
+      const oldBackend = existingMetadata.b || existingMetadata.backend;
+      const oldKey = existingMetadata.k_s3 || existingMetadata.s3Key || "";
+      const oldBucket = existingMetadata.bk || existingMetadata.bucket || "";
+      if ((body.backend && body.backend !== oldBackend) || (body.s3Key && oldKey && body.s3Key !== oldKey) ||
+          (body.bucket && oldBucket && body.bucket !== oldBucket)) {
+        return new Response(JSON.stringify({ error: "Link policy updates cannot reassign a Placement locator", code: "PLACEMENT_LOCATOR_CONFLICT" }), {
+          status: 409, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+        });
+      }
+    }
     if (existingMetadata) {
       const existingObject = objectRefForExisting(existingValue, existingMetadata);
       if (existingObject.objectRef !== lifecycle.objectRef) {
@@ -468,12 +504,13 @@ export async function onRequestPost(context) {
     }
     const compressedMeta = {
       ...(safeCid ? { c: safeCid } : {}),
+      oid: lifecycle.objectRef,
       s: inheritedSize,
       t: Math.floor((lastModified || Date.now()) / 1000),
       ...(flags > 0 ? { f: flags } : {}),
       ...(allowedHost ? { d: allowedHost } : {}),
       ...(inheritedS3Key ? { k_s3: inheritedS3Key } : {}),
-      ...(inheritedThumbnailKey ? { th: inheritedThumbnailKey } : {}),
+      ...(inheritedBucket ? { bk: inheritedBucket } : {}),
       ...(inheritedWidth > 0 && inheritedHeight > 0 ? { w: inheritedWidth, h: inheritedHeight } : {}),
       ...(calculatedExpiresAt ? { e: Math.floor(Number(calculatedExpiresAt) / 1000) } : {}),
       ...(existingLastKuboPinAttempt ? { k: Math.floor(Number(existingLastKuboPinAttempt) / 1000) } : {}),
@@ -490,6 +527,15 @@ export async function onRequestPost(context) {
         return new Response(JSON.stringify({ error: "Object has no confirmed Placement", code: "PLACEMENT_NOT_PRESENT" }), {
           status: 409,
           headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+        });
+      }
+      const claimed = lifecycle.placements[0];
+      const durable = knownObject.placements?.[claimed.kind];
+      if (!durable || durable.locator?.key !== claimed.locator?.key ||
+          durable.locator?.bucket !== claimed.locator?.bucket ||
+          durable.locator?.cid !== claimed.locator?.cid) {
+        return new Response(JSON.stringify({ error: "Link delivery locator is not owned by this ObjectId", code: "PLACEMENT_LOCATOR_CONFLICT" }), {
+          status: 409, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
         });
       }
       if (inheritedBackend === "filebase_rpc" &&
@@ -516,7 +562,17 @@ export async function onRequestPost(context) {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
     }
-    if (existingMetadata && body.createOnly && binding.status === "BOUND" && !binding.attempt) {
+    if (existingMetadata && body.createOnly && binding.status === "BOUND") {
+      const current = (await callLifecycle(env, { action: "inspect", objectRef: lifecycle.objectRef })).lifecycle;
+      if (!current?.links?.includes(key) || current.placements?.[lifecycle.placements[0].kind]?.state !== "PRESENT") {
+        return new Response(JSON.stringify({ error: "Existing Link or acquired Placement is not confirmed", code: "PLACEMENT_NOT_PRESENT" }), {
+          status: 409, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+        });
+      }
+      if (binding.attempt) {
+        await callLinkBinding(env, { action: "commit", linkKey: key, attemptId: bindingAttemptId,
+          generation: binding.attempt.generation });
+      }
       return new Response(JSON.stringify({ success: true, noOp: true, key, objectRef: lifecycle.objectRef }), {
         status: 200,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
@@ -554,6 +610,8 @@ export async function onRequestPost(context) {
     flags = filebasePreserved ? (flags & ~1) : (flags | 1);
     compressedMeta.f = flags;
     compressedMeta.kuboStatus = finalKuboStatus;
+    if (lifecycleState?.thumbnail?.state === "PRESENT") compressedMeta.th = lifecycleState.thumbnail.key;
+    else delete compressedMeta.th;
     compressedMeta.g = binding.generation;
 
     // Commit both authorities before publishing their delivery projection.

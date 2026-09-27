@@ -24,6 +24,7 @@ STATIC_RELAY_BACKEND_HOSTS = "relay.k7m.f5.si"
 # Keep false unless FILEBASE_IPFS_API_KEY is scoped to a bucket reserved for
 # Cividge Worker RPC pins only. A shared bucket cannot distinguish pin owners.
 FILEBASE_DEDICATED_BUCKET = "false"
+R2_BUCKET_NAME = "cividge"
 
 [[r2_buckets]]
 binding = "R2_BUCKET"

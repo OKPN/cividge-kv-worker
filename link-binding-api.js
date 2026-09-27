@@ -1,9 +1,14 @@
 import { parseCanonicalLinkKey } from "./lifecycle-model.js";
 
+// Pre-release semantic cutover: old Link DO records used provider-derived
+// ObjectRefs. This routing epoch starts clean without a dual reader. The
+// public Link identity remains the unprefixed canonical host:filename.
+const LINK_BINDING_EPOCH = "objectid-v1:";
+
 export async function callLinkBinding(env, body) {
   const link = parseCanonicalLinkKey(body.linkKey);
   if (!link || !env.LINK_BINDING) throw new Error("Canonical Link key or LINK_BINDING binding is missing");
-  const stub = env.LINK_BINDING.get(env.LINK_BINDING.idFromName(link.key));
+  const stub = env.LINK_BINDING.get(env.LINK_BINDING.idFromName(LINK_BINDING_EPOCH + link.key));
   const response = await stub.fetch("https://link-binding.internal/", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ...body, linkKey: link.key }),

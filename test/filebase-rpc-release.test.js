@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createHash } from "node:crypto";
+const oid = label => `sha256:${createHash("sha256").update(label).digest("hex")}`;
 import { onRequestPost, callLifecycle } from "../lifecycle-api.js";
 import { ObjectLifecycleV2 as ObjectLifecycle } from "../lifecycle.js";
 
 const cid = "Qm" + "a".repeat(44);
-const objectRef = `ipfs:${cid.toLowerCase()}`;
+const objectRef = oid(cid);
 const rpcPlacement = { kind: "filebase_rpc", executor: "worker",
   provenance: "cividge_worker_rpc", locator: { cid } };
 
@@ -64,7 +66,7 @@ test("browser-held admin token cannot forge Worker RPC provenance", async () => 
 
 test("browser S3 Placement is never a Worker RPC cleanup target", async () => {
   const env = fixture({ FILEBASE_DEDICATED_BUCKET: "true" });
-  await present(env, { kind: "filebase", executor: "browser", locator: { key: "x.webp", cid } });
+  await present(env, { kind: "filebase", executor: "browser", locator: { bucket: "cividge", key: "x.webp", cid } });
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => { throw new Error("browser Placement must not be unpinned by Worker"); };
   try {
