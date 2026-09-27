@@ -3,6 +3,7 @@
 // ObjectLifecycle; this module only projects canonical Links into delivery KV.
 import { callLifecycle } from "./lifecycle-api.js";
 import { callLinkBinding } from "./link-binding-api.js";
+import { deliveryCacheRequest } from "./delivery.js";
 
 export async function onRequestOptions() {
   return new Response(null, {
@@ -555,16 +556,18 @@ export async function onRequestPost(context) {
     compressedMeta.kuboStatus = finalKuboStatus;
     compressedMeta.g = binding.generation;
 
-    // KV に登録。期限はメタデータ e だけで管理する。公開GETはこのprojectionを
-    // canonical keyで一回だけ読み、DOやstorageを参照しない。
-    const putOptions = { metadata: compressedMeta };
-    await env.CIVIDGE_KV.put(key, safeCid, putOptions);
+    // Commit both authorities before publishing their delivery projection.
+    // A failed projection can be retried; an exposed uncommitted Link cannot.
     await callLinkBinding(env, { action: "commit", linkKey: key, attemptId: bindingAttemptId,
       generation: binding.attempt?.generation });
     const acknowledgedPolicy = body.policyChange === true || !bindingAtStart?.policy
       ? (await callLinkBinding(env, { action: "acknowledgePolicy", linkKey: key,
         generation: binding.generation, expiresAt: calculatedExpiresAt || null, cachePolicy })).binding.policy
       : bindingAtStart.policy;
+    // KV に登録。期限はメタデータ e だけで管理する。公開GETはこのprojectionを
+    // canonical keyで一回だけ読み、DOやstorageを参照しない。
+    const putOptions = { metadata: compressedMeta };
+    await env.CIVIDGE_KV.put(key, safeCid, putOptions);
 
     // クライアント側へは旧形式互換のオブジェクトも含めて返却
     const returnedMeta = {
@@ -783,7 +786,7 @@ async function purgeHybridCache(request, env, key) {
   try {
     if (typeof caches !== "undefined" && caches.default) {
       for (const u of urlsToPurge) {
-        await caches.default.delete(u).catch(() => {});
+        await caches.default.delete(deliveryCacheRequest(new Request(u))).catch(() => {});
       }
     }
   } catch (cacheErr) {

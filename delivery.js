@@ -393,8 +393,8 @@ function wantsHumanNotFound(request) {
 
 // Internal Cache API keys are versioned at a clean KV/DO authority cutover.
 // The public URL and canonical Link key do not change.
-const DELIVERY_CACHE_EPOCH = "3";
-function deliveryCacheRequest(request) {
+const DELIVERY_CACHE_EPOCH = "4";
+export function deliveryCacheRequest(request) {
   const url = new URL(request.url);
   url.searchParams.set("__cividge_cache_epoch", DELIVERY_CACHE_EPOCH);
   return new Request(url.toString(), request);
@@ -426,6 +426,18 @@ function renderNotFoundResponse(request, cdnCacheSeconds = 300, context = null) 
   }
 
   return res;
+}
+
+function renderOriginUnavailableResponse(request) {
+  return new Response(request.method === "HEAD" ? null : "Media temporarily unavailable", {
+    status: 503,
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Cloudflare-CDN-Cache-Control": "no-store",
+      "Access-Control-Allow-Origin": "*",
+    },
+  });
 }
 
 // ⚡ 正常メディアレスポンスを Cache API（エッジキャッシュ）に書き込み、
@@ -640,8 +652,9 @@ export async function onRequest(context) {
       }
     } catch (kvErr) {
       console.warn("CIVIDGE_KV get error:", kvErr);
+      return renderOriginUnavailableResponse(request);
     }
-  }
+  } else return renderOriginUnavailableResponse(request);
 
   // 🛡️ 台帳存在チェック（ランダムパス攻撃防御）:
   // 台帳に存在しないファイル名は、R2 / IPFS どちらのストレージも検索しない。
@@ -659,8 +672,9 @@ export async function onRequest(context) {
   );
   let hasValidLedgerRecord = Boolean(isIpfsRecord || isR2Record);
   if (!hasValidLedgerRecord) {
-    // [INV-DELIVERY-004] [INV-CORE-003] 台帳に存在しない未知のキーは即座に404門前払い（無駄なR2検索・過保護な自己修復は完全排除）
-    return renderNotFoundResponse(request, 86400, context);
+    // Only an authoritative KV miss is 404. A present but unusable projection
+    // cannot prove that the Link is absent.
+    return resolvedKvKey ? renderOriginUnavailableResponse(request) : renderNotFoundResponse(request, 86400, context);
   }
 
   // ⏳ 時限アップロードの有効期限チェック（期限切れは即座に404、短縮キー e にも対応）
@@ -863,8 +877,7 @@ export async function onRequest(context) {
     // contentCid が記録されており、Kubo/IPFS に実体が移行している可能性がある場合は IPFS 探索へ
     const r2ContentCid = meta.contentCid || meta.c_cid || (meta.cid && meta.cid !== "r2" ? meta.cid : null);
     if (!r2ContentCid) {
-      // CID を持たない純粋な R2 レコードは即座に 404（無駄打ちゼロ）
-      return renderNotFoundResponse(request, 60, context);
+      return renderOriginUnavailableResponse(request);
     }
     // contentCid が存在する場合は、Filebase を除外した IPFS ゲートウェイルーティングへフォールスルー
   }
@@ -951,7 +964,7 @@ export async function onRequest(context) {
               cacheEverything: !hasPassword,
               ...(hasPassword ? { cacheTtl: 0 } : {
                 // 30秒以内の初期同期中は 404 を絶対に Worker キャッシュしない (0秒)
-                cacheTtlByStatus: { "200-299": UPSTREAM_CACHE_SECONDS, "404": isWithinGracePeriod ? 0 : 60, "500-599": 0 }
+                cacheTtlByStatus: { "200-299": UPSTREAM_CACHE_SECONDS, "404": 0, "500-599": 0 }
               }),
             },
           });
@@ -975,8 +988,7 @@ export async function onRequest(context) {
   if (!upstreamResponse || !upstreamResponse.ok) {
     // ⚠️ 登録から30秒以内のファイルは初期同期ラグの可能性が高いため、エッジに404を焼き付けない (0秒 / no-store)
     // 30秒を超えた長期不在（自宅ノードオフライン等）は、Worker防護のため通常通り60秒キャッシュする
-    const notFoundTtl = isWithinGracePeriod ? 0 : 60;
-    return renderNotFoundResponse(request, notFoundTtl, context);
+    return renderOriginUnavailableResponse(request);
   }
 
   const headers = new Headers();

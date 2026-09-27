@@ -15,8 +15,23 @@
   ObjectRef is the only authority for the Object-to-Link relation and release
   state. Delivery KV is a read-optimized projection; browser localStorage is
   UI/cache only.
+- The `LinkBinding` Durable Object is the distinct authority for canonical
+  Link-key uniqueness, binding generation, RETIRED state, and Link policy.
+  `ObjectLifecycle` owns Object-side membership, Placement lifecycle, and
+  zero-reference release authorization. Neither replaces the other.
 - Public delivery performs one canonical KV lookup and never calls the Durable
   Object, lists Links, repairs state, or probes storage on a KV miss.
+- **[INV-NOT-FOUND-IS-AUTHORITATIVE]** An unknown-Link NOT_FOUND requires a
+  successful canonical KV lookup that finds no Link. KV read/binding failure
+  cannot prove absence and returns 503 with `no-store`. An existing Link that
+  explicitly expired may still be denied with HTTP 404; that is an expiry
+  decision, not an inferred KV miss.
+- **[INV-KNOWN-LINK-UPSTREAM-FAILURE-IS-UNAVAILABLE]** Once a Link projection
+  is known, missing/unreachable R2 or IPFS/Filebase/Kubo origin is 503 with
+  `no-store`, not a cached 404. An expired Link remains unavailable as 404.
+- A new Link is published to delivery KV only after ObjectLifecycle membership
+  and LinkBinding commit/policy acknowledgement. Failed KV publication leaves
+  committed authority for retry, never a public-only uncommitted Link.
 
 ### Cache Policy invariants
 

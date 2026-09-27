@@ -101,6 +101,27 @@ test("unknown media uses exactly one canonical host-qualified KV lookup", async 
   assert.deepEqual(kv.calls.get, ["public.example:missing.webp"]);
 });
 
+test("KV read failure is unavailable, never a cached not-found", async () => {
+  const kv = memoryKv();
+  kv.getWithMetadata = async key => { kv.calls.get.push(key); throw new Error("KV unavailable"); };
+  const response = await deliver(context("https://public.example/media.webp", { CIVIDGE_KV: kv }));
+  assert.equal(response.status, 503);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.deepEqual(kv.calls.get, ["public.example:media.webp"]);
+});
+
+test("known R2 Link with missing origin is unavailable, not 404", async () => {
+  const kv = memoryKv(new Map([["public.example:media.webp", {
+    value: "r2", metadata: { b: "r2", k_s3: "media.webp" },
+  }]]));
+  const response = await deliver(context("https://public.example/media.webp", {
+    CIVIDGE_KV: kv, R2_BUCKET: { get: async () => null },
+  }));
+  assert.equal(response.status, 503);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.deepEqual(kv.calls.get, ["public.example:media.webp"]);
+});
+
 test("a clean authority ignores responses cached under the previous delivery epoch", async () => {
   const prior = globalThis.caches;
   const seen = [];
@@ -116,7 +137,7 @@ test("a clean authority ignores responses cached under the previous delivery epo
   try {
     const response = await deliver(context("https://public.example/old.webp", { CIVIDGE_KV: kv }));
     assert.equal(response.status, 404);
-    assert.deepEqual(seen, ["3"]);
+    assert.deepEqual(seen, ["4"]);
     assert.deepEqual(kv.calls.get, ["public.example:old.webp"]);
   } finally { globalThis.caches = prior; }
 });
@@ -301,6 +322,37 @@ test("registry rejects bare Link keys and canonicalizes the host in accepted key
   assert.equal(kv.calls.put[0].options.metadata.d, "public.example");
   assert.equal(kv.calls.put[0].options.metadata.g, 1);
   assert.equal(lifecycleCalls[0].objectRef, "r2:ok.webp");
+});
+
+test("failed LinkBinding commit never publishes a KV projection", async () => {
+  const kv = memoryKv();
+  const bindings = memoryBindingNamespace();
+  const originalGet = bindings.get;
+  bindings.get = id => {
+    const stub = originalGet(id);
+    return { fetch: async (url, options) => {
+      if (JSON.parse(options.body).action === "commit") {
+        return Response.json({ error: "commit failed" }, { status: 503 });
+      }
+      return stub.fetch(url, options);
+    } };
+  };
+  const env = {
+    CIVIDGE_KV: kv, ADMIN_API_TOKEN: "secret", LINK_BINDING: bindings,
+    OBJECT_LIFECYCLE: {
+      idFromName: value => value,
+      get: () => ({ fetch: async () => Response.json({ lifecycle: {
+        links: ["public.example:ok.webp"],
+        placements: { r2: { state: "PRESENT", kind: "r2", locator: { key: "ok.webp" } } },
+      } }) }),
+    },
+  };
+  const response = await onRequestPost({ request: new Request("https://worker.example/api/cividge-kv", {
+    method: "POST", headers: { Authorization: "Bearer secret", "Content-Type": "application/json" },
+    body: JSON.stringify({ key: "public.example:ok.webp", cid: "r2", backend: "r2", s3Key: "ok.webp" }),
+  }), env, waitUntil() {} });
+  assert.notEqual(response.status, 200);
+  assert.deepEqual(kv.calls.put, []);
 });
 
 test("creating an alias projection leaves the source Link and projection intact", async () => {
