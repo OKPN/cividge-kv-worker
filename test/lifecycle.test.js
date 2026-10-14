@@ -140,7 +140,7 @@ test("a clean authority ignores responses cached under the previous delivery epo
   try {
     const response = await deliver(context("https://public.example/old.webp", { CIVIDGE_KV: kv }));
     assert.equal(response.status, 404);
-    assert.deepEqual(seen, ["5"]);
+    assert.deepEqual(seen, []); // KV absence is checked before any public byte cache.
     assert.deepEqual(kv.calls.get, ["public.example:old.webp"]);
   } finally { globalThis.caches = prior; }
 });
@@ -171,7 +171,7 @@ test("a cached SVG 404 cannot replace a human navigation", async () => {
       }) });
     assert.equal(response.headers.get("content-type"), "text/html; charset=utf-8");
     assert.match(await response.text(), /src="data:image\/webp;base64,/);
-    assert.deepEqual(kv.calls.get, []);
+    assert.deepEqual(kv.calls.get, ["public.example:missing.webp"]);
   } finally { globalThis.caches = prior; }
 });
 

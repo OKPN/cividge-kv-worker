@@ -127,7 +127,8 @@ function parseCookies(cookieHeader) {
   cookieHeader.split(";").forEach((cookie) => {
     const parts = cookie.split("=");
     if (parts.length >= 2) {
-      list[parts.shift().trim()] = decodeURIComponent(parts.join("=").trim());
+      const name = parts.shift().trim();
+      try { list[name] = decodeURIComponent(parts.join("=").trim()); } catch (_) {}
     }
   });
   return list;
@@ -184,7 +185,7 @@ async function verifySessionToken(token, filename, meta) {
 }
 
 async function verifyPassword(inputPassword, meta) {
-  if (!inputPassword || !meta) return false;
+  if (typeof inputPassword !== "string" || !inputPassword || !meta) return false;
   if (meta.password && inputPassword === meta.password) return true;
 
   if (meta.passwordHash && meta.passwordSalt) {
@@ -336,13 +337,13 @@ function isSocialCrawler(userAgent = "") {
 
 // 🖼️ SNSクローラー向け軽量 OGP HTML レスポンス生成（大容量バイナリ取得によるプレビュー失敗を完全防止）
 function renderOgpHtml(filename, rawUrl, ext, isVideo, hasThumbnail = false) {
-  const title = `${filename}`;
+  const title = escapeHtml(filename);
   const siteName = "Cividge Media";
   // The preview is a representation of this Link, not a second public Link.
   const separator = rawUrl.includes("?") ? "&" : "?";
-  const rawMediaUrl = `${rawUrl}${separator}raw=1`;
-  const videoThumbUrl = `${rawUrl}${separator}preview=1`;
-  const mediaUrl = rawUrl;
+  const rawMediaUrl = escapeHtml(`${rawUrl}${separator}raw=1`);
+  const videoThumbUrl = escapeHtml(`${rawUrl}${separator}preview=1`);
+  const mediaUrl = escapeHtml(rawUrl);
   const thumbUrl = isVideo ? videoThumbUrl : rawMediaUrl;
   const mimeType = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : (ext === "png" ? "image/png" : (ext === "webp" ? "image/webp" : "application/octet-stream"));
 
@@ -393,17 +394,31 @@ function wantsHumanNotFound(request) {
 
 // Internal Cache API keys are versioned at a clean KV/DO authority cutover.
 // The public URL and canonical Link key do not change.
-const DELIVERY_CACHE_EPOCH = "5";
-export function deliveryCacheRequest(request) {
+const DELIVERY_CACHE_EPOCH = "6";
+export function deliveryCacheRequest(request, projectionFingerprint = "") {
   const url = new URL(request.url);
+  const representations = ["preview", "raw", "thumb"].filter(name => url.searchParams.has(name));
+  url.search = "";
+  for (const name of representations) url.searchParams.set(name, "1");
+  if (wantsHumanNotFound(request)) url.searchParams.set("__cividge_human", "1");
   url.searchParams.set("__cividge_cache_epoch", DELIVERY_CACHE_EPOCH);
+  if (projectionFingerprint) url.searchParams.set("__cividge_projection", projectionFingerprint);
   return new Request(url.toString(), request);
+}
+
+async function projectionCacheRequest(request, value, metadata) {
+  // An ephemeral cache key, not another record or authority. Every request must
+  // observe the Link projection before it can reuse bytes for that projection.
+  const serialized = JSON.stringify([value, Object.keys(metadata).sort().map(key => [key, metadata[key]])]);
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(serialized));
+  const fingerprint = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+  return deliveryCacheRequest(request, fingerprint);
 }
 
 function renderNotFoundResponse(request, cdnCacheSeconds = 300, context = null) {
   const headers = {
     // 公開メディアの miss は短時間負のキャッシュに載せる（DoS・枠枯渇防止）
-    "Cache-Control": cdnCacheSeconds > 0 ? `public, max-age=${cdnCacheSeconds}` : "no-store",
+    "Cache-Control": cdnCacheSeconds > 0 ? `public, max-age=0, s-maxage=${cdnCacheSeconds}` : "no-store",
     ...(cdnCacheSeconds > 0 ? { "Cloudflare-CDN-Cache-Control": `public, max-age=${cdnCacheSeconds}` } : {}),
   };
 
@@ -417,13 +432,8 @@ function renderNotFoundResponse(request, cdnCacheSeconds = 300, context = null) 
     },
   });
 
-  // ⚡ エッジキャッシュ（Cache API）に404を書き込み、同一パスの反復 DoS 攻撃での KV 消費を完全ゼロ化
-  if (cdnCacheSeconds > 0 && typeof caches !== "undefined" && caches.default && request.method === "GET") {
-    try {
-      context?.waitUntil?.(caches.default.put(deliveryCacheRequest(request), res.clone())) ||
-        caches.default.put(deliveryCacheRequest(request), res.clone()).catch(() => {});
-    } catch (_) {}
-  }
+  // Negative responses may be cached downstream, but not stored in Cache API:
+  // Worker cache must never establish absence before current KV observation.
 
   return res;
 }
@@ -440,9 +450,8 @@ function renderOriginUnavailableResponse(request) {
   });
 }
 
-// ⚡ 正常メディアレスポンスを Cache API（エッジキャッシュ）に書き込み、
-// 2回目以降の同一 URL アクセスでの KV 読み取り・ストレージ問い合わせを完全ゼロ化
-function saveResponseToEdgeCache(request, res, context, hasPassword = false) {
+// Cache public bytes only. A hit saves an origin read, never a Link observation.
+function saveResponseToEdgeCache(request, res, context, hasPassword = false, cacheRequest = deliveryCacheRequest(request)) {
   if (
     !hasPassword &&
     request.method === "GET" &&
@@ -452,8 +461,8 @@ function saveResponseToEdgeCache(request, res, context, hasPassword = false) {
     caches.default
   ) {
     try {
-      context?.waitUntil?.(caches.default.put(deliveryCacheRequest(request), res.clone())) ||
-        caches.default.put(deliveryCacheRequest(request), res.clone()).catch(() => {});
+      const write = caches.default.put(cacheRequest, res.clone()).catch(() => {});
+      context?.waitUntil?.(write);
     } catch (_) {}
   }
 }
@@ -478,7 +487,7 @@ export function publicMediaCacheLifetimes(env, { cachePolicy = "BOARD", isVideoO
 
 function setPublicMediaCacheHeaders(headers, lifetimes, hasPassword) {
   if (hasPassword) {
-    headers.set("Cache-Control", `private, max-age=${lifetimes.browserSeconds}`);
+    headers.set("Cache-Control", "private, no-store");
     headers.set("Cloudflare-CDN-Cache-Control", "private, no-store");
     headers.set("Vary", "Cookie, Accept-Encoding");
   } else {
@@ -525,32 +534,14 @@ export async function onRequest(context) {
     });
   }
 
-  // ⚡ エッジキャッシュ（Cache API）最前線ガード:
-  // 過去にアクセスされた正常メディアまたは 404 レスポンスは、KV を叩かず即座に返却（KV消費 0回）
+  // Cache cannot precede routing, current Link observation or password gating.
   const edgeCache = typeof caches !== "undefined" ? caches.default : null;
   // The compatibility probe must reach the current relay-id resolution. An
   // old cached SVG 404 is not proof that this Pages host is registered.
   const characterProbe = /(?:^|\/)404-character\.webp$/.test(new URL(request.url).pathname);
   const previewRequested = new URL(request.url).searchParams.has("preview");
-  if (!characterProbe && !previewRequested && edgeCache && (request.method === "GET" || request.method === "HEAD")) {
-    try {
-      const cached = await edgeCache.match(deliveryCacheRequest(request));
-      if (cached) {
-        if (cached.status === 404) {
-          const cachedIsHtml = (cached.headers.get("content-type") || "").includes("text/html");
-          const human = wantsHumanNotFound(request);
-          const oldDependentHtml = human && cachedIsHtml &&
-            !(await cached.clone().text()).includes('src="data:image/webp;base64,');
-          if (cachedIsHtml !== human || oldDependentHtml) {
-            // Cache API keys do not distinguish navigation from image fetches.
-            // A stale SVG 404 must not replace the complete human-facing page.
-            return renderNotFoundResponse(request, 60, context);
-          }
-        }
-        return cached;
-      }
-    } catch (_) {}
-  }
+  if (!["GET", "HEAD", "POST"].includes(request.method)) return new Response("Method Not Allowed", {
+    status: 405, headers: { "Allow": "GET, HEAD, POST, OPTIONS", "Cache-Control": "no-store" } });
 
   const url = new URL(request.url);
   const pathname = url.pathname;
@@ -674,7 +665,7 @@ export async function onRequest(context) {
   if (!hasValidLedgerRecord) {
     // Only an authoritative KV miss is 404. A present but unusable projection
     // cannot prove that the Link is absent.
-    return resolvedKvKey ? renderOriginUnavailableResponse(request) : renderNotFoundResponse(request, 86400, context);
+    return resolvedKvKey ? renderOriginUnavailableResponse(request) : renderNotFoundResponse(request, 60, context);
   }
 
   // ⏳ 時限アップロードの有効期限チェック（期限切れは即座に404、短縮キー e にも対応）
@@ -682,7 +673,7 @@ export async function onRequest(context) {
   if (expiresTimestamp && Date.now() > Number(expiresTimestamp)) {
     // Expiry is a read-only Link availability decision.  Cleanup is an explicit
     // mutation because this request cannot authoritatively prove final reference.
-    return renderNotFoundResponse(request, 300, context);
+    return renderNotFoundResponse(request, 60, context);
   }
 
   // 🌐 配信ドメイン制限チェック（各ドメインは完全独立：設定されたドメイン以外からのアクセスは即座に404で遮断）
@@ -703,31 +694,35 @@ export async function onRequest(context) {
     const cookieKey = "auth_" + encodeURIComponent(filename);
     const authCookie = cookies[cookieKey];
 
-    const isSessionAuthed = await verifySessionToken(authCookie, filename, meta);
+    const sessionScope = `${resolvedKvKey}:${meta.g || 0}:${meta.oid || ""}`;
+    const isSessionAuthed = request.method !== "POST" && await verifySessionToken(authCookie, sessionScope, meta);
 
     if (request.method === "POST") {
       try {
         const formData = await request.formData();
         const pwd = formData.get("pwd");
         if (await verifyPassword(pwd, meta)) {
-          const sessionToken = await createSessionToken(filename, meta);
+          const sessionToken = await createSessionToken(sessionScope, meta);
           if (!sessionToken) throw new Error("Unable to create session");
           return new Response(null, {
             status: 303,
             headers: {
               "Location": request.url,
+              "Cache-Control": "private, no-store",
+              "Cloudflare-CDN-Cache-Control": "no-store",
               "Set-Cookie": `${cookieKey}=${encodeURIComponent(sessionToken)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=3600`,
             },
           });
         } else {
-          // 🛡️ パスワード総当たり・辞書攻撃対策:
-          // KVの書き込み枠（1日1,000回）を浪費せず、1秒強制スリープでツールの高速試行を無力化
-          await new Promise((resolve) => setTimeout(resolve, 1000));
+          // Limited friction for sequential retries, not a concurrency/rate
+          // limit and not a reduction in KV or PBKDF2 work already performed.
+          await new Promise(resolve => setTimeout(resolve, 3000));
           return new Response(renderPasswordForm(filename, "合言葉（パスワード）が正しくありません"), {
             status: 403,
             headers: {
               "Content-Type": "text/html; charset=utf-8",
               "Cache-Control": "private, no-cache, no-store",
+              "Cloudflare-CDN-Cache-Control": "no-store",
               "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
               "X-Frame-Options": "DENY",
               "Referrer-Policy": "no-referrer",
@@ -735,12 +730,13 @@ export async function onRequest(context) {
           });
         }
       } catch (postErr) {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        await new Promise(resolve => setTimeout(resolve, 3000));
         return new Response(renderPasswordForm(filename, "入力処理でエラーが発生しました"), {
           status: 400,
           headers: {
             "Content-Type": "text/html; charset=utf-8",
             "Cache-Control": "private, no-cache, no-store",
+            "Cloudflare-CDN-Cache-Control": "no-store",
             "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
             "X-Frame-Options": "DENY",
             "Referrer-Policy": "no-referrer",
@@ -755,6 +751,7 @@ export async function onRequest(context) {
         headers: {
           "Content-Type": "text/html; charset=utf-8",
           "Cache-Control": "private, no-cache, no-store",
+          "Cloudflare-CDN-Cache-Control": "no-store",
           "Vary": "Cookie",
           "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
           "X-Frame-Options": "DENY",
@@ -763,6 +760,9 @@ export async function onRequest(context) {
       });
     }
   }
+
+  if (request.method === "POST") return new Response("Method Not Allowed", {
+    status: 405, headers: { "Allow": "GET, HEAD, OPTIONS", "Cache-Control": "no-store" } });
 
   if (previewRequested) {
     // Public delivery still performs exactly one canonical Link KV lookup.
@@ -811,6 +811,25 @@ export async function onRequest(context) {
     });
   }
 
+  const currentCacheRequest = !hasPassword ? await projectionCacheRequest(request, targetCid, meta) : null;
+  if (!hasPassword && !characterProbe && edgeCache) {
+    try {
+      const cached = await edgeCache.match(isHead ? new Request(currentCacheRequest, { method: "GET" }) : currentCacheRequest);
+      if (cached && (cached.status === 200 || cached.status === 206)) {
+        const headers = new Headers(cached.headers);
+        // A cache hit must not newly grant freshness beyond Link validity.
+        const capHeader = name => {
+          const value = headers.get(name);
+          if (value) headers.set(name, value.replace(/(s-maxage|max-age)=(\d+)/g,
+            (_, directive, seconds) => `${directive}=${capCacheToExpiry(Number(seconds), expiresTimestamp)}`));
+        };
+        capHeader("Cache-Control");
+        capHeader("Cloudflare-CDN-Cache-Control");
+        return new Response(isHead ? null : cached.body, { status: cached.status, headers });
+      }
+    } catch (_) {}
+  }
+
   // 3. KV に実データ（blobKey または backend: "kv"）が明示的に格納されている場合のみ即時配信
   // [INV-CORE-001] 通常の R2/IPFS 配信時に存在しない blob_ キーを空振り get() して KV 読み込み枠を倍速浪費するバグを根絶
   const isKvDirectStorage = Boolean(meta.blobKey || meta.backend === "kv" || meta.b === "kv");
@@ -847,7 +866,7 @@ export async function onRequest(context) {
         const ext = extMatch[1].toLowerCase();
         headers.set("Content-Type", meta.mime || mimeMap[ext] || "application/octet-stream");
         const res = new Response(directData, { status: 200, headers });
-        saveResponseToEdgeCache(request, res, context, hasPassword);
+        saveResponseToEdgeCache(request, res, context, hasPassword, currentCacheRequest);
         return res;
       }
     } catch (directErr) {
@@ -884,7 +903,7 @@ export async function onRequest(context) {
           r2Obj.writeHttpMetadata(headers);
           setPublicMediaCacheHeaders(headers, cacheLifetimes, hasPassword);
           const res = new Response(isHead ? null : r2Obj.body, { status: 200, headers });
-          saveResponseToEdgeCache(request, res, context, hasPassword);
+          saveResponseToEdgeCache(request, res, context, hasPassword, currentCacheRequest);
           return res;
         }
       } catch (r2Err) {
@@ -920,7 +939,12 @@ export async function onRequest(context) {
 
   // Control-plane config is read only after the canonical Link lookup and
   // cache miss. A gateway failure never mutates Object/Link/Placement state.
-  const publicGateways = orderPublicGateways(await readGatewayConfig(env), request.cf?.continent, request.cf?.country);
+  let publicGateways;
+  try {
+    publicGateways = orderPublicGateways(await readGatewayConfig(env), request.cf?.continent, request.cf?.country);
+  } catch (_) {
+    return renderOriginUnavailableResponse(request);
+  }
   const filebaseGateway = "https://ipfs.filebase.io/ipfs";
 
   // 自宅 Kubo の専用公開ゲートウェイ（環境変数 KUBO_GATEWAY_URL があれば最優先）
@@ -1075,6 +1099,6 @@ export async function onRequest(context) {
     status: upstreamResponse.status,  // 200 or 206 をそのまま返す
     headers,
   });
-  saveResponseToEdgeCache(request, res, context, hasPassword);
+  saveResponseToEdgeCache(request, res, context, hasPassword, currentCacheRequest);
   return res;
 }

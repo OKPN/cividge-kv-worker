@@ -647,8 +647,9 @@ export async function onRequestPost(context) {
       ...compressedMeta,
     };
 
-    // 🚀 URL再利用・即時反映: 直前までの404エッジキャッシュを即時パージ
-    context.waitUntil?.(purgeHybridCache(request, env, key)) || purgeHybridCache(request, env, key);
+    // Purge is best effort, not an assertion of globally immediate visibility.
+    const purge = purgeHybridCache(request, env, key);
+    if (context.waitUntil) context.waitUntil(purge); else await purge;
 
     return new Response(JSON.stringify({ success: true, key, cid: safeCid, objectRef: lifecycle.objectRef, metadata: returnedMeta }), {
       status: 200,
@@ -757,8 +758,8 @@ export async function onRequestDelete(context) {
     }
     await callLinkBinding(env, { action: "completeRemove", linkKey: canonical.key });
 
-    // 🚀 リンク抹消: エッジに残っている画像キャッシュを即座に消滅させる
-    context.waitUntil?.(purgeHybridCache(request, env, canonical.key)) || purgeHybridCache(request, env, canonical.key);
+    const purge = purgeHybridCache(request, env, canonical.key);
+    if (context.waitUntil) context.waitUntil(purge); else await purge;
 
     return new Response(JSON.stringify({ success: true, deletedKey: canonical.key, objectRef: lifecycle.objectRef }), {
       status: 200,
@@ -776,7 +777,7 @@ export async function onRequestDelete(context) {
 // プランA (独自ドメイン設定時): REST Purge API で世界300箇所の全エッジから即時抹消
 // プランB (pages.dev無料運用時): Cache API (caches.default) でローカルPoPから即時抹消
 // Zone API の対象はcanonical Link hostと明示設定のrelayだけに限定する。
-async function purgeHybridCache(request, env, key) {
+export async function purgeHybridCache(request, env, key) {
   if (!key) return;
   const colonIdx = key.indexOf(":");
   const pureFilename = colonIdx > 0 ? key.substring(colonIdx + 1) : key;
@@ -814,6 +815,11 @@ async function purgeHybridCache(request, env, key) {
   const globalUrlsToPurge = backendRelayOrigins.flatMap(origin =>
     relayTargetPaths.map(path => `${origin}${path}`)
   );
+  // Direct custom-domain delivery has no /r/ wrapper. pages.dev belongs to
+  // Cloudflare's zone, not the administrator's purge zone.
+  if (keyHost && !keyHost.endsWith(".pages.dev") && !keyHost.endsWith(".workers.dev")) {
+    globalUrlsToPurge.push(`https://${keyHost}${targetPath}`);
+  }
 
   // Cache API でも実配信 URL を削除する。これは現在の PoP 限定の補助策。
   urlsToPurge.push(...globalUrlsToPurge);
@@ -821,7 +827,7 @@ async function purgeHybridCache(request, env, key) {
   // 1. プランA: REST Purge API (独自ドメインの Zone ID & API Token がある場合)
   const zoneId = env.CLOUDFLARE_ZONE_ID;
   const purgeToken = env.CLOUDFLARE_PURGE_TOKEN || env.CLOUDFLARE_API_TOKEN;
-  if (zoneId && purgeToken) {
+  if (zoneId && purgeToken && globalUrlsToPurge.length) {
     try {
       const response = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/purge_cache`, {
         method: "POST",
@@ -833,7 +839,7 @@ async function purgeHybridCache(request, env, key) {
       });
       const result = await response.json().catch(() => null);
       if (!response.ok || result?.success !== true) {
-        console.warn(`REST Purge API failed (${response.status}):`, result || "invalid JSON response");
+        console.warn(`REST Purge API failed (${response.status}); invalidation remains best effort`);
       }
     } catch (apiErr) {
       console.warn("REST Purge API error:", apiErr);

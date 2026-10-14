@@ -1,5 +1,29 @@
 # システム不変条件 (System Invariants)
 
+## Password gate / cache boundary
+
+- **[INV-INVALID-ADDRESS-DOES-NOT-REACH-ORIGIN]** Invalid routing/address
+  under the current delivery policy is rejected before storage exploration.
+- **[INV-NOT-FOUND-IS-AUTHORITATIVE]** NOT_FOUND requires a successful
+  canonical delivery lookup establishing absence (or observed expiration), not
+  a cache hit or origin failure. The lookup uses KV projection and is not a
+  claim that KV replaces LinkBinding/ObjectLifecycle authority or is globally fresh.
+- **[INV-UNAVAILABLE-IS-NOT-NOT-FOUND]** Failed KV or known-origin retrieval is
+  unavailable/no-store, never a negative existence cache.
+- **[INV-PASSWORD-GATE-CANNOT-BE-BYPASSED-BY-PRESENTATION]** Body, Range,
+  preview and OGP cannot precede password/expiry checks. Protected/session
+  responses are no-store. Sessions bind canonical Link identity, generation,
+  ObjectId and password signing material, without an independent session ledger.
+- **[INV-CACHE-DOES-NOT-BECOME-AUTHORITY]** Worker byte-cache reuse follows
+  the current KV observation and uses its projection fingerprint. Cached 200/404
+  cannot replace Link checks. KV staleness and pre-Worker/browser caches are
+  separate limits; best-effort purge does not imply globally immediate revocation.
+- **[INV-CACHE-NEVER-OUTLIVES-LINK]** Newly returned freshness, including a
+  byte-cache hit, is capped by observed remaining Link lifetime. Previously
+  assigned client/edge freshness cannot be retroactively revoked by this rule.
+
+Operational audit and Dashboard checks: `cividge/docs/PASSWORD_CACHE_BOUNDARY_AUDIT.md`.
+
 このドキュメントは、本システム（cividge-kv-worker および cividge）が正常に動作するために、**いかなるコード改修やリファクタリングを行っても絶対に崩してはならない性質（不変条件）** を定義したものです。
 
 新規機能の追加や最適化を行う開発者（および AI エージェント）は、必ずこのルールを遵守してください。
@@ -298,7 +322,7 @@ delivery remains a single KV lookup and may reflect the policy later.
 * **満たすべき性質 (Required Behavior)**:
   1. 静的リレー（Pages 等）からバックエンド Worker への中継は、クエリパラメータではなく **フォルダ構造（`/r/<relay-identifier>/<filename>`）** を最優先で使用すること。これにより、キャッシュバスター防御（`INV-INFRA-001`）によるクエリ除去（Ignore Query String）やブラウザの Referrer-Policy による情報欠落に一切影響されず、単一ホストを一発で確定できる。
   2. 照会は「特定されたホスト:ファイル名」の 1 回のみで完結させること（404 空振り時の KV 消費は最大 1 回）。
-  3. 404 レスポンスは Cache API（`caches.default`）によりエッジでキャッシュ（最低 300 秒）し、同一パスへの反復攻撃に対する KV 消費を完全ゼロ（0 回）に抑え込むこと。
+  3. 正常なKV missの404はbrowser max-age=0・shared TTL最大60秒とし、Worker内部の負キャッシュで現在の照会を省略してはならない。反復アクセスの到達数制限はZone側の責務であり、キャッシュだけでKV消費ゼロを保証しない。
 
 ---
 
@@ -363,10 +387,10 @@ delivery remains a single KV lookup and may reflect the policy later.
 
 ### [INV-INFRA-001] ゾーン設定におけるキャッシュバスター防御の義務
 * **規則 (Rule)**:
-  Cividge を公開配信するすべての Cloudflare ゾーン（カスタムドメインおよび静的リレー）において、メディア拡張子に対する Cache Rules では **必ず「すべてのクエリ文字列を無視 (Ignore query string)」を設定しなければならない (MUST)**。
+  無意味なqueryは内部cache keyから除外するが、`preview`・`raw`・`thumb`等の表現選択を一律に潰してはならない。Workerの認証／期限照会より前に古い応答を返す外側shared cacheは配信ingressでbypassする。Zoneのルールは実際のplan・host・経路に合わせて確認する。
 
 * **理由 (Rationale)**:
-  ランダムクエリ攻撃（`?rand=12345`）によるキャッシュバスター DoS 攻撃を防ぎ、Worker の無料枠枯渇および上流ストレージのパンクをエッジ（CDN）の最前線で 100% 防護するため。
+  ランダムqueryによる本文cache keyの増殖を防ぎ、previewと本文の混同や認証迂回を避けるため。到達request数・無料枠の防衛は前段制限との組み合わせであり、100%防御をキャッシュの不変条件としない。
 
 * **運用手順**:
   詳細な設定手順については `cividge/docs/SECURITY_AND_CACHE_RUNBOOK.md` を参照すること。
