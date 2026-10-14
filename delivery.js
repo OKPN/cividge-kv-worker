@@ -920,7 +920,7 @@ export async function onRequest(context) {
 
   // Control-plane config is read only after the canonical Link lookup and
   // cache miss. A gateway failure never mutates Object/Link/Placement state.
-  const publicGateways = orderPublicGateways(await readGatewayConfig(env), request.cf?.continent);
+  const publicGateways = orderPublicGateways(await readGatewayConfig(env), request.cf?.continent, request.cf?.country);
   const filebaseGateway = "https://ipfs.filebase.io/ipfs";
 
   // 自宅 Kubo の専用公開ゲートウェイ（環境変数 KUBO_GATEWAY_URL があれば最優先）

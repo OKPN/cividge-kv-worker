@@ -8,11 +8,22 @@ export const DEFAULT_GATEWAY_CONFIG = Object.freeze({
     { url: "https://dget.top/ipfs", region: "global", enabled: true },
     { url: "https://ipfs.orbitor.dev/ipfs", region: "na", enabled: true },
     { url: "https://eu.orbitor.dev/ipfs", region: "eu", enabled: true },
-    { url: "https://latam.orbitor.dev/ipfs", region: "global", enabled: true },
+    { url: "https://latam.orbitor.dev/ipfs", region: "latam", enabled: true },
   ],
 });
 
-const REGIONS = new Set(["global", "apac", "eu", "na"]);
+const REGIONS = new Set(["global", "apac", "eu", "na", "latam"]);
+
+// Explicit routing coverage: Mexico, Central America, Caribbean countries and
+// territories, and South America. This is a selection policy, not geolocation
+// or a claim about a Gateway's physical location.
+const LATAM_COUNTRIES = new Set([
+  "MX", "BZ", "GT", "HN", "SV", "NI", "CR", "PA",
+  "AG", "AI", "AW", "BB", "BL", "BQ", "BS", "CU", "CW", "DM", "DO",
+  "GD", "GP", "HT", "JM", "KN", "KY", "LC", "MF", "MQ", "MS", "PR",
+  "SX", "TC", "TT", "VC", "VG", "VI",
+  "AR", "BO", "BR", "CL", "CO", "EC", "FK", "GF", "GY", "PE", "PY", "SR", "UY", "VE",
+]);
 
 export function normalizeGatewayConfig(input) {
   if (!input || typeof input !== "object" || !Array.isArray(input.endpoints)) throw new Error("Gateway endpoints are required");
@@ -49,12 +60,13 @@ export async function readGatewayConfig(env) {
   return saved ? normalizeGatewayConfig(saved) : normalizeGatewayConfig(DEFAULT_GATEWAY_CONFIG);
 }
 
-export function orderPublicGateways(config, continent) {
+export function orderPublicGateways(config, continent, country) {
   const enabled = config.endpoints.filter(item => item.enabled);
   if (config.mode === "manual") {
     return [config.selectedUrl, ...enabled.map(item => item.url).filter(url => url !== config.selectedUrl)];
   }
-  const region = continent === "AS" || continent === "OC" ? "apac"
+  const region = LATAM_COUNTRIES.has(String(country || "").toUpperCase()) || continent === "SA" ? "latam"
+    : continent === "AS" || continent === "OC" ? "apac"
     : continent === "EU" || continent === "AF" ? "eu"
       : continent === "NA" ? "na" : "global";
   return enabled.slice().sort((a, b) => {

@@ -48,3 +48,28 @@ test("authenticated admin save changes the Worker-readable runtime config", asyn
   assert.equal(orderPublicGateways(saved, "AS")[0], "https://eu.orbitor.dev/ipfs");
   assert.equal((await handleGatewayConfig(new Request("https://worker.test/api/gateway-config"), env)).status, 401);
 });
+
+test("LATAM overrides the North America continent for explicit countries", () => {
+  const config = normalizeGatewayConfig(DEFAULT_GATEWAY_CONFIG);
+  const latam = "https://latam.orbitor.dev/ipfs";
+  for (const country of ["MX", "GT", "PA", "CU", "PR", "JM", "BR", "ar"]) {
+    assert.equal(orderPublicGateways(config, "NA", country)[0], latam);
+  }
+  assert.equal(orderPublicGateways(config, "SA")[0], latam);
+  for (const country of ["US", "CA"]) {
+    assert.equal(orderPublicGateways(config, "NA", country)[0], "https://ipfs.orbitor.dev/ipfs");
+  }
+  assert.deepEqual(orderPublicGateways(config, "NA", "MX").slice(0, 2), [latam, "https://dget.top/ipfs"]);
+  assert.equal(orderPublicGateways(config)[0], "https://dget.top/ipfs");
+  config.endpoints.find(item => item.url === latam).enabled = false;
+  assert.equal(orderPublicGateways(config, "NA", "MX")[0], "https://dget.top/ipfs");
+  config.mode = "manual";
+  config.selectedUrl = "https://eu.orbitor.dev/ipfs";
+  assert.equal(orderPublicGateways(config, "NA", "MX")[0], config.selectedUrl);
+});
+
+test("saved Gateway region metadata is preserved without migration", () => {
+  const input = structuredClone(DEFAULT_GATEWAY_CONFIG);
+  input.endpoints.find(item => item.url.includes("latam.")).region = "global";
+  assert.equal(normalizeGatewayConfig(input).endpoints.find(item => item.url.includes("latam.")).region, "global");
+});
