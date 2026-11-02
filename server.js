@@ -4,6 +4,7 @@ import * as uploadApi from "./upload.js";
 import * as thumbnailApi from "./thumbnail-api.js";
 import { onRequest as onDelivery } from "./delivery.js";
 import { handleGatewayConfig } from "./gateway-config-api.js";
+import { handleIpfsAvailability } from "./ipfs-availability-api.js";
 import * as linkBindingApi from "./link-binding-api.js";
 export { ObjectLifecycleV2 } from "./lifecycle.js";
 export { LinkBindingV2 } from "./link-binding.js";
@@ -42,6 +43,7 @@ export default {
     }
 
     if (pathname === "/api/gateway-config") return handleGatewayConfig(request, env);
+    if (pathname === "/api/ipfs-availability") return handleIpfsAvailability(request, env);
 
     if (pathname === "/api/thumbnail") {
       const res = request.method === "POST"

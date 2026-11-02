@@ -556,6 +556,40 @@ test("confirmed Kubo placement alone permits source release", () => {
   assert.equal(state.placements.filebase.state, "RELEASE_PENDING");
 });
 
+test("manual explicit drift may release the last PRESENT placement while keeping Links", () => {
+  const state = newLifecycle(oid("ipfs:bafy-drift"), [
+    { kind: "kubo", executor: "browser", locator: { cid: "bafy-drift" } },
+  ]);
+  addLink(state, "public.example:drift.webp");
+  requestPlacementRelease(state, "kubo", { allowLastPlacementDrift: true });
+  assert.equal(state.links.length, 1);
+  assert.equal(state.placements.kubo.state, "RELEASE_PENDING");
+});
+
+test("ObjectLifecycle requires the manual-drift authorization flag before releasing the last placement", async () => {
+  const objectRef = oid("ipfs:bafy-drift-api");
+  const state = newLifecycle(objectRef, [
+    { kind: "kubo", executor: "browser", locator: { cid: "bafy-drift-api" } },
+  ]);
+  addLink(state, "public.example:drift-api.webp");
+  const values = new Map([["lifecycle", state]]);
+  const lifecycle = new ObjectLifecycle({ storage: {
+    get: async key => structuredClone(values.get(key)),
+    put: async (key, value) => values.set(key, structuredClone(value)),
+    setAlarm: async () => {}, deleteAlarm: async () => {},
+  } }, {});
+  const send = allowLastPlacementDrift => lifecycle.fetch(new Request("https://object-lifecycle.internal/", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "requestPlacementRelease", objectRef, placement: "kubo",
+      reason: "manual-drift", allowLastPlacementDrift }),
+  }));
+  assert.equal((await send(false)).status, 409);
+  assert.equal((await send(true)).status, 200);
+  const stored = values.get("lifecycle");
+  assert.equal(stored.links.length, 1);
+  assert.equal(stored.placements.kubo.state, "RELEASE_PENDING");
+});
+
 test("createLink adds peer Links without changing an existing peer", () => {
   const state = newLifecycle(oid("r2:shared.webp"), [
     { kind: "r2", executor: "worker", locator: { bucket: "cividge", key: "shared.webp" } },

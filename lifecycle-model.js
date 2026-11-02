@@ -256,12 +256,12 @@ export function reportThumbnailRelease(current, report) {
   return current;
 }
 
-export function requestPlacementRelease(current, kind) {
+export function requestPlacementRelease(current, kind, { allowLastPlacementDrift = false } = {}) {
   const placement = current.placements[String(kind || "").toLowerCase()];
   if (!placement) throw new Error("Unknown placement");
   if (placement.state === "RELEASED") return current;
   if (placement.state === "RELEASING") throw new Error("Placement release is already in progress");
-  if (current.links.length !== 0 && !activePreservingPlacement(current, placement.kind)) {
+  if (current.links.length !== 0 && !activePreservingPlacement(current, placement.kind) && !allowLastPlacementDrift) {
     throw new Error("A linked Object needs another PRESENT placement before source release");
   }
   placement.state = "RELEASE_PENDING";

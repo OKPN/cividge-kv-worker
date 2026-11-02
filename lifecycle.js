@@ -68,7 +68,12 @@ export class ObjectLifecycleV2 {
         requestRelease(state);
       } else if (action === "requestPlacementRelease") {
         if (!state) return json({ error: "Object lifecycle not found" }, 404);
-        requestPlacementRelease(state, body.placement);
+        requestPlacementRelease(state, body.placement, {
+          // Manual user confirmation may intentionally leave the Link without
+          // a managed PRESENT Placement so IPFS can serve it while it survives.
+          // Automated capacity/FIFO paths must never set this flag.
+          allowLastPlacementDrift: body.allowLastPlacementDrift === true && body.reason === "manual-drift",
+        });
       } else if (action === "requestPlacementAcquire") {
         // A reserved Link may prepare a new Object before physical I/O. The
         // Placement begins as PIN_REQUESTED, never falsely PRESENT.

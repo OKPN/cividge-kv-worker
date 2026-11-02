@@ -428,3 +428,14 @@ delivery remains a single KV lookup and may reflect the policy later.
 * **規則 (Rule)**:
   すべての配信ドメインおよび静的リレーは完全に対等であり、特定のホストを暗黙のデフォルトとして優遇したり、フォールバック採用してはならない (MUST NOT)。
   リクエストから配信ドメインが一意に特定できない場合、憶測で特定ホストのキーを探しに行かず、即座に「404 Not Found」として門前払いしなければならない。また、単体キーへのフォールバック照会も行わず、特定されたドメインのキー（`host:filename`）のみを 1 回で照会しなければならない。
+
+---
+
+### [INV-IPFS-DRIFT-IS-OBSERVATION] Gateway availability is an observation
+* The authenticated availability endpoint is read-only and probes configured IPFS retrieval gateways without changing Link, ObjectLifecycle, Placement, or delivery KV state.
+* `NOT_FOUND_FROM_CHECKED_GATEWAYS` means every checked gateway returned 404. It does not prove that the block is gone from the entire IPFS network. Timeouts, rate limits, gateway errors, and mixed responses are `UNAVAILABLE`.
+* Repeated unavailable/not-found observations never retire or delete a Link automatically.
+
+### [INV-MANUAL-LAST-PLACEMENT-RELEASE] Explicit last managed Placement release
+* Automatic capacity/FIFO release must not release the last `PRESENT` managed Placement while a Link remains.
+* A deliberate user release may leave the Link in an IPFS-drifting condition only after explicit confirmation. The ordinary ObjectLifecycle release authorization, generation-bound claim, actuator, and report remain required.
