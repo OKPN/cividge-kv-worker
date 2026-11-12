@@ -3,7 +3,6 @@
 // ObjectLifecycle; this module only projects canonical Links into delivery KV.
 import { callLifecycle } from "./lifecycle-api.js";
 import { callLinkBinding } from "./link-binding-api.js";
-import { deliveryCacheRequest } from "./delivery.js";
 import { parseObjectId } from "./object-id.js";
 
 export async function onRequestOptions() {
@@ -285,9 +284,10 @@ export async function onRequestPost(context) {
 
   try {
     const body = await request.json();
-    let { key, cid, size, mime, lastModified, password, dataBase64, ttl, expiresAt, width, height, contentCid, backend } = body;
-    if ((Number.isFinite(Number(size)) && Number(size) > 80_000_000) ||
-        (typeof dataBase64 === "string" && Math.floor(dataBase64.length * 3 / 4) > 80_000_000)) {
+    // dataBase64 (KV 直収納) は受け取っても保存されず、配信分岐も撤去済み
+    // のため、フィールド自体を廃止した (2026-11-12 レビュー)。
+    let { key, cid, size, mime, lastModified, password, ttl, expiresAt, width, height, contentCid, backend } = body;
+    if (Number.isFinite(Number(size)) && Number(size) > 80_000_000) {
       return new Response(JSON.stringify({ error: "File too large (Max: 80 MB)" }), {
         status: 413,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
@@ -395,7 +395,9 @@ export async function onRequestPost(context) {
     // 期限は KV のネイティブ TTL には渡さない。
     // TTL に任せるとレコードだけが無通知で消え、配信時に「この CID の
     // 最後の別名だったか」を判定して Filebase/Kubo の pin を解放できなくなる。
-    // delivery.js が期限後の最初のアクセスで expiresAt を確認して削除する。
+    // delivery.js は期限後のアクセスで expiresAt を確認し 404 を返す
+    // (SPEC 不変条件 8: 公開 GET は KV/実体を削除しない。物理 cleanup は
+    // ライフサイクル側の認可済み操作として別に行われる)。
     // ttl: 0 は「明示的に無期限へ変更」のときだけ期限を外す。
     // Filebase → Kubo のような保存先状態の更新では、継続時間を持たず ttl: 0 が
     // 渡されることがあるため、正の expiresAt があればそちらを最優先で維持する。
@@ -773,9 +775,14 @@ export async function onRequestDelete(context) {
   }
 }
 
-// 🌐 ハイブリッド Cache Purge ヘルパー
-// プランA (独自ドメイン設定時): REST Purge API で世界300箇所の全エッジから即時抹消
-// プランB (pages.dev無料運用時): Cache API (caches.default) でローカルPoPから即時抹消
+// 🌐 Cache Purge ヘルパー
+// Zone REST Purge API (独自ドメイン設定時) で公開 URL の CDN 層を best-effort に抹消する。
+// Worker Cache API 側のエントリは、射影フィンガープリント付き内部キー
+// (__cividge_projection) で保存され、配信時は必ず KV の現行射影を観測して
+// からでなければ到達できない。したがって Link の削除・再登録はフィンガー
+// プリントの変化によって構造的に無効化され、Cache API の個別 delete は
+// 不要 (旧 Plan B はフィンガープリント無しのキーで消していたため一致せず、
+// 2026-11-12 のレビューで撤去した)。
 // Zone API の対象はcanonical Link hostと明示設定のrelayだけに限定する。
 export async function purgeHybridCache(request, env, key) {
   if (!key) return;
@@ -784,13 +791,6 @@ export async function purgeHybridCache(request, env, key) {
   const keyHost = colonIdx > 0 ? key.substring(0, colonIdx) : null;
 
   const targetPath = `/${encodeURIComponent(pureFilename)}`;
-  
-  const targetDomains = new Set();
-  if (keyHost) {
-    targetDomains.add(`https://${keyHost}`);
-  }
-  
-  const urlsToPurge = Array.from(targetDomains).map(origin => `${origin}${targetPath}`);
 
   // 静的 Pages 公開入口は /<file> -> 独自ゾーンの /r/<file> へ送る。
   // Zone Purge API へは、そのゾーンに属する実配信 URL だけを渡す。
@@ -821,10 +821,7 @@ export async function purgeHybridCache(request, env, key) {
     globalUrlsToPurge.push(`https://${keyHost}${targetPath}`);
   }
 
-  // Cache API でも実配信 URL を削除する。これは現在の PoP 限定の補助策。
-  urlsToPurge.push(...globalUrlsToPurge);
-
-  // 1. プランA: REST Purge API (独自ドメインの Zone ID & API Token がある場合)
+  // REST Purge API (独自ドメインの Zone ID & API Token がある場合)
   const zoneId = env.CLOUDFLARE_ZONE_ID;
   const purgeToken = env.CLOUDFLARE_PURGE_TOKEN || env.CLOUDFLARE_API_TOKEN;
   if (zoneId && purgeToken && globalUrlsToPurge.length) {
@@ -844,16 +841,5 @@ export async function purgeHybridCache(request, env, key) {
     } catch (apiErr) {
       console.warn("REST Purge API error:", apiErr);
     }
-  }
-
-  // 2. プランB: Cache API (caches.default.delete) - pages.dev 環境でも動作
-  try {
-    if (typeof caches !== "undefined" && caches.default) {
-      for (const u of urlsToPurge) {
-        await caches.default.delete(deliveryCacheRequest(new Request(u))).catch(() => {});
-      }
-    }
-  } catch (cacheErr) {
-    console.warn("Cache API delete error:", cacheErr);
   }
 }
