@@ -10,7 +10,6 @@
   },
   "dependencies": {
     "blockstore-core": "^7.0.1",
-    "hono": "^4.7.2",
     "ipfs-unixfs-importer": "^17.1.1"
   }
 }
