@@ -414,3 +414,30 @@ test("same final bytes uploaded to R2 and Filebase converge on one ObjectLifecyc
   assert.equal(records.get("public.example:r2.webp").metadata.oid, objectId);
   assert.equal(records.get("public.example:filebase.webp").metadata.oid, objectId);
 });
+
+test("archive and unknown extensions are rejected, never silently renamed to .webp", async () => {
+  const records = new Map();
+  const env = {
+    TEST_UPLOAD_TOKEN: "test-upload-token",
+    ADMIN_API_TOKEN: "test-admin-token",
+    R2_BUCKET_NAME: "cividge",
+    R2_BUCKET: { async put() { throw new Error("must not PUT a rejected upload"); }, async head() { return null; } },
+    CIVIDGE_KV: {
+      async getWithMetadata(key) { return records.get(key) || { value: null, metadata: null }; },
+      async put(key, value, options) { records.set(key, { value, metadata: options.metadata }); },
+    },
+  };
+  env.OBJECT_LIFECYCLE = memoryNamespace(ObjectLifecycle, env);
+  env.LINK_BINDING = memoryNamespace(LinkBinding, env);
+  for (const filename of ["archive.zip", "bundle.7z", "photo.unknownext", "noextension"]) {
+    const response = await onRequestPost({ env, waitUntil() {}, request: new Request(
+      "https://worker.example/api/upload?storage=r2&domain=public.example&naming=original", {
+        method: "POST",
+        headers: { Authorization: "Bearer test-upload-token", "X-Upload-Filename": filename, "Content-Type": "application/octet-stream" },
+        body: "bytes",
+      }) });
+    assert.equal(response.status, 400, filename);
+    assert.match((await response.json()).error, /Unsupported file extension/);
+  }
+  assert.equal(records.size, 0);
+});

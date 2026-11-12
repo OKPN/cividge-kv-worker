@@ -34,12 +34,16 @@ export async function onRequestGet(context) {
   });
 }
 
-// 許可拡張子一覧
+// 許可拡張子一覧。配信側 (delivery.js) のホワイトリストと一致させること:
+// ここで許可した拡張子は必ず配信できなければならない。「アップロードは
+// 成功するが配信は常時 404」という組合せを作らない。アーカイブ形式
+// (zip/7z/rar/tar/gz) と実行ファイルは README の設計通りブロックする
+// (origin defense)。2026-11-12 のレビューで、アーカイブを許可しながら
+// 配信できない不整合と、未知拡張子の黙った .webp 化を是正した。
 const ALLOWED_EXTS = [
   "jpg", "jpeg", "png", "webp", "gif", "avif", "jxl", "bmp", "ico",
   "mp4", "webm", "ogv", "mov", "m4v", "avi",
   "mp3", "wav", "ogg", "m4a", "flac", "aac",
-  "zip", "7z", "rar", "tar", "gz",
   "pdf", "txt", "md", "json", "csv"
 ];
 
@@ -48,7 +52,7 @@ const MIME_MAP = {
   gif: "image/gif", avif: "image/avif", jxl: "image/jxl", bmp: "image/bmp", ico: "image/x-icon",
   mp4: "video/mp4", webm: "video/webm", mov: "video/quicktime",
   mp3: "audio/mpeg", wav: "audio/wav", ogg: "audio/ogg",
-  zip: "application/zip", "7z": "application/x-7z-compressed", pdf: "application/pdf"
+  pdf: "application/pdf"
 };
 
 // One decimal 80 MB limit across browser, multipart and raw-body uploads.
@@ -119,51 +123,12 @@ export async function putR2Upload(bucket, key, fileStream, fileBuffer, declaredL
   }
   await bucket.put(key, buffered, {
     ...metadata,
-    customMetadata: { size: String(buffered.byteLength), ...(contentCid ? { contentCid } : {}) },
+    // Keep the same customMetadata shape as every other path (cid /
+    // object-id keys). The previous literal renamed cid to contentCid and
+    // dropped object-id, which made later identity verification fail.
+    customMetadata: { ...metadata.customMetadata, size: String(buffered.byteLength) },
   });
   return buffered.byteLength;
-}
-
-function createFilebaseMultipartStream(fileStream, filename, contentType) {
-  const boundary = `----cividge-${crypto.randomUUID()}`;
-  const safeFilename = String(filename || "upload_file").replace(/[\r\n"]/g, "_");
-  const encoder = new TextEncoder();
-  const prefix = encoder.encode(
-    `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${safeFilename}"\r\nContent-Type: ${contentType || "application/octet-stream"}\r\n\r\n`,
-  );
-  const suffix = encoder.encode(`\r\n--${boundary}--\r\n`);
-  const reader = fileStream.getReader();
-  let stage = 0;
-
-  return {
-    contentType: `multipart/form-data; boundary=${boundary}`,
-    body: new ReadableStream({
-      async pull(controller) {
-        if (stage === 0) {
-          stage = 1;
-          controller.enqueue(prefix);
-          return;
-        }
-        if (stage === 1) {
-          const { done, value } = await reader.read();
-          if (!done) {
-            controller.enqueue(value);
-            return;
-          }
-          stage = 2;
-        }
-        if (stage === 2) {
-          stage = 3;
-          controller.enqueue(suffix);
-          return;
-        }
-        controller.close();
-      },
-      cancel(reason) {
-        return reader.cancel(reason);
-      },
-    }),
-  };
 }
 
 function isIpfsCid(value) {
@@ -181,16 +146,6 @@ export async function calculateUploadCid(bytes) {
   return cid;
 }
 
-function streamBufferedBytes(bytes) {
-  const view = new Uint8Array(bytes);
-  let offset = 0;
-  return new ReadableStream({ pull(controller) {
-    if (offset >= view.byteLength) return controller.close();
-    const end = Math.min(offset + 256 * 1024, view.byteLength);
-    controller.enqueue(view.subarray(offset, end));
-    offset = end;
-  } });
-}
 
 // The five upload meanings are decided without physical capability. A caller
 // must reserve the canonical Link before acting on this classification.
@@ -406,34 +361,6 @@ async function uploadToFilebase(fileBuffer, filename, contentType, env) {
   return cid;
 }
 
-async function uploadStreamToFilebase(fileStream, filename, contentType, env) {
-  const apiKey = (env.FILEBASE_IPFS_API_KEY || "").trim();
-  if (!apiKey) {
-    throw new Error("Filebase 投稿は未設定です。Worker に FILEBASE_IPFS_API_KEY を secret として設定してください。");
-  }
-  const multipart = createFilebaseMultipartStream(fileStream, filename, contentType);
-  const response = await fetch("https://rpc.filebase.io/api/v0/add?cid-version=0", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": multipart.contentType,
-    },
-    body: multipart.body,
-  });
-  const responseText = await response.text();
-  if (!response.ok) {
-    throw new Error(`Filebase 投稿エラー (${response.status}): ${responseText.slice(0, 300)}`);
-  }
-  for (const line of responseText.trim().split(/\r?\n/).reverse()) {
-    try {
-      const payload = JSON.parse(line);
-      const candidate = payload.Hash || payload.Cid?.["/"] || payload.cid;
-      if (isIpfsCid(candidate)) return candidate;
-    } catch (_) {}
-  }
-  throw new Error("Filebase から有効な CID が返されませんでした。");
-}
-
 // 投稿トークンの検証。管理トークンは投稿 API に流用しない。
 export function verifyUploadAuth(request, env) {
   // Both values have the same upload-only capability. TEST_UPLOAD_TOKEN is
@@ -487,8 +414,6 @@ export async function onRequestPost(context) {
     }
 
     let fileBuffer = null;
-    let fileStream = null;
-    let streamByteLength = null;
     let originalFilename = url.searchParams.get("filename") || request.headers.get("X-Upload-Filename") || "";
     // パスワードを URL に入れると履歴・ログへ残り得るため、ヘッダーか multipart のみ許可。
     let password = (request.headers.get("X-Upload-Password") || "").trim();
@@ -519,7 +444,7 @@ export async function onRequestPost(context) {
       contentType = contentTypeHeader.split(";")[0].trim();
     }
 
-    if (!fileBuffer && !fileStream) {
+    if (!fileBuffer) {
       return new Response(JSON.stringify({ success: false, error: "No file content uploaded" }), {
         status: 400,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
@@ -547,9 +472,14 @@ export async function onRequestPost(context) {
     originalFilename = truncateFilename(originalFilename, 100);
 
     // 3. 拡張子バリデーション
+    // 未知・未許可の拡張子は黙って .webp に化けさせず、明示的に拒否する
+    // (実バイトと無関係な拡張子/Content-Type で登録されるのを防ぐ)。
     let ext = originalFilename.includes(".") ? originalFilename.split(".").pop().toLowerCase() : "";
     if (!ext || !ALLOWED_EXTS.includes(ext)) {
-      ext = "webp"; // デフォルト拡張子
+      return new Response(JSON.stringify({ success: false, error: `Unsupported file extension: ${ext || "(none)"}` }), {
+        status: 400,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
     }
     contentType = contentType || MIME_MAP[ext] || "application/octet-stream";
 
@@ -575,35 +505,9 @@ export async function onRequestPost(context) {
       shortKey = `${y}${m}${d}_${randomStr}.${ext}`;
     }
 
-    // 4. パスワードハッシュ生成 (PBKDF2)
-    let passwordMeta = {};
-    if (password) {
-      const saltBytes = crypto.getRandomValues(new Uint8Array(16));
-      const enc = new TextEncoder();
-      const keyMaterial = await crypto.subtle.importKey(
-        "raw",
-        enc.encode(password),
-        { name: "PBKDF2" },
-        false,
-        ["deriveBits"]
-      );
-      const derivedBits = await crypto.subtle.deriveBits(
-        {
-          name: "PBKDF2",
-          salt: saltBytes,
-          iterations: 100000,
-          hash: "SHA-256",
-        },
-        keyMaterial,
-        256
-      );
-      const hashHex = Array.from(new Uint8Array(derivedBits)).map(b => b.toString(16).padStart(2, "0")).join("");
-      const saltHex = Array.from(saltBytes).map(b => b.toString(16).padStart(2, "0")).join("");
-      passwordMeta = {
-        passwordHash: hashHex,
-        passwordSalt: saltHex,
-      };
-    }
+    // 4. (削除済み) パスワードの PBKDF2 ハッシュは登録ハンドラ
+    // (cividge-kv.js) が平文パスワードから計算する。ここで計算しても
+    // 使われず、10万回の deriveBits だけが無駄に走っていた。
 
     // 5. 返却・配信先ドメインの決定
     let targetDomainParam = (

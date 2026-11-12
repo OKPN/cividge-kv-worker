@@ -26,7 +26,7 @@ export default {
       });
     }
 
-    if (pathname === "/api/upload" || pathname.startsWith("/api/upload?")) {
+    if (pathname === "/api/upload") {
       const context = { request, env, waitUntil: (p) => ctx.waitUntil(p), next: () => new Response("404", { status: 404 }) };
       let res;
       if (request.method === "POST") res = await uploadApi.onRequestPost(context);
@@ -70,7 +70,7 @@ export default {
     }
 
     // Canonical control-plane endpoint for delivery projection mutations.
-    const isKvApi = pathname === "/api/cividge-kv" || pathname.startsWith("/api/cividge-kv?");
+    const isKvApi = pathname === "/api/cividge-kv";
     if (isKvApi) {
       const context = { request, env, waitUntil: (p) => ctx.waitUntil(p), next: () => new Response("404", { status: 404 }) };
       let res;
