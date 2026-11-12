@@ -406,6 +406,29 @@ export function deliveryCacheRequest(request, projectionFingerprint = "") {
   return new Request(url.toString(), request);
 }
 
+// Syntactic parse of a single-range `Range: bytes=...` header into the shape
+// R2 expects ({ offset, length } / { offset } / { suffix }). Multi-range and
+// malformed headers return null, meaning "ignore the Range" (RFC 9110 allows
+// a server to ignore Range); satisfiability is decided by R2 itself and read
+// back from the returned object's `range`/`size`.
+export function parseBytesRange(header) {
+  if (!header) return null;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(String(header).trim());
+  if (!match) return null;
+  const [, start, end] = match;
+  if (start === "" && end === "") return null;
+  if (start === "") {
+    const suffix = Number(end);
+    return Number.isFinite(suffix) && suffix > 0 ? { suffix } : null;
+  }
+  const offset = Number(start);
+  if (!Number.isFinite(offset)) return null;
+  if (end === "") return { offset };
+  const last = Number(end);
+  if (!Number.isFinite(last) || last < offset) return null;
+  return { offset, length: last - offset + 1 };
+}
+
 async function projectionCacheRequest(request, value, metadata) {
   // An ephemeral cache key, not another record or authority. Every request must
   // observe the Link projection before it can reuse bytes for that projection.
@@ -811,8 +834,11 @@ export async function onRequest(context) {
     });
   }
 
+  const rangeHeader = request.headers.get("Range");
   const currentCacheRequest = !hasPassword ? await projectionCacheRequest(request, targetCid, meta) : null;
-  if (!hasPassword && !characterProbe && edgeCache) {
+  // Range requests bypass the full-object edge cache: a cached 200 must not
+  // answer a seek. The origin branches below honour Range themselves.
+  if (!hasPassword && !characterProbe && edgeCache && !rangeHeader) {
     try {
       const cached = await edgeCache.match(isHead ? new Request(currentCacheRequest, { method: "GET" }) : currentCacheRequest);
       if (cached && (cached.status === 200 || cached.status === 206)) {
@@ -830,51 +856,12 @@ export async function onRequest(context) {
     } catch (_) {}
   }
 
-  // 3. KV に実データ（blobKey または backend: "kv"）が明示的に格納されている場合のみ即時配信
-  // [INV-CORE-001] 通常の R2/IPFS 配信時に存在しない blob_ キーを空振り get() して KV 読み込み枠を倍速浪費するバグを根絶
-  const isKvDirectStorage = Boolean(meta.blobKey || meta.backend === "kv" || meta.b === "kv");
-  if (isKvDirectStorage && env?.CIVIDGE_KV) {
-    try {
-      const blobKey = meta.blobKey || ("blob_" + filename);
-      const directData = await env.CIVIDGE_KV.get(blobKey, "arrayBuffer");
-      if (directData) {
-        const headers = new Headers();
-        headers.set("Access-Control-Allow-Origin", "*");
-        headers.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
-        headers.set("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges, X-Image-Width, X-Image-Height");
-        headers.set("Content-Disposition", `inline; filename="${encodeURIComponent(filename)}"`);
-        headers.set("X-Content-Type-Options", "nosniff");
-        headers.set("Accept-Ranges", "bytes");
-        const extLower = extMatch[1].toLowerCase();
-        const isVideo = ["mp4", "webm", "mov", "m4v", "avi", "ogv"].includes(extLower);
-        const isAudio = ["mp3", "wav", "ogg", "m4a", "flac", "aac"].includes(extLower);
-        const cacheLifetimes = publicMediaCacheLifetimes(env, {
-          cachePolicy: meta.cp || "BOARD",
-          isVideoOrAudio: isVideo || isAudio,
-          expiresAt: expiresTimestamp,
-        });
-        setPublicMediaCacheHeaders(headers, cacheLifetimes, hasPassword);
-        headers.set("Content-Length", String(directData.byteLength));
-        const mimeMap = {
-          webp: "image/webp", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
-          gif: "image/gif", jxl: "image/jxl", avif: "image/avif", bmp: "image/bmp", ico: "image/x-icon",
-          mp4: "video/mp4", webm: "video/webm", mov: "video/quicktime", m4v: "video/mp4", avi: "video/x-msvideo", ogv: "video/ogg",
-          mp3: "audio/mpeg", wav: "audio/wav", ogg: "audio/ogg", m4a: "audio/mp4", flac: "audio/flac", aac: "audio/aac",
-          pdf: "application/pdf", txt: "text/plain; charset=utf-8", md: "text/markdown; charset=utf-8",
-          json: "application/json; charset=utf-8", csv: "text/csv; charset=utf-8",
-        };
-        const ext = extMatch[1].toLowerCase();
-        headers.set("Content-Type", meta.mime || mimeMap[ext] || "application/octet-stream");
-        const res = new Response(directData, { status: 200, headers });
-        saveResponseToEdgeCache(request, res, context, hasPassword, currentCacheRequest);
-        return res;
-      }
-    } catch (directErr) {
-      console.warn("Direct blob read error:", directErr);
-    }
-  }
+  // (削除済み) KV 直収納 (backend="kv" / blob_) の配信分岐は、台帳妥当性
+// チェックで常時 503 となり到達不能だったため 2026-11-12 のレビューで
+// 撤去した。KV は配信射影であり、バイトの正本は R2/Filebase/Kubo の
+// Placement 側にある (INVARIANTS の legacy 切り捨て方針とも一致)。
 
-  // ⚡ 3.5. R2 ストレージの配信処理（台帳が R2 の場合は R2 バケットを優先検索）
+// ⚡ 3.5. R2 ストレージの配信処理（台帳が R2 の場合は R2 バケットを優先検索）
   // See: [INV-DELIVERY-004] (R2 と IPFS の相互排他ルーティング ＆ R2→Kubo フォールバック)
   const isOriginR2 = projectedBackend === "r2";
   const isR2 = !isIpfsRecord && Boolean(isR2Record || isOriginR2);
@@ -882,7 +869,25 @@ export async function onRequest(context) {
     if (env && env.R2_BUCKET) {
       try {
         const r2Key = meta.s3Key || meta.k_s3 || filename;
-        const r2Obj = await env.R2_BUCKET.get(r2Key);
+        const parsedRange = parseBytesRange(rangeHeader);
+        let r2Obj = await env.R2_BUCKET.get(r2Key, parsedRange ? { range: parsedRange } : undefined);
+        if (parsedRange && !r2Obj) {
+          // An unsatisfiable range can surface as a null get. Distinguish it
+          // from a missing object: existing object -> 416, missing -> fall
+          // through to the existing Kubo/IPFS fallback below.
+          const head = await env.R2_BUCKET.head(r2Key).catch(() => null);
+          if (head) {
+            return new Response(null, {
+              status: 416,
+              headers: {
+                "Content-Range": `bytes */${head.size}`,
+                "Accept-Ranges": "bytes",
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-store",
+              },
+            });
+          }
+        }
         if (r2Obj) {
           const headers = new Headers();
           headers.set("Access-Control-Allow-Origin", "*");
@@ -902,7 +907,19 @@ export async function onRequest(context) {
           });
           r2Obj.writeHttpMetadata(headers);
           setPublicMediaCacheHeaders(headers, cacheLifetimes, hasPassword);
-          const res = new Response(isHead ? null : r2Obj.body, { status: 200, headers });
+          // Honour Range when R2 actually served a slice (r2Obj.range is set
+          // only then). saveResponseToEdgeCache stores 200s only, so a 206 is
+          // never written into the full-object cache.
+          let status = 200;
+          const served = r2Obj.range;
+          if (parsedRange && served && Number.isFinite(served.offset) && Number.isFinite(served.length)) {
+            status = 206;
+            headers.set("Content-Range", `bytes ${served.offset}-${served.offset + served.length - 1}/${r2Obj.size}`);
+            headers.set("Content-Length", String(served.length));
+          } else if (Number.isFinite(r2Obj.size)) {
+            headers.set("Content-Length", String(r2Obj.size));
+          }
+          const res = new Response(isHead ? null : r2Obj.body, { status, headers });
           saveResponseToEdgeCache(request, res, context, hasPassword, currentCacheRequest);
           return res;
         }
