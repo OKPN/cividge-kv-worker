@@ -17,6 +17,13 @@ routes = [
 STATIC_RELAY_PUBLIC_HOSTS = "your-public-relay.pages.dev,another-relay.pages.dev"
 # The backend custom domain host behind static Pages relay.
 STATIC_RELAY_BACKEND_HOSTS = "relay.your-domain.com"
+# Keep false unless FILEBASE_IPFS_API_KEY is scoped exclusively to Cividge Worker RPC pins.
+FILEBASE_DEDICATED_BUCKET = "false"
+R2_BUCKET_NAME = "your-bucket-name"
+# Optional: offload public non-expiring R2 video/audio `206 Range` seeks via 307 redirect.
+# R2_PUBLIC_ORIGINS = "your-domain.com=https://r2-cdn.your-domain.com"
+# Optional: dedicated Kubo gateway URL exposed via Cloudflare Tunnel.
+# KUBO_GATEWAY_URL = "https://kubo-gw.your-domain.com/ipfs"
 
 # Secrets (Do NOT put plaintext tokens here! Use `npx wrangler secret put` instead):
 # - ADMIN_API_TOKEN: Secret token for admin endpoints (/api/cividge-kv)

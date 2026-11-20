@@ -67,13 +67,19 @@ User / Social Bot (Misskey, Twitter, Discord)
 
 This repository includes official agent skills in [`.codex/skills/`](.codex/skills/) to automate safe deployments and public relay configuration without breaking routes:
 
+- **`cividge-setup`**: Prioritized setup, WAF hardening, `R2_PUBLIC_ORIGINS` video/audio seek offload, and curl verification checklist.
 - **`cividge-deploy`**: Validates syntax, preserves multi-relay host lists in `wrangler.toml`, deploys the Worker, and runs automated curl health checks.
 - **`cloudflare-pages-relay`**: Generates function-free, disposable `pages.dev` 307 relays and registers them into `STATIC_RELAY_PUBLIC_HOSTS` cleanly.
 
 ### 1. Prerequisites
 
-- Node.js (v18+)
+- Node.js 22.12+ (22.x) or 24.x
 - Cloudflare Account & [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/)
+
+#### Prioritized Setup Checklist
+1. **Minimum Required**: `CIVIDGE_KV` + Durable Object bindings (`ObjectLifecycleV2`, `LinkBindingV2`), `ADMIN_API_TOKEN`, storage bucket (`R2_BUCKET` + browser PUT CORS and/or Filebase), and at least one custom delivery domain or static Pages relay (`workers.dev` returns `404` for public media `GET`).
+2. **Security & Quota Protection**: Cloudflare WAF rules blocking non-media/non-`GET`/`HEAD` paths on delivery domains (and blocking non-`/objects/` requests on any R2 Custom Domain), separate `UPLOAD_TOKEN` for external scripts, rate limiting on `/r/` or `/api/`, and `FILEBASE_DEDICATED_BUCKET = "false"` when sharing a Filebase bucket.
+3. **Optional Enhancements**: `R2_PUBLIC_ORIGINS` for `307` R2 Custom Domain video/audio seek offload, `CLOUDFLARE_ZONE_ID` + `CLOUDFLARE_PURGE_TOKEN` for instant edge cache purge, and `KUBO_GATEWAY_URL` for private Kubo Tunnel fallback.
 
 ### 2. Configuration
 
@@ -261,6 +267,32 @@ and not starts_with(http.request.uri.path, "/api/")
 
 This rejects arbitrary direct paths before the Worker runs while preserving the
 relay path and authenticated API routes.
+
+### 5. Optional: R2 Custom Domain seek offload (`R2_PUBLIC_ORIGINS`) & WAF
+
+To prevent repeated `206 Range` video/audio seeks from consuming Worker and KV
+quotas, map each zone suffix to its R2 Custom Domain origin in `wrangler.toml`:
+
+```toml
+R2_PUBLIC_ORIGINS = "example.com=https://r2-cdn.example.com"
+```
+
+When configured, unauthenticated, non-expiring R2 video and audio objects under
+`objects/<cid>` are verified with `R2_BUCKET.head()` (preserving R2 → Kubo
+fallback if absent) and answered with a `307 Temporary Redirect` (`Cache-Control: no-store`)
+matching the receiving `requestHost`'s parent domain.
+
+Whenever an R2 Custom Domain is enabled, add a **Custom WAF Block Rule** so bots
+cannot probe arbitrary paths and count against R2 Class B operations:
+
+```cf
+http.host eq "r2-cdn.example.com"
+and (
+  not starts_with(http.request.uri.path, "/objects/")
+  or http.request.uri.path eq "/objects/"
+  or not (http.request.method in {"GET" "HEAD"})
+)
+```
 
 ### What this protects
 
