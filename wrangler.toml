@@ -27,6 +27,8 @@ KUBO_GATEWAY_URL = "https://kubo-gw.k7m.f5.si/ipfs"
 # Cividge Worker RPC pins only. A shared bucket cannot distinguish pin owners.
 FILEBASE_DEDICATED_BUCKET = "false"
 R2_BUCKET_NAME = "cividge"
+# 公開 R2 カスタムドメインへの動画・音声 307 オフロード先（受信ホストの親ドメイン一致で振り分け）
+R2_PUBLIC_ORIGINS = "k7m.f5.si=https://r2-cdn.k7m.f5.si,okpn.f5.si=https://r2-cdn.okpn.f5.si"
 
 [[r2_buckets]]
 binding = "R2_BUCKET"

@@ -18,6 +18,36 @@ function getCharacterWebpBytes() {
   return characterWebpBytes;
 }
 
+/**
+ * Resolve an R2 custom-domain origin matching the public delivery host's
+ * parent domain from `env.R2_PUBLIC_ORIGINS` (`suffix=https://origin,...`).
+ * Returns null when no entry matches (e.g. stealth *.pages.dev relays).
+ */
+export function resolveR2PublicOrigin(env, publicHost) {
+  const raw = String(env?.R2_PUBLIC_ORIGINS || "").trim();
+  const host = String(publicHost || "").trim().toLowerCase().split(":")[0];
+  if (!raw || !host) return null;
+  const entries = raw.split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const eqIdx = entry.indexOf("=");
+      if (eqIdx <= 0) return null;
+      const suffix = entry.slice(0, eqIdx).trim().toLowerCase().replace(/^\./, "");
+      const origin = entry.slice(eqIdx + 1).trim().replace(/\/+$/, "");
+      if (!suffix || !/^https?:\/\/[^/\s]+$/i.test(origin)) return null;
+      return { suffix, origin };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.suffix.length - a.suffix.length);
+  for (const { suffix, origin } of entries) {
+    if (host === suffix || host.endsWith(`.${suffix}`)) {
+      return origin;
+    }
+  }
+  return null;
+}
+
 const CATBOX_404_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -869,6 +899,30 @@ export async function onRequest(context) {
     if (env && env.R2_BUCKET) {
       try {
         const r2Key = meta.s3Key || meta.k_s3 || filename;
+        const extLower = extMatch[1].toLowerCase();
+        const isVideo = ["mp4", "webm", "mov", "m4v", "avi", "ogv"].includes(extLower);
+        const isAudio = ["mp3", "wav", "ogg", "m4a", "flac", "aac"].includes(extLower);
+        // Unauthenticated, non-expiring R2 video/audio under `objects/` can
+        // 307-redirect to the matching R2 custom domain so 206 Range seeks
+        // bypass Worker/KV quotas while preserving R2->Kubo fallback via head().
+        const r2PublicOrigin = (!hasPassword && !expiresTimestamp && (isVideo || isAudio) && r2Key.startsWith("objects/"))
+          ? resolveR2PublicOrigin(env, requestHost)
+          : null;
+        if (r2PublicOrigin) {
+          const head = await env.R2_BUCKET.head(r2Key).catch(() => null);
+          if (head) {
+            return new Response(null, {
+              status: 307,
+              headers: {
+                "Location": `${r2PublicOrigin}/${r2Key}`,
+                "Cache-Control": "no-store",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+                "Vary": "Host",
+              },
+            });
+          }
+        }
         const parsedRange = parseBytesRange(rangeHeader);
         let r2Obj = await env.R2_BUCKET.get(r2Key, parsedRange ? { range: parsedRange } : undefined);
         if (parsedRange && !r2Obj) {
@@ -897,9 +951,6 @@ export async function onRequest(context) {
           headers.set("X-Content-Type-Options", "nosniff");
           headers.set("Accept-Ranges", "bytes");
           setImageDimensionHeaders(headers, meta);
-          const extLower = extMatch[1].toLowerCase();
-          const isVideo = ["mp4", "webm", "mov", "m4v", "avi", "ogv"].includes(extLower);
-          const isAudio = ["mp3", "wav", "ogg", "m4a", "flac", "aac"].includes(extLower);
           const cacheLifetimes = publicMediaCacheLifetimes(env, {
             cachePolicy: meta.cp || "BOARD",
             isVideoOrAudio: isVideo || isAudio,
