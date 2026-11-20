@@ -21,6 +21,8 @@ STATIC_RELAY_PUBLIC_HOSTS = "content-relay.pages.dev,testunko.pages.dev,punipuni
 # The custom-zone endpoint behind the static Pages relay.  Its /r/<file> URL is
 # globally purged when CLOUDFLARE_ZONE_ID and CLOUDFLARE_PURGE_TOKEN are set.
 STATIC_RELAY_BACKEND_HOSTS = "relay.k7m.f5.si"
+# 自宅 Kubo の専用ゲートウェイ（Cloudflare Tunnel 経由）
+KUBO_GATEWAY_URL = "https://kubo-gw.k7m.f5.si/ipfs"
 # Keep false unless FILEBASE_IPFS_API_KEY is scoped to a bucket reserved for
 # Cividge Worker RPC pins only. A shared bucket cannot distinguish pin owners.
 FILEBASE_DEDICATED_BUCKET = "false"
