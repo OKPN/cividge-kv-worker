@@ -5,6 +5,7 @@ import {
   claimThumbnailRelease,
   claimPlacement,
   completeRemoveLink,
+  deriveObjectState,
   newLifecycle,
   parseObjectRef,
   reconcileMissingThumbnail,
@@ -37,7 +38,16 @@ export class ObjectLifecycleV2 {
 
     let state = await this.ctx.storage.get(STATE_KEY);
     if (state && state.objectRef !== object.objectRef) return json({ error: "Durable Object identity mismatch" }, 409);
-    if (state && recoverExpiredPlacementClaims(state)) await this.persist(state);
+    if (state) {
+      const recovered = recoverExpiredPlacementClaims(state);
+      const derived = deriveObjectState(state);
+      if (state.state !== derived) {
+        state.state = derived;
+        await this.persist(state);
+      } else if (recovered) {
+        await this.persist(state);
+      }
+    }
     const action = body.action;
     try {
       if (action === "createLink") {

@@ -12,10 +12,15 @@ import { callLinkBinding } from "../link-binding-api.js";
 import {
   addLink,
   beginRemoveLink,
+  beginThumbnailUpload,
   claimPlacement,
+  claimThumbnailRelease,
   completeRemoveLink,
+  deriveObjectState,
   newLifecycle,
   reportPlacement,
+  reportThumbnailRelease,
+  reportThumbnailUpload,
   requestPlacementAcquire,
   requestPlacementRelease,
   requestRelease,
@@ -889,4 +894,133 @@ test("delivery projection marks Filebase absence even without a RELEASED row", a
     links: [key], placements: { filebase: { state: "PRESENT" } },
   });
   assert.equal(records.get(key).metadata.f & 1, 0);
+});
+
+test("multi-placement video with released Filebase and thumbnail can be re-uploaded to R2 cleanly", () => {
+  const r2 = { kind: "r2", executor: "worker", locator: { bucket: "cividge", key: "objects/QmVideo" } };
+  const fb = { kind: "filebase", executor: "browser", locator: { bucket: "cividge", key: "objects/QmVideo", cid: "QmVideo" } };
+  const state = newLifecycle(oid("video-multi"), [r2, fb]);
+  addLink(state, "r2.example:video.mp4");
+  addLink(state, "fb.example:video.mp4");
+  const thumbUp = beginThumbnailUpload(state).claim;
+  reportThumbnailUpload(state, { ...thumbUp, outcome: "present" });
+
+  // Delete both links and release R2 + Filebase + thumbnail.
+  removeLink(state, "r2.example:video.mp4");
+  removeLink(state, "fb.example:video.mp4");
+  requestRelease(state);
+  const relR2 = claimPlacement(state, "r2", "release", "rel-r2").task;
+  reportPlacement(state, "r2", { ...relR2, outcome: "released" });
+  const relThumb = claimThumbnailRelease(state).claim;
+  reportThumbnailRelease(state, { ...relThumb, outcome: "released" });
+  const relFb = claimPlacement(state, "filebase", "release", "rel-fb").task;
+  reportPlacement(state, "filebase", { ...relFb, outcome: "released" });
+  assert.equal(state.state, "RELEASED");
+
+  // Re-upload only to R2; reportPlacement must keep state ACTIVE before addLink runs.
+  reconcilePlacementForAcquire(state, r2, "absent");
+  requestPlacementAcquire(state, r2);
+  const acqR2 = claimPlacement(state, "r2", "acquire", "acq-r2").task;
+  reportPlacement(state, "r2", { ...acqR2, outcome: "present" });
+  assert.equal(state.state, "ACTIVE");
+  addLink(state, "r2.example:reup.mp4");
+  assert.equal(state.state, "ACTIVE");
+  assert.deepEqual(state.links, ["r2.example:reup.mp4"]);
+
+  const thumbReup = beginThumbnailUpload(state).claim;
+  reportThumbnailUpload(state, { ...thumbReup, outcome: "present" });
+  assert.equal(state.thumbnail.state, "PRESENT");
+  assert.equal(deriveObjectState(state), "ACTIVE");
+});
+
+test("RETRYABLE Filebase and thumbnail releases do not block R2 re-upload or thumbnail rebuild", () => {
+  const r2 = { kind: "r2", executor: "worker", locator: { bucket: "cividge", key: "objects/QmRetry" } };
+  const fb = { kind: "filebase", executor: "browser", locator: { bucket: "cividge", key: "objects/QmRetry", cid: "QmRetry" } };
+  const state = newLifecycle(oid("video-retry"), [r2, fb]);
+  addLink(state, "r2.example:v.mp4");
+  const t1 = beginThumbnailUpload(state).claim;
+  reportThumbnailUpload(state, { ...t1, outcome: "present" });
+  removeLink(state, "r2.example:v.mp4");
+  requestRelease(state);
+
+  const relR2 = claimPlacement(state, "r2", "release", "rel-r2").task;
+  reportPlacement(state, "r2", { ...relR2, outcome: "released" });
+  const relFb = claimPlacement(state, "filebase", "release", "rel-fb").task;
+  reportPlacement(state, "filebase", { ...relFb, outcome: "retryable", error: "tab closed" });
+  const relThumb = claimThumbnailRelease(state).claim;
+  reportThumbnailRelease(state, { ...relThumb, outcome: "retryable", error: "transient" });
+  assert.equal(state.state, "RELEASE_PENDING");
+
+  reconcilePlacementForAcquire(state, r2, "absent");
+  requestPlacementAcquire(state, r2);
+  const acqR2 = claimPlacement(state, "r2", "acquire", "acq-r2").task;
+  reportPlacement(state, "r2", { ...acqR2, outcome: "present" });
+  assert.equal(state.state, "ACTIVE");
+  addLink(state, "r2.example:v2.mp4");
+  const t2 = beginThumbnailUpload(state).claim;
+  reportThumbnailUpload(state, { ...t2, outcome: "present" });
+  assert.equal(state.state, "ACTIVE");
+  assert.equal(state.thumbnail.state, "PRESENT");
+});
+
+test("re-acquiring a released R2 placement succeeds while a peer Filebase Link remains active", () => {
+  const r2 = { kind: "r2", executor: "worker", locator: { bucket: "cividge", key: "objects/QmPeer" } };
+  const fb = { kind: "filebase", executor: "browser", locator: { bucket: "cividge", key: "objects/QmPeer", cid: "QmPeer" } };
+  const state = newLifecycle(oid("video-peer-reacquire"), [r2, fb]);
+  addLink(state, "r2.example:v.mp4");
+  addLink(state, "fb.example:v.mp4");
+  removeLink(state, "r2.example:v.mp4");
+  requestPlacementRelease(state, "r2");
+  const relR2 = claimPlacement(state, "r2", "release", "rel-r2").task;
+  reportPlacement(state, "r2", { ...relR2, outcome: "released" });
+  assert.equal(state.state, "ACTIVE");
+  assert.equal(state.placements.r2.state, "RELEASED");
+
+  reconcilePlacementForAcquire(state, r2, "absent");
+  requestPlacementAcquire(state, r2);
+  const acqR2 = claimPlacement(state, "r2", "acquire", "acq-r2").task;
+  reportPlacement(state, "r2", { ...acqR2, outcome: "present" });
+  addLink(state, "r2.example:new.mp4");
+  assert.equal(state.placements.r2.state, "PRESENT");
+  assert.deepEqual(state.links, ["fb.example:v.mp4", "r2.example:new.mp4"]);
+});
+
+test("ObjectLifecycleV2 self-heals a pre-fix RELEASE_PENDING record with a PRESENT placement on createLink", async () => {
+  const id = oid("stuck-record");
+  const stuck = {
+    version: 2,
+    objectRef: id,
+    state: "RELEASE_PENDING",
+    links: [],
+    pendingLinkRemovals: [],
+    placements: {
+      r2: { kind: "r2", executor: "worker", locator: { bucket: "cividge", key: "objects/QmStuck" }, state: "PRESENT", generation: 2, claim: null, lastCompletedClaim: null, error: null },
+      filebase: { kind: "filebase", executor: "browser", locator: { bucket: "cividge", key: "objects/QmStuck", cid: "QmStuck" }, state: "RELEASED", generation: 2, claim: null, lastCompletedClaim: null, error: null },
+    },
+    thumbnail: { key: "derived/thumbnails/x.webp", state: "RELEASED", generation: 2, claim: null, error: null },
+  };
+  const values = new Map([["lifecycle", stuck]]);
+  const lifecycle = new ObjectLifecycle({
+    storage: {
+      get: async key => structuredClone(values.get(key)),
+      put: async (key, value) => values.set(key, structuredClone(value)),
+      setAlarm: async () => {},
+      deleteAlarm: async () => {},
+    },
+  }, {});
+  const response = await lifecycle.fetch(new Request("https://object-lifecycle.internal/", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action: "createLink",
+      objectRef: id,
+      linkKey: "r2.example:healed.mp4",
+      placements: [],
+      confirmedPlacements: [],
+    }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.lifecycle.state, "ACTIVE");
+  assert.deepEqual(body.lifecycle.links, ["r2.example:healed.mp4"]);
 });

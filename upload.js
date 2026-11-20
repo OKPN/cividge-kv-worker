@@ -549,7 +549,7 @@ export async function onRequestPost(context) {
     const physicalKey = `objects/${contentCid}`;
     const linkKey = `${cleanHostname}:${shortKey}`;
     const existingBinding = (await callLinkBinding(env, { action: "inspect", linkKey })).binding;
-    if (existingBinding?.objectRef && existingBinding.objectRef !== objectRef) {
+    if (existingBinding?.status !== "RETIRED" && existingBinding?.objectRef && existingBinding.objectRef !== objectRef) {
       const conflict = new Error("This Link is already bound to different content");
       conflict.status = 409;
       conflict.code = "LINK_OBJECT_CONFLICT";

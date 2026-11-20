@@ -25,6 +25,29 @@ function allReleased(current) {
     (!current.thumbnail || current.thumbnail.state === "RELEASED");
 }
 
+// Single derived truth for Object state so redundant state flags can never
+// drift out of sync across multi-placement acquire/release/thumbnail flows.
+export function deriveObjectState(current) {
+  const placements = Object.values(current?.placements || {});
+  const thumb = current?.thumbnail;
+  const hasLinks = (current?.links?.length || 0) > 0 || (current?.pendingLinkRemovals?.length || 0) > 0;
+  if (hasLinks) return "ACTIVE";
+  if (placements.some(p => p.state === "RELEASING") || thumb?.state === "RELEASING") {
+    return "RELEASING";
+  }
+  if (placements.some(p => p.state === "PRESENT" || p.state === "PIN_REQUESTED" || p.state === "PINNING")) {
+    return "ACTIVE";
+  }
+  if ((placements.length > 0 || thumb) && allReleased(current)) {
+    return "RELEASED";
+  }
+  if (placements.some(p => p.state === "RELEASE_PENDING" || p.state === "RETRYABLE") ||
+      (thumb && ["RELEASE_PENDING", "RETRYABLE", "UNCERTAIN"].includes(thumb.state))) {
+    return "RELEASE_PENDING";
+  }
+  return current?.state === "RELEASED" ? "RELEASED" : "ACTIVE";
+}
+
 export function parseObjectRef(value) {
   return parseObjectId(value);
 }
@@ -115,6 +138,7 @@ export function addLink(current, linkKey, placements = []) {
     }
     return current;
   }
+  current.state = deriveObjectState(current);
   if (current.state === "RELEASED" || current.state === "RELEASING") throw new Error("Object is not linkable");
   if (current.state === "RELEASE_PENDING") {
     const placements = Object.values(current.placements);
@@ -143,6 +167,7 @@ export function addLink(current, linkKey, placements = []) {
   current.pendingLinkRemovals = current.pendingLinkRemovals.filter(key => key !== link.key);
   current.links.push(link.key);
   current.links.sort();
+  current.state = deriveObjectState(current);
   return current;
 }
 
@@ -179,28 +204,36 @@ export function requestRelease(current) {
   if (current.links.length !== 0 || current.pendingLinkRemovals.length !== 0) {
     throw new Error("Object still has active Links");
   }
+  current.state = deriveObjectState(current);
   if (current.state === "RELEASED") return current;
   if (current.state === "RELEASING") throw new Error("Object release is already in progress");
-  current.state = "RELEASE_PENDING";
+  if (Object.values(current.placements).some(p => ["PINNING", "PIN_REQUESTED"].includes(p.state))) {
+    throw new Error("Object acquisition is in progress");
+  }
   for (const placement of Object.values(current.placements)) {
     if (placement.state === "PRESENT" || placement.state === "RETRYABLE") {
       placement.state = "RELEASE_PENDING";
       placement.claim = null;
     }
   }
-  if (current.thumbnail?.state === "PRESENT") {
+  if (current.thumbnail && (current.thumbnail.state === "PRESENT" || current.thumbnail.state === "RETRYABLE")) {
     current.thumbnail.state = "RELEASE_PENDING";
     current.thumbnail.claim = null;
   }
-  if (allReleased(current)) current.state = "RELEASED";
+  current.state = (Object.keys(current.placements).length === 0 && !current.thumbnail)
+    ? "RELEASED"
+    : deriveObjectState(current);
   return current;
 }
 
 export function beginThumbnailUpload(current, now = Date.now()) {
+  current.state = deriveObjectState(current);
   if (!current.links.length || current.state !== "ACTIVE") throw new Error("Thumbnail parent is not active");
   const existing = current.thumbnail;
   if (existing?.state === "PRESENT") return { lifecycle: current, noOp: true };
-  if (existing && !["ABSENT", "RELEASED", "UNCERTAIN"].includes(existing.state)) throw new Error("Thumbnail operation is in progress");
+  if (existing && (["UPLOADING", "RELEASING"].includes(existing.state) || existing.claim)) {
+    throw new Error("Thumbnail operation is in progress");
+  }
   const generation = (existing?.generation || 0) + 1;
   const claim = { claimId: crypto.randomUUID(), generation, operation: "upload", expiresAt: now + PLACEMENT_CLAIM_LEASE_MS };
   current.thumbnail = { key: thumbnailR2Key(current.objectRef), state: "UPLOADING", generation, claim, error: null };
@@ -208,6 +241,7 @@ export function beginThumbnailUpload(current, now = Date.now()) {
 }
 
 export function reconcileMissingThumbnail(current) {
+  current.state = deriveObjectState(current);
   if (!current.links.length || current.state !== "ACTIVE" || current.thumbnail?.state !== "PRESENT") {
     throw new Error("Thumbnail cannot be reconciled in this lifecycle state");
   }
@@ -228,11 +262,12 @@ export function reportThumbnailUpload(current, report) {
     thumbnail.state = current.links.length ? "UNCERTAIN" : "RELEASE_PENDING";
     thumbnail.error = String(report.error || "Thumbnail upload failed");
   } else throw new Error("Invalid thumbnail upload outcome");
-  if (!current.links.length) current.state = "RELEASE_PENDING";
+  current.state = deriveObjectState(current);
   return current;
 }
 
 export function claimThumbnailRelease(current, now = Date.now()) {
+  current.state = deriveObjectState(current);
   const thumbnail = current.thumbnail;
   if (current.links.length || current.pendingLinkRemovals.length || current.state !== "RELEASE_PENDING" ||
       !thumbnail || !["RELEASE_PENDING", "RETRYABLE", "UNCERTAIN"].includes(thumbnail.state)) throw new Error("Thumbnail is not releasable");
@@ -240,7 +275,7 @@ export function claimThumbnailRelease(current, now = Date.now()) {
   thumbnail.claim = { claimId: crypto.randomUUID(), generation: thumbnail.generation,
     operation: "release", expiresAt: now + PLACEMENT_CLAIM_LEASE_MS };
   thumbnail.state = "RELEASING";
-  current.state = "RELEASING";
+  current.state = deriveObjectState(current);
   return { lifecycle: current, claim: { ...thumbnail.claim, key: thumbnail.key } };
 }
 
@@ -252,7 +287,7 @@ export function reportThumbnailRelease(current, report) {
   if (report.outcome === "released") { thumbnail.state = "RELEASED"; thumbnail.error = null; }
   else if (report.outcome === "retryable") { thumbnail.state = "RETRYABLE"; thumbnail.error = String(report.error || "Thumbnail cleanup failed"); }
   else throw new Error("Invalid thumbnail release outcome");
-  current.state = allReleased(current) ? "RELEASED" : "RELEASE_PENDING";
+  current.state = deriveObjectState(current);
   return current;
 }
 
@@ -267,10 +302,12 @@ export function requestPlacementRelease(current, kind, { allowLastPlacementDrift
   placement.state = "RELEASE_PENDING";
   placement.claim = null;
   placement.error = null;
+  current.state = deriveObjectState(current);
   return current;
 }
 
 export function requestPlacementAcquire(current, rawPlacement) {
+  current.state = deriveObjectState(current);
   if (current.state === "RELEASING") throw new Error("Object release is in progress");
   const requested = canonicalPlacement(rawPlacement, "PIN_REQUESTED");
   const existing = current.placements[requested.kind];
@@ -289,7 +326,7 @@ export function requestPlacementAcquire(current, rawPlacement) {
     existing.claim = null;
     existing.error = null;
   }
-  if (current.state === "RELEASED" || current.state === "RELEASE_PENDING") current.state = "ACTIVE";
+  current.state = deriveObjectState(current);
   return current;
 }
 
@@ -297,21 +334,20 @@ export function requestPlacementAcquire(current, rawPlacement) {
 // re-upload may inspect the *same* physical locator before any PUT and settle
 // an uncertain release. This never infers presence from a failed cleanup.
 export function reconcilePlacementForAcquire(current, rawPlacement, observation) {
-  if (current.links.length || current.pendingLinkRemovals.length || current.state === "RELEASING") {
-    throw new Error("Object cannot be reconciled during link or release mutation");
-  }
+  current.state = deriveObjectState(current);
   const requested = canonicalPlacement(rawPlacement, "ABSENT");
   const existing = current.placements[requested.kind];
   if (!existing || !samePlacement(existing, requested)) throw new Error("Placement locator mismatch");
-  if (!["RELEASE_PENDING", "RETRYABLE", "RELEASED"].includes(existing.state) || existing.claim) {
+  if (current.state === "RELEASING" || existing.state === "RELEASING" || existing.claim) {
+    throw new Error("Placement cannot be reconciled while release is in progress");
+  }
+  if (!["RELEASE_PENDING", "RETRYABLE", "RELEASED"].includes(existing.state)) {
     throw new Error("Placement does not need release reconciliation");
   }
   if (observation !== "present" && observation !== "absent") throw new Error("Verified placement observation is required");
   existing.state = observation === "present" ? "PRESENT" : "RELEASED";
   existing.error = null;
-  current.state = allReleased(current)
-    ? "RELEASED" : Object.values(current.placements).some(p => p.state === "PRESENT")
-      ? "ACTIVE" : "RELEASE_PENDING";
+  current.state = deriveObjectState(current);
   return current;
 }
 
@@ -323,6 +359,7 @@ export function claimPlacement(current, kind, operation, claimId, now = Date.now
   const acquire = intent === "acquire";
   const release = intent === "release";
   if (!acquire && !release) throw new Error("Invalid placement operation");
+  current.state = deriveObjectState(current);
   const claimable = acquire
     ? placement.state === "PIN_REQUESTED"
     : placement.state === "RELEASE_PENDING" || placement.state === "RETRYABLE";
@@ -348,7 +385,7 @@ export function claimPlacement(current, kind, operation, claimId, now = Date.now
   };
   placement.state = acquire ? "PINNING" : "RELEASING";
   placement.error = null;
-  if (release && current.links.length === 0) current.state = "RELEASING";
+  current.state = deriveObjectState(current);
   return { lifecycle: current, task: taskForPlacement(placement) };
 }
 
@@ -364,7 +401,6 @@ export function recoverExpiredPlacementClaims(current, now = Date.now()) {
       placement.state = "PIN_REQUESTED";
     } else if (placement.state === "RELEASING" && claim.operation === "release") {
       placement.state = "RETRYABLE";
-      if (current.links.length === 0) current.state = "RELEASE_PENDING";
     } else {
       continue;
     }
@@ -378,12 +414,12 @@ export function recoverExpiredPlacementClaims(current, now = Date.now()) {
       thumbnail.state = current.links.length ? "UNCERTAIN" : "RELEASE_PENDING";
     } else if (thumbnail.state === "RELEASING") {
       thumbnail.state = "RETRYABLE";
-      current.state = "RELEASE_PENDING";
     }
     thumbnail.claim = null;
     thumbnail.error = "Thumbnail actuator claim expired";
     changed = true;
   }
+  if (changed) current.state = deriveObjectState(current);
   return changed;
 }
 
@@ -433,7 +469,6 @@ export function reportPlacement(current, kind, report) {
   }
   placement.lastCompletedClaim = { claimId, generation, operation, outcome };
   placement.claim = null;
-  if (current.links.length === 0) current.state = allReleased(current) ? "RELEASED" : "RELEASE_PENDING";
-  else current.state = "ACTIVE";
+  current.state = deriveObjectState(current);
   return current;
 }
