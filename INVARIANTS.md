@@ -437,5 +437,8 @@ delivery remains a single KV lookup and may reflect the policy later.
 * Repeated unavailable/not-found observations never retire or delete a Link automatically.
 
 ### [INV-MANUAL-LAST-PLACEMENT-RELEASE] Explicit last managed Placement release
-* Automatic capacity/FIFO release must not release the last `PRESENT` managed Placement while a Link remains.
+* Automatic capacity/FIFO release must not release the last `PRESENT` managed Placement while an active Link remains (for general files, or for video/audio when `kuboSkipMediaPin` is off, FIFO must preserve to Kubo first or skip with a warning).
 * A deliberate user release may leave the Link in an IPFS-drifting condition only after explicit confirmation. The ordinary ObjectLifecycle release authorization, generation-bound claim, actuator, and report remain required.
+* Two explicit FIFO Link-retirement paths are permitted when all attached Links are first retired through the normal Link-removal path (bringing the reference count to 0) before requesting ObjectLifecycle release:
+  1. **Expired Objects**: Objects whose attached Links are all past `expiresAt` (already `404` on public delivery) are prioritized by FIFO and retired without Kubo preservation.
+  2. **Stream Media Worker-Defense (`kuboSkipMediaPin`, default ON)**: Because video/audio Range seeks served outside the R2 custom domain consume Worker request quota, FIFO retires all attached Links and releases the Placement without pinning to Kubo while this policy is enabled. Disabling `kuboSkipMediaPin` restores the Kubo-preservation requirement above.
